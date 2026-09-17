@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ab-causal-lab · 实验平台</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #fff; --ink: #1a1d21; --dim: #6b7280;
+    --line: #e3e6ea; --blue: #1f77b4; --red: #d62728; --green: #2ca02c;
+    --orange: #ff7f0e; --purple: #9467bd;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 14px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  header {
+    background: #fff; border-bottom: 1px solid var(--line);
+    padding: 14px 24px; display: flex; align-items: baseline; gap: 14px;
+    position: sticky; top: 0; z-index: 10;
+  }
+  header h1 { font-size: 16px; margin: 0; }
+  header .sub { color: var(--dim); font-size: 12px; }
+  header .links { margin-left: auto; font-size: 12px; }
+  header a { color: var(--blue); text-decoration: none; margin-left: 12px; }
+  nav { display: flex; gap: 4px; padding: 12px 24px 0; }
+  nav button {
+    border: 1px solid var(--line); background: #fff; padding: 7px 16px;
+    border-radius: 6px 6px 0 0; cursor: pointer; font-size: 13px; color: var(--dim);
+    border-bottom: none;
+  }
+  nav button.on { color: var(--ink); font-weight: 600; background: var(--card); }
+  main { padding: 0 24px 40px; }
+  .panel {
+    background: var(--card); border: 1px solid var(--line); border-radius: 0 8px 8px 8px;
+    padding: 20px;
+  }
+  .panel[hidden] { display: none; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--line); }
+  th { color: var(--dim); font-weight: 500; font-size: 12px; }
+  tbody tr:hover { background: #fafbfc; }
+  .badge {
+    display: inline-block; padding: 1px 8px; border-radius: 10px;
+    font-size: 11px; font-weight: 600; letter-spacing: .3px;
+  }
+  .pass { background: #e7f5e9; color: #1c6b28; }
+  .warn { background: #fff3e0; color: #9a5b00; }
+  .fail { background: #fdeaea; color: #a11419; }
+  .info { background: #eef2f7; color: #465469; }
+  .muted { color: var(--dim); }
+  .mono { font-family: ui-monospace, Consolas, monospace; }
+  button.act {
+    border: 1px solid var(--line); background: #fff; border-radius: 6px;
+    padding: 5px 12px; cursor: pointer; font-size: 12px;
+  }
+  button.act:hover { border-color: var(--blue); color: var(--blue); }
+  button.act[disabled] { opacity: .5; cursor: default; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; }
+  .card { border: 1px solid var(--line); border-radius: 8px; padding: 14px; }
+  .card .k { color: var(--dim); font-size: 12px; }
+  .card .v { font-size: 21px; font-weight: 600; margin-top: 4px; }
+  h3 { font-size: 13px; margin: 22px 0 10px; color: var(--dim); font-weight: 600; }
+  .check { display: flex; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--line); }
+  .check:last-child { border-bottom: none; }
+  .check .msg { font-size: 13px; }
+  form { display: grid; grid-template-columns: 150px 1fr; gap: 10px 14px; max-width: 660px; }
+  form label { font-size: 13px; color: var(--dim); padding-top: 7px; }
+  input, select {
+    padding: 7px 10px; border: 1px solid var(--line); border-radius: 6px;
+    font: inherit; font-size: 13px; width: 100%;
+  }
+  .err { color: var(--red); font-size: 13px; margin-top: 10px; white-space: pre-wrap; }
+  .spinner { color: var(--dim); font-size: 13px; }
+  .bars { display: flex; align-items: flex-end; gap: 14px; height: 120px; margin-top: 8px; }
+  .bar { width: 54px; background: var(--blue); border-radius: 4px 4px 0 0; position: relative; }
+  .bar span { position: absolute; bottom: -20px; left: 0; right: 0; text-align: center;
+              font-size: 11px; color: var(--dim); }
+  .bar b { position: absolute; top: -18px; left: 0; right: 0; text-align: center; font-size: 11px; }
+  .axis { border-top: 1px solid var(--line); margin-top: 24px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>ab-causal-lab</h1>
+  <span class="sub">确定性分流 · 实验分析 · 因果推断验证台</span>
+  <span class="links">
+    <a href="/docs" target="_blank">API 文档</a>
+    <a href="/openapi.json" target="_blank">OpenAPI</a>
+  </span>
+</header>
+
+<nav>
+  <button data-tab="list" class="on">实验列表</button>
+  <button data-tab="detail">实验详情</button>
+  <button data-tab="create">新建实验</button>
+  <button data-tab="validate">在线验证</button>
+</nav>
+
+<main>
+  <!-- 列表 -->
+  <section class="panel" id="tab-list">
+    <table>
+      <thead>
+        <tr><th>实验名</th><th>假设</th><th>负责人</th><th>数据源</th>
+            <th>分流</th><th>状态</th><th></th></tr>
+      </thead>
+      <tbody id="rows"><tr><td colspan="7" class="spinner">加载中…</td></tr></tbody>
+    </table>
+  </section>
+
+  <!-- 详情 -->
+  <section class="panel" id="tab-detail" hidden>
+    <div id="detail-empty" class="muted">
+      还没有选实验。到「实验列表」点任意一行的「查看」。
+    </div>
+    <div id="detail-body" hidden>
+      <div style="display:flex;align-items:center;gap:12px;margin-bottom:6px">
+        <h2 id="d-name" style="font-size:17px;margin:0"></h2>
+        <span id="d-health" class="badge"></span>
+      </div>
+      <div id="d-meta" class="muted" style="font-size:13px"></div>
+
+      <h3>体检项（诊断是一等公民）</h3>
+      <div id="d-checks"></div>
+
+      <h3>主指标：CUPED 与朴素口径对照</h3>
+      <div class="cards" id="d-estimates"></div>
+
+      <h3>序贯监控路径（O'Brien-Fleming，5 次查看）</h3>
+      <div id="d-seq" class="muted" style="font-size:13px"></div>
+      <div class="bars" id="d-bars"></div>
+      <div class="axis"></div>
+    </div>
+  </section>
+
+  <!-- 新建 -->
+  <section class="panel" id="tab-create" hidden>
+    <form id="create-form">
+      <label>实验名 *</label><input name="name" required placeholder="exp_new_idea">
+      <label>假设</label><input name="hypothesis" placeholder="新策略提升人均互动次数">
+      <label>负责人</label><input name="owner" placeholder="team-name">
+      <label>所属层</label><input name="layer" placeholder="ranking">
+      <label>分流盐</label><input name="salt" placeholder="留空则按实验名派生">
+      <label>流量比例</label><input name="traffic_ratio" type="number" value="1.0" step="0.05" min="0.01" max="1">
+      <label>主指标</label><input name="primary_metric" value="metric">
+      <label>分支权重</label>
+      <input name="variants" value="control:0.5, treatment:0.5"
+             title="格式：名称:权重，逗号分隔。权重之和必须为 1">
+      <label>演示用真实效应</label>
+      <input name="true_lift" type="number" value="0.2" step="0.05"
+             title="仅演示：分析时注入的效应。真实平台没有这个字段">
+      <label></label>
+      <div><button class="act" type="submit">创建</button></div>
+    </form>
+    <div id="create-err" class="err"></div>
+    <div id="create-ok" class="muted" style="margin-top:10px"></div>
+  </section>
+
+  <!-- 在线验证 -->
+  <section class="panel" id="tab-validate" hidden>
+    <p class="muted" style="margin-top:0">
+      跑一次 A/A 仿真，检查框架的 I 类错误率是否守在名义水平。
+      <strong>这是现场快速检查</strong>，完整验证见
+      <span class="mono">reports/m0_validation.md</span>。
+    </p>
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <label class="muted">A/A 重复次数 <input id="v-trials" type="number" value="400" min="50" max="5000" style="width:100px"></label>
+      <label class="muted">队列规模 <input id="v-units" type="number" value="8000" min="500" max="100000" style="width:110px"></label>
+      <button class="act" id="v-run">运行</button>
+      <span id="v-status" class="spinner"></span>
+    </div>
+    <div id="v-out" style="margin-top:16px"></div>
+  </section>
+</main>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const fmt = (v, d = 4) => (v === null || v === undefined) ? "—" : Number(v).toFixed(d);
+const pct = (v) => (v === null || v === undefined) ? "—" : (100 * v).toFixed(1) + "%";
+
+async function api(path, opts) {
+  const res = await fetch(path, opts);
+  if (res.status === 204) return null;
+  const body = await res.json().catch(() => null);
+  if (!res.ok) throw new Error((body && body.detail) || res.statusText);
+  return body;
+}
+
+/* ---------- tabs ---------- */
+const tabs = ["list", "detail", "create", "validate"];
+document.querySelectorAll("nav button").forEach((b) => {
+  b.onclick = () => {
+    document.querySelectorAll("nav button").forEach((x) => x.classList.remove("on"));
+    b.classList.add("on");
+    tabs.forEach((t) => { $("#tab-" + t).hidden = (t !== b.dataset.tab); });
+  };
+});
+function goto(tab) { document.querySelector(`nav button[data-tab="${tab}"]`).click(); }
+
+/* ---------- 列表 ---------- */
+async function loadList() {
+  const rows = $("#rows");
+  try {
+    const items = await api("/api/experiments");
+    if (!items.length) {
+      rows.innerHTML = `<tr><td colspan="7" class="muted">还没有实验。到「新建实验」加一个。</td></tr>`;
+      return;
+    }
+    rows.innerHTML = items.map((e) => {
+      const weights = e.variants.map((v) => `${v.name} ${v.weight}`).join(" / ");
+      // 数据源：绑定了数仓就读真实链路，否则是平台自造的合成数据。
+      // 这一列必须显式出现 —— 两份报告的字段完全一样，只有来源不同，
+      // 不标出来就没法判断屏幕上的数字是"演示"还是"真实链路"。
+      const src = e.warehouse_experiment
+        ? `<span class="badge info" title="读 ADS + DWS">数仓</span>
+           <span class="muted mono" style="font-size:11px"> ${e.warehouse_experiment}</span>`
+        : `<span class="badge warn" title="平台按 salt 生成的合成数据">合成</span>`;
+      return `<tr>
+        <td class="mono">${e.name}</td>
+        <td>${e.hypothesis || '<span class="muted">—</span>'}</td>
+        <td>${e.owner || '<span class="muted">—</span>'}</td>
+        <td>${src}</td>
+        <td class="mono" style="font-size:12px">${weights}<br>
+            <span class="muted">${pct(e.traffic_ratio)} 流量</span></td>
+        <td><span class="badge info">${e.status}</span></td>
+        <td><button class="act" data-id="${e.id}" data-name="${e.name}">查看</button></td>
+      </tr>`;
+    }).join("");
+    rows.querySelectorAll("button.act").forEach((b) => {
+      b.onclick = () => showDetail(b.dataset.id, b.dataset.name);
+    });
+  } catch (err) {
+    rows.innerHTML = `<tr><td colspan="7" class="err">${err.message}</td></tr>`;
+  }
+}
+
+/* ---------- 详情 ---------- */
+async function showDetail(id, name) {
+  goto("detail");
+  $("#detail-empty").hidden = true;
+  $("#detail-body").hidden = false;
+  $("#d-name").textContent = name;
+  $("#d-meta").textContent = "分析中…";
+  $("#d-checks").innerHTML = '<div class="spinner">跑引擎（SRM → CUPED → 序贯监控）…</div>';
+  $("#d-estimates").innerHTML = "";
+  $("#d-bars").innerHTML = "";
+  $("#d-seq").textContent = "";
+
+  try {
+    const r = await api(`/api/experiments/${id}/analyze`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ n_users: 20000, alpha: 0.05, n_looks: 5 }),
+    });
+
+    $("#d-health").className = "badge " + r.health;
+    $("#d-health").textContent = { pass: "体检通过", warn: "有可疑项", fail: "不可信" }[r.health];
+    const srcTag = r.source === "warehouse"
+      ? "数仓链路（ADS + DWS 充分统计量）"
+      : `合成数据（按 salt 生成，种子确定性${r.population_size ? `，请求 ${r.population_size.toLocaleString()} 人` : ""}）`;
+    $("#d-meta").innerHTML =
+      `${r.status} · <strong>数据源：${srcTag}</strong> · 进入分析 ${r.n_users.toLocaleString()} ` +
+      (r.analysis_unit === "cluster" ? `人 / ${r.n_analysis_units} 个簇` : "人") +
+      ` · alpha ${r.alpha} · 对照组 ${p.n_control.toLocaleString()} / ` +
+      `处理组 ${p.n_treatment.toLocaleString()}`;
+
+    $("#d-checks").innerHTML = r.checks.map((c) => `
+      <div class="check">
+        <span class="badge ${c.status}">${c.status.toUpperCase()}</span>
+        <span class="msg"><strong>${c.name}</strong>：${c.message}</span>
+      </div>`).join("");
+
+    const card = (k, v, sub) =>
+      `<div class="card"><div class="k">${k}</div><div class="v">${v}</div>
+       <div class="k" style="margin-top:6px">${sub || ""}</div></div>`;
+
+    // 用 primary / alt，而不是硬编码 cuped / naive ——
+    // 报告里"那个结论"永远是 primary，它背后可能是 CUPED、簇级检验或比值 delta。
+    const p = r.primary, a = r.alt, f = r.cuped_fit;
+    const pw = r.power || {};
+    const sign = (v) => (v >= 0 ? "+" : "") + fmt(v);
+    const EST_NAME = {
+      cuped: "CUPED", post_only: "post-only",
+      cluster_level: "簇级检验", unit_level: "单元级检验（错）",
+      ratio_delta: "比值 delta method",
+    };
+    const cards = [
+      card(`${EST_NAME[r.primary_estimator_name] || r.primary_estimator_name}（头条口径）`,
+           sign(p.absolute_effect),
+           `p = ${fmt(p.p_value, 4)}　${p.significant ? "显著" : "不显著"}`),
+    ];
+    if (a) {
+      cards.push(card(`对照：${EST_NAME[r.alt_estimator_name] || r.alt_estimator_name}`,
+                      sign(a.absolute_effect),
+                      `p = ${fmt(a.p_value, 4)}　${a.significant ? "显著" : "不显著"}`));
+    }
+    cards.push(card("标准误",
+                    a ? `${fmt(p.std_error)} vs ${fmt(a.std_error)}` : fmt(p.std_error),
+                    a ? `头条口径小 ${pct(1 - p.std_error / a.std_error)}` : "—"));
+    if (f) {
+      cards.push(card("方差缩减 ρ²", pct(f.variance_reduction),
+                      `等效样本量 ×${fmt(f.effective_sample_multiplier, 2)}`));
+    }
+    if (pw.mde_abs != null) {
+      cards.push(card("MDE（功效 0.8）",
+                      fmt(pw.mde_abs) + (pw.mde_relative != null ? `（${pct(pw.mde_relative)}）` : ""),
+                      pw.mde_shrinkage_vs_post_only != null
+                        ? `比 post-only 小 ${pct(pw.mde_shrinkage_vs_post_only)}`
+                        : "同口径内无对照"));
+    }
+    $("#d-estimates").innerHTML = cards.join("");
+
+    $("#d-seq").innerHTML =
+      `${r.sequential.spending_name} · 判定口径 <strong>${EST_NAME[r.estimator] || r.estimator}</strong>` +
+      `（分析单元 ${r.analysis_unit === "cluster" ? "簇" : "用户"}）· ` +
+      `末次边界 <span class="mono">${fmt(r.sequential.final_boundary)}</span> ` +
+      `（名义 p = ${fmt(r.sequential.final_nominal_p)}）· ` +
+      `${r.monitoring.find((m) => m.crossed) ? "触碰过边界" : "始终未触及边界"}`;
+
+    const maxZ = Math.max(...r.monitoring.map((m) => Math.abs(m.z)), ...r.monitoring.map((m) => m.boundary)) * 1.1;
+    $("#d-bars").innerHTML = r.monitoring.map((m) => {
+      const h = Math.max(2, 120 * Math.abs(m.z) / maxZ);
+      const bh = Math.max(2, 120 * m.boundary / maxZ);
+      const color = m.crossed ? "var(--red)" : "var(--blue)";
+      // 簇设计下"样本量"是簇数（随机化单元），必须按簇报，否则会被读成用户数
+      const nTag = m.n_clusters_per_arm
+        ? `簇 ${m.n_clusters_treatment}/${m.n_clusters_control}`
+        : (m.n_treatment === m.n_control ? `n=${m.n_per_arm}` : `n=${m.n_treatment}/${m.n_control}`);
+      const look = m.label && m.label.startsWith("look") ? `t=${fmt(m.information_fraction, 2)}` : m.label;
+      return `<div style="position:relative;width:54px;height:120px">
+        <div style="position:absolute;bottom:0;left:0;width:54px;height:${h}px;
+                    background:${color};border-radius:4px 4px 0 0"></div>
+        <div style="position:absolute;bottom:${bh}px;left:-4px;width:62px;
+                    border-top:2px dashed var(--orange)"></div>
+        <div style="position:absolute;bottom:-20px;left:-14px;right:-14px;text-align:center;
+                    font-size:11px;color:var(--dim)">${look}</div>
+        <div style="position:absolute;bottom:-34px;left:-14px;right:-14px;text-align:center;
+                    font-size:10px;color:var(--dim)">${nTag}</div>
+        <div style="position:absolute;top:-18px;left:0;right:0;text-align:center;
+                    font-size:11px">${fmt(m.z, 2)}</div>
+      </div>`;
+    }).join("");
+  } catch (err) {
+    $("#d-meta").textContent = "";
+    $("#d-checks").innerHTML = `<div class="err">${err.message}</div>`;
+  }
+}
+
+/* ---------- 新建 ---------- */
+$("#create-form").onsubmit = async (ev) => {
+  ev.preventDefault();
+  const fd = new FormData(ev.target);
+  const variants = fd.get("variants").split(",").map((s) => {
+    const [n, w] = s.split(":");
+    return { name: (n || "").trim(), weight: parseFloat(w) };
+  }).filter((v) => v.name);
+  const body = {
+    name: fd.get("name").trim(),
+    hypothesis: fd.get("hypothesis") || "",
+    owner: fd.get("owner") || "",
+    layer: fd.get("layer") || null,
+    variants,
+    traffic_ratio: parseFloat(fd.get("traffic_ratio")),
+    primary_metric: fd.get("primary_metric") || "metric",
+    true_lift: parseFloat(fd.get("true_lift") || "0"),
+    status: "draft",
+  };
+  const salt = (fd.get("salt") || "").trim();
+  if (salt) body.salt = salt;
+
+  $("#create-err").textContent = "";
+  $("#create-ok").textContent = "";
+  try {
+    const rec = await api("/api/experiments", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    $("#create-ok").textContent = `已创建 ${rec.name}（id ${rec.id}）`;
+    ev.target.reset();
+    loadList();
+  } catch (err) {
+    $("#create-err").textContent = err.message;
+  }
+};
+
+/* ---------- 在线验证 ---------- */
+$("#v-run").onclick = async () => {
+  const btn = $("#v-run");
+  btn.disabled = true;
+  $("#v-status").textContent = "跑仿真中…";
+  $("#v-out").innerHTML = "";
+  try {
+    const r = await api("/api/validate/aa", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        n_trials: parseInt($("#v-trials").value, 10),
+        n_units: parseInt($("#v-units").value, 10),
+        alpha: 0.05,
+      }),
+    });
+    const cls = r.calibrated ? "pass" : "fail";
+    $("#v-out").innerHTML = `
+      <div class="check">
+        <span class="badge ${cls}">${r.calibrated ? "校准正常" : "偏离名义水平"}</span>
+        <span class="msg">${r.n_trials} 次重复 × ${r.n_units.toLocaleString()} 人（真效应 0）</span>
+      </div>
+      <div class="cards" style="margin-top:14px">
+        <div class="card"><div class="k">经验 I 类错误</div>
+          <div class="v">${pct(r.empirical_fpr)}</div>
+          <div class="k">95% CI [${pct(r.fpr_interval[0])}, ${pct(r.fpr_interval[1])}]　名义 ${pct(r.alpha)}</div></div>
+        <div class="card"><div class="k">区间覆盖率</div>
+          <div class="v">${pct(r.coverage)}</div>
+          <div class="k">95% CI [${pct(r.coverage_interval[0])}, ${pct(r.coverage_interval[1])}]　名义 95%</div></div>
+        <div class="card"><div class="k">p 值均匀性</div>
+          <div class="v">${fmt(r.ks_p_value, 3)}</div>
+          <div class="k">KS D = ${fmt(r.ks_statistic)}　&gt; 0.05 表示无法拒绝均匀</div></div>
+      </div>
+      <p class="muted" style="margin-bottom:0">${r.note}</p>`;
+  } catch (err) {
+    $("#v-out").innerHTML = `<div class="err">${err.message}</div>`;
+  } finally {
+    btn.disabled = false;
+    $("#v-status").textContent = "";
+  }
+};
+
+loadList();
+</script>
+</body>
+</html>

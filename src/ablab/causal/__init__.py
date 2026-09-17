@@ -1,0 +1,102 @@
+"""观察数据因果推断：DiD（含交错处置）、合成控制、敏感性分析。
+
+M0–M2 的结论靠**随机化**站住；M3 第一次没有这个靠山，
+所有结论都建立在**识别假设**上（DiD 靠平行趋势、合成控制靠"捐赠池能复刻处置单元"）。
+所以本模块的验证台重心也变了：不再问"我的数算得对不对"，
+而是问"**假设被打破时我会错得多离谱，而且我会不会察觉**"。
+"""
+
+from .did import (
+    CSResult,
+    TWFEDecomposition,
+    callaway_santanna,
+    event_study_leads,
+    pretrend_test,
+    twfe,
+    twfe_decomposition,
+    two_by_two_did,
+)
+from .forest import CausalForest, CausalTree, ForestConfig
+from .hte import (
+    CATE_FORMS,
+    DMLResult,
+    HTEConfig,
+    HTEData,
+    dml_partial_linear,
+    generate_hte_data,
+    naive_plugin,
+    s_learner,
+    t_learner,
+    x_learner,
+)
+from .panel import (
+    GroundTruth,
+    Panel,
+    StaggeredPanelConfig,
+    generate_staggered_panel,
+    never_treated_code,
+)
+from .sensitivity import TrendSensitivity, trend_sensitivity
+from .synthetic import (
+    PlaceboResult,
+    SCMConfig,
+    SCMData,
+    SCMResult,
+    generate_scm_scenario,
+    placebo_inference,
+    synthetic_control,
+)
+from .uplift import (
+    UpliftCurve,
+    auuc,
+    constant_prediction,
+    qini_coefficient,
+    rank_correlation,
+    scaled_perfect,
+    uplift_curve,
+)
+
+__all__ = [
+    "CSResult",
+    "TWFEDecomposition",
+    "callaway_santanna",
+    "event_study_leads",
+    "pretrend_test",
+    "twfe",
+    "twfe_decomposition",
+    "two_by_two_did",
+    "GroundTruth",
+    "Panel",
+    "StaggeredPanelConfig",
+    "generate_staggered_panel",
+    "never_treated_code",
+    "TrendSensitivity",
+    "trend_sensitivity",
+    "PlaceboResult",
+    "SCMConfig",
+    "SCMData",
+    "SCMResult",
+    "generate_scm_scenario",
+    "placebo_inference",
+    "synthetic_control",
+    "CATE_FORMS",
+    "DMLResult",
+    "HTEConfig",
+    "HTEData",
+    "dml_partial_linear",
+    "generate_hte_data",
+    "naive_plugin",
+    "s_learner",
+    "t_learner",
+    "x_learner",
+    "CausalForest",
+    "CausalTree",
+    "ForestConfig",
+    "UpliftCurve",
+    "auuc",
+    "constant_prediction",
+    "qini_coefficient",
+    "rank_correlation",
+    "scaled_perfect",
+    "uplift_curve",
+]

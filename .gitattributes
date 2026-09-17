@@ -1,0 +1,32 @@
+# 统一换行符：仓库里存 LF，工作区按平台自动转。
+#
+# 为什么需要这个文件：这个项目的 .py 文件**行尾曾经是混的** ——
+# 用 PowerShell 的 [System.IO.File]::WriteAllLines 改过的文件在 Windows 上被写成了 CRLF，
+# 其余是 LF。混着不会让 Python 报错，但会让 git diff 出现整文件重写、
+# 让 WSL/Linux 上的脚本带上多余的 \r（shebang 行首会变成 "#!/usr/bin/env python\r"，
+# 在某些环境下直接执行会报 "bad interpreter"）。
+#
+# 团队里只要有一个人用 Windows，这个文件就是必需品，不是可选项。
+* text=auto eol=lf
+
+# PowerShell 脚本按平台走（Linux 上如果用 LF 存 ps1 也没问题）
+*.ps1 text eol=crlf
+
+# 二进制：不要做任何换行或 diff 处理。
+# 这些是"证据"而不是代码，损坏一个字节这张图就废了。
+*.png binary
+*.jpg binary
+*.parquet binary
+*.duckdb binary
+*.db binary
+*.whl binary
+
+# 生成物/锁文件：让 diff 可读但别合并（合并出来的锁文件是没有意义的）
+requirements.lock text eol=lf linguist-generated=true
+
+# 报告是**文本证据**，必须保留、必须能 diff —— 数字变了要看得见
+*.md text eol=lf
+*.sql text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf

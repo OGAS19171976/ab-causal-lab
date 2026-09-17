@@ -1,0 +1,96 @@
+# ============================================================================
+# CI：把"这套数字可信"从本机搬到任何人可验证的地方
+# ============================================================================
+# 这个仓库的全部主张都是"可复现、可验证"。在配 CI 之前，
+# "475 个测试通过、七个验证脚本 exit=0"只在一个人的机器上成立 ——
+# 那不算证据，那算复述。这个工作流把同一件事变成公开、可点开、可重跑的东西。
+#
+# 两个 job 并行：
+#   tests       只跑 pytest（约 5 分钟，反馈最快）
+#   validation  锁文件 + 全部验证脚本（约 10 分钟）
+#
+# 两者的命令定义来自同一处 —— scripts/run_all_checks.py。
+# 这正是那个脚本存在的理由：CI 与本地各写一份命令清单，迟早漂移，
+# 于是"本地绿、CI 没跑那一步"这种假绿灯会一直存在。
+#
+# 注意 Ubuntu 上跑图会走 label() 的英文回退分支（容器里没有 CJK 字体），
+# 这是设计好的行为而不是故障 —— 见 ablab/plotting.py。
+# ============================================================================
+
+name: checks
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  # 同一分支只保留最新一次：验证脚本要跑十几分钟，排队没意义
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # matplotlib 默认把字体缓存写到 ~/.matplotlib；本仓库在导入前把它指到项目内，
+  # 这里再显式给一份，确保 CI 上也不依赖 HOME 的可写性
+  MPLCONFIGDIR: build/.mplconfig
+  PYTHONIOENCODING: utf-8
+
+jobs:
+  tests:
+    name: 测试（475 个）
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          # 与本仓库实测环境一致。若 setup-python 尚未提供 3.14，
+          # 改成 "3.13" 即可 —— 但要知道那不再是"实测过的那套"。
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+      - name: 依赖声明与锁文件一致
+        run: python scripts/lock_requirements.py --check
+      - name: pytest
+        run: pytest tests/
+      - name: 上传测试日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-logs
+          path: build/checks/tests.log
+          if-no-files-found: ignore
+
+  validation:
+    name: 验证脚本（M0–M6 + 数仓）
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+      # run_all_checks.py 里写死了一条顺序依赖：warehouse 必须排在 m5/m6 之前，
+      # 否则那两段的数仓内容会因为 build/warehouse.duckdb 不存在而**静默跳过**
+      # （报告里只剩一句"跳过"，汇总却仍然全绿）。
+      - name: 跑全部验证脚本
+        run: python scripts/run_all_checks.py --skip-tests
+      # 关键一步：把证据本身作为产物发布。
+      # 报告与图是这个项目的交付物，CI 不该只报"绿了"，该把东西交出来。
+      - name: 发布报告与图（证据）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports
+          path: |
+            reports/
+            build/checks/
+          if-no-files-found: warn
+          retention-days: 30

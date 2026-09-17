@@ -1,0 +1,420 @@
+"""实验注册表：把"一个实验"从散落的配置变成有状态、可校验、可追溯的记录。
+
+三个设计决定
+------------
+**1. 用 sqlite3 而不是 DuckDB。**
+数仓那层分析明细数据，用 DuckDB；这一层是低频的**配置类**数据（几十到几千条），
+sqlite3 是标准库、零依赖、单文件、天然适合。
+
+**2. 创建时必须过 ``ExperimentSpec`` 的校验。**
+权重之和、流量比例、分支重名、处置期…… 这些规则在 M0 就写好了。
+注册表不重复实现一遍 —— 它直接构造一个 ``ExperimentSpec``，
+非法配置在写入之前就被拒掉。**校验逻辑只有一份。**
+
+**3. 记录里保留 ``salt`` 且不可变。**
+salt 决定了每一个用户的分组。改 salt 等于把所有用户重新分组，
+实验数据直接报废 —— 所以它在 API 层是只读的（``update`` 不接受它）。
+
+**4. ``warehouse_experiment`` 是可变的，这跟第 3 条不矛盾。**
+它只决定"从哪里读数"，不改变任何用户的分组，所以允许后置绑定 ——
+而且必须允许：数仓表要等实验跑完才有，创建实验时它还不存在。
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+import uuid
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Sequence
+
+from ..assignment import ExperimentSpec, Variant
+
+__all__ = [
+    "ExperimentRecord",
+    "ExperimentRegistry",
+    "RegistryError",
+    "STATUSES",
+]
+
+STATUSES = ("draft", "running", "stopped")
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS experiments (
+    id            TEXT PRIMARY KEY,
+    name          TEXT NOT NULL UNIQUE,
+    hypothesis    TEXT NOT NULL DEFAULT '',
+    owner         TEXT NOT NULL DEFAULT '',
+    layer         TEXT,
+    unit          TEXT NOT NULL DEFAULT 'user_id',
+    salt          TEXT NOT NULL,
+    traffic_ratio REAL NOT NULL DEFAULT 1.0,
+    variants      TEXT NOT NULL,
+    primary_metric TEXT NOT NULL DEFAULT 'metric',
+    guardrails    TEXT NOT NULL DEFAULT '[]',
+    status        TEXT NOT NULL DEFAULT 'draft',
+    start_ds      TEXT,
+    end_ds        TEXT,
+    true_lift     REAL NOT NULL DEFAULT 0.0,
+    estimator     TEXT NOT NULL DEFAULT 'cuped',
+    analysis_unit TEXT NOT NULL DEFAULT 'unit',
+    metric_type   TEXT NOT NULL DEFAULT 'mean',
+    created_at    TEXT NOT NULL
+);
+"""
+
+#: 建表之后新增的列（列名 -> 列定义）。
+#:
+#: 为什么需要这个：``CREATE TABLE IF NOT EXISTS`` 对**已存在**的表什么都不做，
+#: 于是"给老库加一列"这件事它管不了。上线过一版之后再改结构，
+#: 不写迁移就会在 ``INSERT`` 时报 no such column。
+_MIGRATIONS: dict[str, str] = {
+    "warehouse_experiment": "TEXT",
+    "estimator": "TEXT NOT NULL DEFAULT 'cuped'",
+    "analysis_unit": "TEXT NOT NULL DEFAULT 'unit'",
+    "metric_type": "TEXT NOT NULL DEFAULT 'mean'",
+}
+
+#: 判定口径。**必须与头条结论同一个估计量**，否则监控曲线与结论卡会互相打架。
+ESTIMATORS = ("cuped", "post_only")
+#: 分析单元。``cluster`` 表示整簇随机化 —— 此时必须用簇级检验，
+#: 否则那个看起来完全正常的 p 值背后是 64.5% 的 I 类错误率。
+ANALYSIS_UNITS = ("unit", "cluster")
+#: 指标类型。``ratio`` 表示比值指标（Σy/Σx），必须走 delta method。
+METRIC_TYPES = ("mean", "ratio")
+
+
+class RegistryError(ValueError):
+    """注册表层的输入错误（参数非法、重名、找不到等）。"""
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+@dataclass
+class ExperimentRecord:
+    """注册表里的一条实验记录。"""
+
+    name: str
+    variants: list[dict[str, Any]]
+    salt: str
+    hypothesis: str = ""
+    owner: str = ""
+    layer: str | None = None
+    unit: str = "user_id"
+    traffic_ratio: float = 1.0
+    primary_metric: str = "metric"
+    guardrails: list[str] = field(default_factory=list)
+    status: str = "draft"
+    start_ds: str | None = None
+    end_ds: str | None = None
+    #: 仅演示用：分析时注入的真实效应。真实平台不会有这一列。
+    true_lift: float = 0.0
+    #: 绑定的数仓实验名（``ads_experiment_result.experiment``）。
+    #: 留空则分析走**合成数据**路径；填了就读数仓。
+    #: 与 ``salt`` 不同，这一列**允许后置修改** —— 数仓表要等实验跑完才有，
+    #: 而 binding 不改变任何用户的分组，改它不会让已有数据报废。
+    warehouse_experiment: str | None = None
+    #: 判定口径：``cuped`` 或 ``post_only``。序贯边界、显著性判定、
+    #: always-valid p 都按它算 —— **必须与头条结论同一个估计量**。
+    #: 和 ``salt`` 一样属于"现在定了就别改"的那类：改了等于换了个判定规则，
+    #: 但历史上已经据此做过决定。所以它有 setter（口径是策略不是数据），
+    #: 但报告里会把用到的口径写出来。
+    estimator: str = "cuped"
+    #: 分析单元：``unit``（随机化单元 = 分析单元）或 ``cluster``（整簇随机化）。
+    analysis_unit: str = "unit"
+    #: 指标类型：``mean``（人均指标）或 ``ratio``（比值指标 Σy/Σx）。
+    metric_type: str = "mean"
+    id: str = ""
+    created_at: str = ""
+
+    def to_spec(self) -> ExperimentSpec:
+        """把记录还原成分流定义 —— 构造即校验。"""
+        return ExperimentSpec(
+            name=self.name,
+            variants=tuple(
+                Variant(str(v["name"]), float(v["weight"])) for v in self.variants
+            ),
+            salt=self.salt,
+            unit=self.unit,
+            traffic_ratio=float(self.traffic_ratio),
+            layer=self.layer,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+class ExperimentRegistry:
+    """实验注册表（sqlite3 后端）。"""
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = str(path)
+        if self.path != ":memory:":
+            Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(self.path, check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        self._conn.executescript(_SCHEMA)
+        self._migrate()
+        self._conn.commit()
+
+    def _migrate(self) -> None:
+        """把老库补齐到当前结构（幂等）。
+
+        ``CREATE TABLE IF NOT EXISTS`` 只管"表不存在"，管不了"表少一列"。
+        没有这一步，给老库加列之后第一次写入就会 no such column。
+        """
+        existing = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(experiments)")
+        }
+        for column, decl in _MIGRATIONS.items():
+            if column not in existing:
+                self._conn.execute(f"ALTER TABLE experiments ADD COLUMN {column} {decl}")
+
+    def close(self) -> None:
+        self._conn.close()
+
+    # -- 校验 -------------------------------------------------------------- #
+    @staticmethod
+    def _validate(
+        name: str,
+        variants: Sequence[dict[str, Any]],
+        salt: str,
+        unit: str,
+        traffic_ratio: float,
+        layer: str | None,
+        status: str,
+    ) -> None:
+        if not name or not name.strip():
+            raise RegistryError("实验名不能为空")
+        if status not in STATUSES:
+            raise RegistryError(f"status 必须是 {STATUSES} 之一，收到 {status!r}")
+        if not salt or not salt.strip():
+            raise RegistryError("salt 不能为空（它决定每个用户的分组）")
+        # 直接复用 M0 的分流定义校验：权重之和、重名分支、流量比例……
+        try:
+            ExperimentSpec(
+                name=name,
+                variants=tuple(
+                    Variant(str(v.get("name", "")), float(v.get("weight", 0.0)))
+                    for v in variants
+                ),
+                salt=salt,
+                unit=unit,
+                traffic_ratio=float(traffic_ratio),
+                layer=layer,
+            )
+        except ValueError as exc:  # 转成注册表层的错误类型，便于 API 统一处理
+            raise RegistryError(str(exc)) from exc
+
+    # -- 写 ---------------------------------------------------------------- #
+    def create(
+        self,
+        *,
+        name: str,
+        variants: Sequence[dict[str, Any]],
+        salt: str | None = None,
+        hypothesis: str = "",
+        owner: str = "",
+        layer: str | None = None,
+        unit: str = "user_id",
+        traffic_ratio: float = 1.0,
+        primary_metric: str = "metric",
+        guardrails: Sequence[str] = (),
+        status: str = "draft",
+        start_ds: str | None = None,
+        end_ds: str | None = None,
+        true_lift: float = 0.0,
+        warehouse_experiment: str | None = None,
+        estimator: str = "cuped",
+        analysis_unit: str = "unit",
+        metric_type: str = "mean",
+    ) -> ExperimentRecord:
+        """新建实验。非法配置在写入前就被拒掉。"""
+        if not variants:
+            raise RegistryError("至少需要一个分支")
+        if estimator not in ESTIMATORS:
+            raise RegistryError(f"estimator 必须是 {ESTIMATORS} 之一，收到 {estimator!r}")
+        if analysis_unit not in ANALYSIS_UNITS:
+            raise RegistryError(
+                f"analysis_unit 必须是 {ANALYSIS_UNITS} 之一，收到 {analysis_unit!r}"
+            )
+        if metric_type not in METRIC_TYPES:
+            raise RegistryError(f"metric_type 必须是 {METRIC_TYPES} 之一，收到 {metric_type!r}")
+        if analysis_unit == "cluster" and estimator == "cuped":
+            # 早失败：整簇路径需要**簇级**前置指标才能做 CUPED，
+            # 而当前数仓/合成数据都还没有它。与其在分析时报错，不如创建时就拦住。
+            raise RegistryError(
+                "analysis_unit='cluster' 与 estimator='cuped' 不能同时选："
+                "整簇随机化需要簇级的前置指标才能做 CUPED，当前数据源没有提供；"
+                "请把 estimator 设为 'post_only'"
+            )
+
+        # 未指定 salt 时派生一个**不随改名变化**的稳定 salt
+        resolved_salt = salt or f"{name.strip()}_v1"
+        self._validate(
+            name, variants, resolved_salt, unit, traffic_ratio, layer, status
+        )
+        binding = warehouse_experiment.strip() if warehouse_experiment else None
+        if warehouse_experiment is not None and not binding:
+            raise RegistryError("warehouse_experiment 不能是空白字符串（留空请传 None）")
+
+        if self.get_by_name(name) is not None:
+            raise RegistryError(f"实验名 {name!r} 已存在（名字是唯一键）")
+
+        record = ExperimentRecord(
+            id=uuid.uuid4().hex[:12],
+            name=name.strip(),
+            variants=[dict(v) for v in variants],
+            salt=resolved_salt,
+            hypothesis=hypothesis,
+            owner=owner,
+            layer=layer,
+            unit=unit,
+            traffic_ratio=float(traffic_ratio),
+            primary_metric=primary_metric,
+            guardrails=list(guardrails),
+            status=status,
+            start_ds=start_ds,
+            end_ds=end_ds,
+            true_lift=float(true_lift),
+            warehouse_experiment=binding,
+            estimator=estimator,
+            analysis_unit=analysis_unit,
+            metric_type=metric_type,
+            created_at=_now(),
+        )
+
+        self._conn.execute(
+            """
+            INSERT INTO experiments
+            (id, name, hypothesis, owner, layer, unit, salt, traffic_ratio,
+             variants, primary_metric, guardrails, status, start_ds, end_ds,
+             true_lift, warehouse_experiment, estimator, analysis_unit, metric_type,
+             created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                record.id, record.name, record.hypothesis, record.owner, record.layer,
+                record.unit, record.salt, record.traffic_ratio,
+                json.dumps(record.variants, ensure_ascii=False),
+                record.primary_metric,
+                json.dumps(record.guardrails, ensure_ascii=False),
+                record.status, record.start_ds, record.end_ds,
+                record.true_lift, record.warehouse_experiment, record.estimator,
+                record.analysis_unit, record.metric_type,
+                record.created_at,
+            ),
+        )
+        self._conn.commit()
+        return record
+
+    def set_status(self, experiment_id: str, status: str) -> ExperimentRecord:
+        """只允许改状态 —— 分流定义一旦上线就不能动。"""
+        if status not in STATUSES:
+            raise RegistryError(f"status 必须是 {STATUSES} 之一，收到 {status!r}")
+        record = self.get(experiment_id)
+        self._conn.execute(
+            "UPDATE experiments SET status = ? WHERE id = ?", (status, experiment_id)
+        )
+        self._conn.commit()
+        record.status = status
+        return record
+
+    def set_estimator(self, experiment_id: str, estimator: str) -> ExperimentRecord:
+        """切换判定口径。
+
+        允许改 —— 口径是**策略**不是数据，改了不会让任何人的分组失效。
+        但要注意它改变的是判定规则本身：切完之后，"历史上有没有越界"这个问题
+        的答案会跟着变。所以报告里始终写着用的是哪个口径。
+        """
+        if estimator not in ESTIMATORS:
+            raise RegistryError(f"estimator 必须是 {ESTIMATORS} 之一，收到 {estimator!r}")
+        record = self.get(experiment_id)
+        self._conn.execute(
+            "UPDATE experiments SET estimator = ? WHERE id = ?", (estimator, experiment_id)
+        )
+        self._conn.commit()
+        record.estimator = estimator
+        return record
+
+    def bind_warehouse(self, experiment_id: str, warehouse_experiment: str | None) -> ExperimentRecord:
+        """绑定/解绑数仓实验。
+
+        **允许后置修改，而且不影响任何已有结论的正确性** —— 因为这个字段
+        只决定"从哪里读数"，不改变任何用户的分组。真正不可变的是 ``salt``。
+        """
+        record = self.get(experiment_id)
+        binding = warehouse_experiment.strip() if warehouse_experiment else None
+        if warehouse_experiment is not None and not binding:
+            raise RegistryError("warehouse_experiment 不能是空白字符串（解绑请传 None）")
+        self._conn.execute(
+            "UPDATE experiments SET warehouse_experiment = ? WHERE id = ?",
+            (binding, experiment_id),
+        )
+        self._conn.commit()
+        record.warehouse_experiment = binding
+        return record
+
+    def delete(self, experiment_id: str) -> None:
+        if self.get(experiment_id) is None:
+            raise RegistryError(f"找不到实验 {experiment_id!r}")
+        self._conn.execute("DELETE FROM experiments WHERE id = ?", (experiment_id,))
+        self._conn.commit()
+
+    # -- 读 ---------------------------------------------------------------- #
+    @staticmethod
+    def _row_to_record(row: sqlite3.Row) -> ExperimentRecord:
+        return ExperimentRecord(
+            id=row["id"],
+            name=row["name"],
+            hypothesis=row["hypothesis"],
+            owner=row["owner"],
+            layer=row["layer"],
+            unit=row["unit"],
+            salt=row["salt"],
+            traffic_ratio=row["traffic_ratio"],
+            variants=json.loads(row["variants"]),
+            primary_metric=row["primary_metric"],
+            guardrails=json.loads(row["guardrails"]),
+            status=row["status"],
+            start_ds=row["start_ds"],
+            end_ds=row["end_ds"],
+            true_lift=row["true_lift"],
+            warehouse_experiment=row["warehouse_experiment"],
+            estimator=row["estimator"],
+            analysis_unit=row["analysis_unit"],
+            metric_type=row["metric_type"],
+            created_at=row["created_at"],
+        )
+
+    def get(self, experiment_id: str) -> ExperimentRecord:
+        row = self._conn.execute(
+            "SELECT * FROM experiments WHERE id = ?", (experiment_id,)
+        ).fetchone()
+        if row is None:
+            raise RegistryError(f"找不到实验 {experiment_id!r}")
+        return self._row_to_record(row)
+
+    def get_by_name(self, name: str) -> ExperimentRecord | None:
+        row = self._conn.execute(
+            "SELECT * FROM experiments WHERE name = ?", (name,)
+        ).fetchone()
+        return self._row_to_record(row) if row else None
+
+    def list(self, *, status: str | None = None) -> list[ExperimentRecord]:
+        sql = "SELECT * FROM experiments"
+        params: tuple[Any, ...] = ()
+        if status is not None:
+            sql += " WHERE status = ?"
+            params = (status,)
+        sql += " ORDER BY created_at DESC, name"
+        return [self._row_to_record(r) for r in self._conn.execute(sql, params)]
+
+    def count(self) -> int:
+        return int(
+            self._conn.execute("SELECT COUNT(*) AS n FROM experiments").fetchone()["n"]
+        )
