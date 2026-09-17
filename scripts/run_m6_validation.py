@@ -47,6 +47,7 @@ from ablab.platform import (  # noqa: E402
 from ablab.platform.registry import ExperimentRecord  # noqa: E402
 from ablab.platform.analysis import PLATFORM_POPULATION  # noqa: E402
 from ablab.plotting import label, plt, save, setup_style  # noqa: E402
+from ablab.reporting import for_report  # noqa: E402
 
 BLUE, ORANGE, GREY, RED, GREEN, PURPLE = (
     "#1f77b4", "#ff7f0e", "#7f7f7f", "#d62728", "#2ca02c", "#9467bd",
@@ -380,7 +381,7 @@ def main() -> int:
         "# M6 验证报告：平台的生产口径\n\n"
         "> 由 `python scripts/run_m6_validation.py` 生成，全部数字可复现。\n"
         "> M5 把引擎接成了服务，M6 修的是「接得对不对」：口径一致、分析单元、MDE/功效。\n\n"
-        "```text\n" + "\n".join(log) + "\n```\n",
+        "```text\n" + "\n".join(for_report(log, root=ROOT)) + "\n```\n",
         encoding="utf-8",
     )
     print(f"报告已写入 {report}")

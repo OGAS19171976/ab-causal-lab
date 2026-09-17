@@ -30,6 +30,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 
 from ablab.plotting import label, plt, save, setup_style  # noqa: E402
+from ablab.reporting import for_report  # noqa: E402
 from ablab.sim import PopulationConfig, generate_population, two_arm_spec  # noqa: E402
 from ablab.sim.scenarios import ClusterScenarioConfig, RatioScenarioConfig  # noqa: E402
 from ablab.validation import (  # noqa: E402
@@ -420,7 +421,7 @@ def main() -> int:
     emit(f"总耗时 {time.perf_counter() - t0:.1f}s")
 
     report = out / "m1_validation.md"
-    report.write_text("# M1 验证报告\n\n```text\n" + "\n".join(log) + "\n```\n", encoding="utf-8")
+    report.write_text("# M1 验证报告\n\n```text\n" + "\n".join(for_report(log, root=ROOT)) + "\n```\n", encoding="utf-8")
     print(f"\n报告已写入 {report}")
     return 0 if verdict == "PASS" else 1
 

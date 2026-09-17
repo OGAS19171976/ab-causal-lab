@@ -15,7 +15,6 @@ CUPED 偏置分解 [250 次独立分流 × 8 次噪声重复]
     CUPED 斜率     = -0.0090 (SE 0.0168, p=0.593)
       -> 与 0 无显著差异（偏置被整项扣掉）
   含义：naive 的偏置完全来自「前置失衡 × beta」，CUPED 把这一项扣掉了
-
 单次实现（固定分流）下的具体表现：
 CUPED vs post-only  [conditional]
   重复 1,500 次
@@ -140,5 +139,4 @@ CUPED vs post-only  [randomized]
 
 逐项检查: {'naive 偏置由失衡驱动（斜率=beta）': True, 'CUPED 无失衡偏置（斜率不显著）': True, 'CUPED 随机化下校准': True, 'CUPED 条件模式下校准': True, '条件模式下 naive 未校准': True, '方差缩减贴近 rho^2': True, 'delta method 校准': True, 'CR1 校准': True, '聚类反例确实崩溃': True}
 总体判定: PASS
-总耗时 116.8s
 ```

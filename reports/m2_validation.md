@@ -140,5 +140,4 @@ ab-causal-lab · M2 验证报告
 
 逐项检查: {'边界精度通过': True, '调整 p 值与边界一致': True, 'naive 窥视确实膨胀': True, '群序贯校准': True, 'mSPRT 保证成立（不超 alpha）': True, '贝叶斯阈值并非自动校准': True, '群序贯功效优于 mSPRT': True}
 总体判定: PASS
-总耗时 33.3s
 ```

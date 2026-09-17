@@ -678,7 +678,22 @@ python -m venv .venv
 .venv/Scripts/activate          # Windows；Linux/macOS 用 source .venv/bin/activate
 pip install -r requirements.txt # 钉死到实测版本；要更严用 requirements.lock
 
-pytest tests                    # 475 个测试，约 9 分钟（别加 -q，会吞掉汇总行）
+pytest tests                    # 504 个测试，约 7 分钟（别加 -q，会吞掉汇总行）
+python scripts/run_all_checks.py            # **全部检查**：测试 + M0–M6 + 数仓，约 18 分钟
+python scripts/run_all_checks.py --quick    # 快速版
+python scripts/run_all_checks.py --list     # 只列计划
+
+# 或者用任务脚本（同一份定义，顺带把 UTF-8 环境设好）：
+#   powershell -File tasks.ps1 test | verify | quick | deps | serve
+```
+
+**CI 跑的就是同一条命令**（`.github/workflows/ci.yml` 调 `run_all_checks.py`），
+所以本地绿与 CI 绿不可能是两件事。工作流还会把 `reports/` 作为产物上传 ——
+报告与图是这个项目的交付物，CI 不该只报"绿了"。
+
+单独跑某一段：
+
+```bash
 python scripts/run_m0_validation.py            # M0：分流层 + 推断层，约 90 秒
 python scripts/run_m1_validation.py            # M1：三个新方法，约 120 秒
 python scripts/run_m2_validation.py            # M2：序贯检验与贝叶斯决策，约 35 秒
@@ -688,6 +703,10 @@ python scripts/run_m5_validation.py            # M5：平台管道校准 + 数�
 python scripts/run_m6_validation.py            # M6：生产口径（口径一致/分析单元/MDE），约 3 分钟
 python scripts/run_warehouse.py                # 数仓链路 + 实验结论，约 10 秒
 ```
+
+> **顺序有讲究**：`run_warehouse.py` 必须排在 `run_m5_validation.py` / `run_m6_validation.py`
+> **之前** —— 那两段的数仓内容要 `build/warehouse.duckdb` 存在，否则会**静默跳过**
+> （报告里只剩一句"跳过"，而汇总仍然全绿）。`run_all_checks.py` 把这个顺序写死并有测试守着。
 
 **把平台跑起来**（本项目自带的演示服务，独立端口，与你在用的 DSH Web GUI 的 3080 无关）：
 
@@ -824,6 +843,7 @@ Python 只做假设检验。两边都不越界 —— 所以不会出现"在 SQL
 src/ablab/
 ├── hashing.py             MurmurHash3：纯 Python 标量 + numpy 向量化（逐位一致）
 ├── assignment.py          分流引擎：Randomizer / ExperimentSpec / Layer
+├── reporting.py           报告写出规则：reports/ 里只留可复现内容（剥掉耗时与绝对路径）
 ├── inference/
 │   ├── aggregates.py      可加充分统计量 + merge（M1 的公共地基）
 │   ├── welch.py           t 检验推断的唯一实现（三层结构，六个入口共用）
@@ -873,14 +893,18 @@ src/ablab/
 └── plotting.py            图表样式与中文字体探测
 
 sql/                       五层 SQL，每一层都写了"为什么这么写"
-scripts/                   十个脚本（含 pick_demo_salts.py 与 lock_requirements.py）
+scripts/                   十一个脚本（含 pick_demo_salts.py / lock_requirements.py /
+                           run_all_checks.py —— 后两者分别管依赖与"全部检查"的单一定义）
+tasks.ps1                  常用命令入口（与 CI 共用 run_all_checks.py）
+.github/workflows/ci.yml   测试 + 验证双 job，并把 reports/ 作为产物发布
 requirements.txt           直接依赖（钉死到实测版本）
 requirements.lock          直接依赖 + 传递闭包，共 42 个包
-tests/                     475 个测试（hashing 25 / assignment 25 / inference 20 /
+.gitattributes             统一换行符（这个仓库的行尾曾经是混的）
+tests/                     504 个测试（hashing 25 / assignment 25 / inference 20 /
                            inference_m1 43 / methods 30 / sequential 70 /
                            causal 41 / hte 47 / validation 38 / warehouse 23 /
                            platform 53 / platform_warehouse 25 / platform_m6 28 /
-                           dependencies 7）
+                           dependencies 7 / ci_contract 12 / reporting 17）
 ```
 
 ### 依赖
@@ -1077,6 +1101,23 @@ python scripts/lock_requirements.py --check   # 校验当前环境是否等于�
     是同一件事的直接说法。所以平台把 MDE 与所需样本量做成了报告里的一等读数，
     而不是把 ρ² 摆在那里等人解读。
 
+27. **"跑哪些检查"只允许有一份定义**
+    CI 与本地各维护一份命令清单，迟早漂移：某天本地加了个脚本、CI 没加，
+    于是**绿灯的 CI 其实没检查那一步**。所以定义只在 `scripts/run_all_checks.py` 里，
+    CI 与 `tasks.ps1` 都调它。同一份定义还顺手钉住了一条**顺序依赖**：
+    `warehouse` 必须排在 `m5`/`m6` 之前，否则那两段的数仓内容会因为
+    `build/warehouse.duckdb` 不存在而**静默跳过** —— 报告里只剩一句"跳过"，
+    汇总却仍然全绿。**"少测了一段"比"测失败"危险得多**，因为没有任何信号。
+
+28. **`reports/` 里只放"换台机器也一模一样"的东西**
+    耗时和绝对路径属于运行信息，不属于证据。把它们写进报告会有两个后果：
+    ① 重跑一次 `git diff reports/` 就有 16 增 14 删的噪声，于是
+    **"重跑后报告没变"这条最硬的可复现性证据永远无法用 diff 核对**；
+    ② 换台机器跑，diff 里全是无关变化，真正的数字变化被淹掉。
+    所以规则做成**写出时的统一过滤**（`ablab/reporting.py`），而不是逐个改
+    `say(...)` 调用 —— 将来有人加一行带耗时的输出时，不需要记得这条规则。
+    实测收益：过滤之后同一份代码重跑，`reports/` 逐字节不变。
+
 ---
 
 ## 六、已知边界
@@ -1156,6 +1197,26 @@ M6 生产口径自身的边界：
   （FWER 从 0.0002 到 0.0079、功效从 0.0002 到 0.175），但平台上用户看不见也改不了。
 * **MDE 报告用的是**观测到的** SE**，不是实验前的历史波动。所以它回答的是
   "这份数据能检出多大效应"，不是"下次该按什么规模做" —— 后者请用 `/api/design/power`。
+
+工程外壳自身的边界（这一节存在是因为"能跑"与"别人能跑"是两件事）：
+
+* **CI 还没有在 GitHub 上真跑过一次。** 我校验了 YAML 能解析、每个 job 引用的命令
+  在本机都能通过（`run_all_checks.py` 10 项全绿，1070 秒），
+  但"工作流在 GitHub 的 runner 上跑起来"这件事本身没验证过。
+  最可能出问题的两点：`actions/setup-python` 是否已提供 3.14（不提供就改成 `3.13`），
+  以及 Ubuntu 上没有 CJK 字体（那会让图走英文回退分支，是设计好的行为而不是故障）。
+  **在 CI 真的绿一次之前，不要把那个徽章当成证据。**
+* **git 身份是仓库级占位值**（`ab-causal-lab <dev@example.com>`），
+  因为这台机器的全局 `user.name` / `user.email` 是空的。
+  改成你自己的：`git config user.name "..."` 与 `git config user.email "..."`。
+  首次提交是一个**基线提交**（128 个文件），不是七个按里程碑分的提交 ——
+  那样编造历史不如老实说"M0–M6 是一路做下来的，版本控制与 CI 是最后才补齐的"。
+* **报告的重跑一致性只在单个脚本上验过。** `reports/` 现在不含耗时与绝对路径，
+  实测 `run_m2_validation.py` 连跑两次报告 SHA256 相同；
+  但**七个脚本各跑两遍的完整对照没有做**（那要 ~25 分钟），
+  所以"整份 reports/ 重跑后逐字节不变"这句话目前是**推断**，不是实测。
+* **`tasks.ps1` 是 Windows 专用**（`chcp`、`.venv\Scripts\`）。Linux/macOS 上直接用
+  `python scripts/run_all_checks.py` —— 那一份是跨平台的，而且它才是定义的所在。
 
 ## 七、路线图
 

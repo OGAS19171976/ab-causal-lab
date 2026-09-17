@@ -45,6 +45,7 @@ from ablab.causal import (  # noqa: E402
     twfe_decomposition,
 )
 from ablab.plotting import label, plt, save, setup_style  # noqa: E402
+from ablab.reporting import for_report  # noqa: E402
 from ablab.validation import (  # noqa: E402
     run_pretrend_audit,
     run_scm_audit,
@@ -367,7 +368,7 @@ def main() -> int:
     emit(f"总耗时 {time.perf_counter() - t0:.1f}s")
 
     report = out / "m3_validation.md"
-    report.write_text("# M3 验证报告\n\n```text\n" + "\n".join(log) + "\n```\n", encoding="utf-8")
+    report.write_text("# M3 验证报告\n\n```text\n" + "\n".join(for_report(log, root=ROOT)) + "\n```\n", encoding="utf-8")
     print(f"\n报告已写入 {report}")
     return 0 if verdict == "PASS" else 1
 

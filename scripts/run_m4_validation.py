@@ -41,6 +41,7 @@ from ablab.causal import (  # noqa: E402
     uplift_curve,
 )
 from ablab.plotting import label, plt, save, setup_style  # noqa: E402
+from ablab.reporting import for_report  # noqa: E402
 from ablab.validation import (  # noqa: E402
     run_cate_form_comparison,
     run_dml_audit,
@@ -310,7 +311,7 @@ def main() -> int:
     emit(f"总耗时 {time.perf_counter() - t0:.1f}s")
 
     report = out / "m4_validation.md"
-    report.write_text("# M4 验证报告\n\n```text\n" + "\n".join(log) + "\n```\n", encoding="utf-8")
+    report.write_text("# M4 验证报告\n\n```text\n" + "\n".join(for_report(log, root=ROOT)) + "\n```\n", encoding="utf-8")
     print(f"\n报告已写入 {report}")
     return 0 if verdict == "PASS" else 1
 

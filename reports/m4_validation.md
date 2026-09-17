@@ -62,5 +62,4 @@ DML vs naive plug-in（15 次仿真/样本量）
 
 逐项检查: {'naive plug-in 有可见偏置': True, 'DML 偏置远小于 naive': True, 'DML 覆盖率守住在名义附近': True, 'naive 覆盖率随 n 崩塌': True, '四种 CATE 形式都跑过': True, '存在排序能力（秩相关为正）': True, '排序与水平结论冲突': True, '样本内 Qini 虚高': True}
 总体判定: PASS
-总耗时 310.0s
 ```

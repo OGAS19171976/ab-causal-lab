@@ -56,6 +56,7 @@ from ablab.platform.datasource import (  # noqa: E402
 from ablab.platform.demo import DEMO_EXPERIMENTS  # noqa: E402
 from ablab.platform.registry import ExperimentRecord  # noqa: E402
 from ablab.plotting import label, plt, save, setup_style  # noqa: E402
+from ablab.reporting import for_report  # noqa: E402
 
 BLUE, ORANGE, GREY, RED, GREEN, PURPLE = (
     "#1f77b4", "#ff7f0e", "#7f7f7f", "#d62728", "#2ca02c", "#9467bd",
@@ -478,7 +479,7 @@ def main() -> int:
         "# M5 验证报告：平台层\n\n"
         "> 由 `python scripts/run_m5_validation.py` 生成，全部数字可复现。\n"
         "> M5 不引入新方法，验证重点从「分布性质」转为「工程不变量」+ 整条管道的 A/A 校准。\n\n"
-        "```text\n" + "\n".join(log) + "\n```\n",
+        "```text\n" + "\n".join(for_report(log, root=ROOT)) + "\n```\n",
         encoding="utf-8",
     )
     print(f"报告已写入 {report}")

@@ -24,6 +24,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from ablab.reporting import for_report  # noqa: E402
 from ablab.warehouse import (  # noqa: E402
     WarehouseConfig,
     analyse_ads,
@@ -145,7 +146,7 @@ def main() -> int:
 
     report = out_dir / "warehouse_report.md"
     report.write_text(
-        "# 数仓链路验证报告\n\n```text\n" + "\n".join(log) + "\n```\n",
+        "# 数仓链路验证报告\n\n```text\n" + "\n".join(for_report(log, root=ROOT)) + "\n```\n",
         encoding="utf-8",
     )
     print(f"\n报告已写入 {report}")
