@@ -75,6 +75,42 @@ class TestRelativizePaths:
     def test_plain_text_untouched(self):
         assert relativize_paths("没有任何路径的一行", root=ROOT) == "没有任何路径的一行"
 
+    def test_posix_semantics_would_leak_a_windows_path(self):
+        """把"CI 上那次失败"的**机制**钉住（本机是 Windows，复现不出那个现象）。
+
+        现象（CI / Ubuntu 上真实发生）：
+        ``relativize_paths(r"C:\\Users\\someone\\.cache\\uv", root=...)`` 原样返回了，
+        用户名照旧留在正文里 —— ``<绝对路径>`` 兜底没生效。
+
+        原因就在这两行：在 POSIX 上，``C:\\Users\\...`` 不是绝对路径，
+        于是 ``Path(raw).resolve()`` 把它接到 cwd 上，
+        ``.relative_to(root)`` 竟然**成功**（因为 cwd 就是 root）。
+        修法是先问 ``is_absolute()`` 再比 —— 这两条断言就是那个前提。
+        """
+        import pathlib
+
+        raw = r"C:\Users\someone\.cache\uv"
+        assert not pathlib.PurePosixPath(raw).is_absolute(), (
+            "POSIX 上 C:\\... 必须是相对路径 —— 这正是当初 relative_to 会成功的原因"
+        )
+        assert pathlib.PureWindowsPath(raw).is_absolute()
+
+    def test_sub_step_guards_with_is_absolute(self):
+        """并且实现里**确实**用了那道闸门（否则上面的机制仍会咬人）。
+
+        源码级断言不算优雅，但这里它检查的是一条**本机跑不到的分支**（POSIX 语义）：
+        没有它，这个 bug 只会在 CI 上复现，而"只在 CI 上红"是最难查的一类。
+        """
+        import inspect
+
+        import ablab.reporting as reporting
+
+        source = inspect.getsource(reporting.relativize_paths)
+        assert "is_absolute()" in source, (
+            "relativize_paths 的兜底分支必须先确认候选路径在本平台上是绝对路径，"
+            "否则在 POSIX 上 Windows 路径会被原样放回正文（用户名泄露）"
+        )
+
 
 class TestForReport:
     def test_drops_lines_that_become_empty(self):

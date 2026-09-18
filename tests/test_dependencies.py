@@ -118,26 +118,57 @@ class TestCrossPlatformLock:
         assert "tzdata" in marked, "tzdata（pandas 只在 Windows/emscripten 要）也没写 marker"
 
     def test_check_skips_them_on_linux(self):
-        """模拟 Linux：这两个包必须被跳过，而其余包照旧检查。"""
+        """模拟 Linux：这两个包必须被跳过，而其余包照旧检查。
+
+        **用注入的 entries，不要从当前环境重算闭包。** 第一版是从 `closure()`
+        拿的条目，于是在 CI 的 Linux 上失败：那台机器根本没装 colorama / tzdata
+        （它们是 Windows 专属依赖），**压根不会出现在闭包里**，
+        自然既谈不上"被跳过"、也谈不上"被保留" —— 测试写成了只在本机成立的形状。
+        这也正是"测试必须自己把输入条件写死"的又一例。
+        """
         module = self._load()
-        locked = module.closure(tuple(n for g in module.DIRECT.values() for n in g))
-        applicable, skipped = module.select_for_platform(locked, self.LINUX)
+        entries = {
+            "numpy": ("2.5.3", None),
+            "librt": ("0.15.0", 'platform_python_implementation != "PyPy"'),
+            "colorama": ("0.4.6", 'sys_platform == "win32"'),
+            "tzdata": ("2026.2", 'sys_platform == "win32"'),
+        }
+        applicable, skipped = module.select_for_platform(entries, self.LINUX)
 
         assert "colorama" in skipped and "tzdata" in skipped, skipped
         assert "colorama" not in applicable
         # librt（mypy 的依赖）条件是非 PyPy —— Linux 上照样需要，不能被误跳
         assert "librt" in applicable, "librt 在 Linux 上也需要，不该被跳过"
-        # 直接依赖一个都不能被跳过（它们无条件需要）
-        direct = {n.lower() for g in module.DIRECT.values() for n in g}
-        assert not (direct & set(skipped)), f"直接依赖被误判为不适用：{direct & set(skipped)}"
+        # 无条件依赖一个都不能被跳过
+        assert "numpy" in applicable
 
     def test_check_keeps_them_on_windows(self):
-        """模拟 Windows：它们就该被要求存在（本机是真装着的）。"""
+        """模拟 Windows：它们就该被要求存在。"""
         module = self._load()
-        locked = module.closure(tuple(n for g in module.DIRECT.values() for n in g))
-        applicable, skipped = module.select_for_platform(locked, self.WINDOWS)
+        entries = {
+            "numpy": ("2.5.3", None),
+            "colorama": ("0.4.6", 'sys_platform == "win32"'),
+            "tzdata": ("2026.2", 'sys_platform == "win32"'),
+        }
+        applicable, skipped = module.select_for_platform(entries, self.WINDOWS)
         assert "colorama" in applicable and "tzdata" in applicable
         assert skipped == [], f"Windows 上不该跳过任何包：{skipped}"
+
+    def test_real_lock_file_loses_nothing_on_linux(self):
+        """真锁文件在 Linux 上：该跳的跳、该留的留 —— 用真文件而不是真环境。
+
+        这条读的是 `requirements.lock` 本身，所以**在任何平台上结论都一样**；
+        它保证"锁文件对 Linux 是有意义的"，而不是"本机恰好测出这个结果"。
+        """
+        module = self._load()
+        entries = module.parse_lock(ROOT / "requirements.lock")
+        applicable, skipped = module.select_for_platform(entries, self.LINUX)
+        assert set(skipped) == {"colorama", "tzdata"}, skipped
+        # 直接依赖一个都不能被跳过
+        direct = {module.normalize(n) for g in module.DIRECT.values() for n in g}
+        assert not (direct & set(skipped)), f"直接依赖被误判为不适用：{direct & set(skipped)}"
+        assert "librt" in applicable
+        assert len(applicable) == len(entries) - 2
 
     def test_every_lock_line_is_a_valid_requirement(self):
         """锁文件必须能被标准 PEP 508 解析器读 —— pip 就是那么读的。

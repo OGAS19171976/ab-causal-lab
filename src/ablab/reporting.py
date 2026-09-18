@@ -80,6 +80,10 @@ def relativize_paths(line: str, root: Path | None = None) -> str:
     实现上不用正则去匹配"一个完整路径" —— 那是猜，且遇到含空格的目录名必错
     （本项目自己的路径里就有空格）。做法是先拿**已知的根**做字面替换，
     再把紧跟其后的那一段路径转成正斜杠；剩下匹配不到根的绝对路径才用正则兜底。
+
+    兜底那一步判决"它是不是本机绝对路径"时必须真的问 ``Path.is_absolute()``：
+    在 POSIX 上 ``C:\\Users\\x`` 是**相对路径**，直接 ``resolve().relative_to(root)``
+    会成功并把它原样放回去（详见下面 ``_sub`` 里的注释与那条 CI 失败）。
     """
     out = line
     if root is not None:
@@ -92,10 +96,22 @@ def relativize_paths(line: str, root: Path | None = None) -> str:
     def _sub(match: re.Match[str]) -> str:
         raw = match.group(0)
         if root is not None:
-            try:
-                return str(Path(raw).resolve().relative_to(Path(root).resolve())).replace("\\", "/")
-            except (ValueError, OSError):
-                pass
+            candidate = Path(raw)
+            # **必须先确认它在本平台上是绝对路径**，再谈"是不是在 root 底下"。
+            # 这是被 CI 抓出来的一个真实缺陷：CI 在 Ubuntu 上跑时
+            # `tests/test_reporting.py::test_outside_path_becomes_placeholder` 失败 ——
+            # 因为它喂的是 `C:\Users\someone\...`，而在 POSIX 上
+            # `Path("C:\\Users\\someone\\...")` 是个**相对路径**，
+            # `.resolve()` 把它接到 cwd 上，于是 `.relative_to(root)` 竟然**成功**，
+            # 原样返回、用户名照旧留在正文里 —— `<绝对路径>` 兜底根本没生效。
+            # 换句话说：在 Linux 上，"报告里不含绝对路径"这条保证是**打折**的。
+            if candidate.is_absolute():
+                try:
+                    return str(
+                        candidate.resolve().relative_to(Path(root).resolve())
+                    ).replace("\\", "/")
+                except (ValueError, OSError):
+                    pass
         return "<绝对路径>"
 
     return _ABS_PATH.sub(_sub, out)
