@@ -14,7 +14,26 @@
 用法::
 
     python scripts/lock_requirements.py            # 写 requirements.lock
-    python scripts/lock_requirements.py --check     # 只校验当前环境是否满足锁定
+    python scripts/lock_requirements.py --check     # 校验当前环境 == 锁文件
+
+``--check`` 做什么（以及它曾经**没做**什么）
+-------------------------------------------
+第一版的 ``--check`` 根本没打开过 ``requirements.lock``：它是从**当前环境**重算一遍
+闭包（``dist.version`` 来自已装的包），再拿 ``md.version()`` 去比自己 —— 恒等，
+于是这一步**必然绿**，却挂着"依赖声明与锁文件一致"的牌子。
+
+它被 CI 当场演示了：第一次在 Ubuntu runner 上跑时，锁文件把 ``colorama`` 写成硬依赖
+（那是 pytest / click 的 Windows 专属依赖），而那台机器上根本没有 colorama，
+这一步照样 ``OK``。**假绿灯比红灯危险**，因为它不产生任何信号。
+
+现在它真的读锁文件，并做三件事：
+1. 锁里**本平台适用**的包，必须都装着、且版本一致；
+2. 本平台**实际需要**的包（从直接依赖重算闭包），锁里必须都有 ——
+   这一条才是能抓住"加了依赖忘了重新生成锁"的那种检查；
+3. 锁里带 ``; marker`` 的行，换平台时按 marker 跳过（见 ``select_for_platform``）。
+
+判定逻辑是纯函数 ``check_against``，数据（installed / needed）可注入，
+所以"在 Linux 上会不会误判"能在 Windows 上被测到。
 """
 
 from __future__ import annotations
@@ -168,6 +187,69 @@ def select_for_platform(
     return applicable, sorted(skipped)
 
 
+def normalize(name: str) -> str:
+    """PEP 503 规范化名：``scikit_learn`` / ``scikit-learn`` 要能对上。
+
+    不规范化就会出现"锁里写着 ``ast_serialize``、环境里查到 ``ast-serialize``"
+    这种自己吓自己的不一致。
+    """
+    import re
+
+    return re.sub(r"[-_.]+", "-", name).strip().lower()
+
+
+def parse_lock(path: Path) -> dict[str, tuple[str, str | None]]:
+    """读锁文件 → ``{规范化名: (版本, marker)}``。
+
+    **这一步是 ``--check`` 存在的意义**：不读文件的 check 不是 check
+    （见模块 docstring 里那段"它曾经没做什么"）。
+    """
+    out: dict[str, tuple[str, str | None]] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        head, _, marker = line.partition(";")
+        name, sep, version = head.partition("==")
+        if not sep:
+            print(f"  [警告] 锁文件里这一行没有钉死版本，已忽略：{line}", file=sys.stderr)
+            continue
+        out[normalize(name)] = (version.strip(), marker.strip() or None)
+    return out
+
+
+def check_against(
+    entries: dict[str, tuple[str, str | None]],
+    *,
+    installed: dict[str, str],
+    needed: dict[str, str],
+    environment: dict | None = None,
+) -> tuple[list[str], list[str]]:
+    """纯函数：返回 ``(不一致清单, 本平台不适用的包)``。
+
+    ``installed`` / ``needed`` 都按**规范化名**做键，由调用方注入 ——
+    测试因此可以构造"锁里少一个包""锁里版本写错""Linux 上 colorama 不该被要求"
+    这些场景，而不必真的去改环境。
+    """
+    applicable, skipped = select_for_platform(entries, environment)
+    bad: list[str] = []
+    for name, (version, _marker) in sorted(applicable.items()):
+        actual = installed.get(normalize(name))
+        if actual is None:
+            bad.append(f"{name} 未安装（锁 {version}）")
+        elif actual != version:
+            bad.append(f"{name} 装了 {actual}，锁的是 {version}")
+
+    locked_names = set(entries)
+    for name, version in sorted(needed.items()):
+        if normalize(name) not in locked_names:
+            bad.append(
+                f"{name}=={version} 当前环境需要它，但锁文件里没有"
+                "（多半是加了依赖却忘了重新生成锁）"
+            )
+    return bad, skipped
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="生成 / 校验 requirements.lock")
     ap.add_argument("--out", default=str(ROOT / "requirements.lock"))
@@ -181,16 +263,27 @@ def main() -> int:
     py = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
 
     if args.check:
-        applicable, skipped = select_for_platform(locked)
-        bad: list[str] = []
-        for name, (version, _marker) in sorted(applicable.items()):
-            try:
-                actual = md.version(name)
-            except md.PackageNotFoundError:
-                bad.append(f"{name} 未安装（锁 {version}）")
-                continue
-            if actual != version:
-                bad.append(f"{name} 装了 {actual}，锁的是 {version}")
+        lock_path = Path(args.out)
+        if not lock_path.exists():
+            print(f"锁文件不存在：{lock_path}")
+            return 1
+        entries = parse_lock(lock_path)
+        # sys.path 顺序是 **venv 在前、全局在后**，而
+        # ``--system-site-packages`` 下同一个包可能两边都有、版本还不一样。
+        # 这时"装了哪个"的答案必须是**先出现的那个**（那才是 import 得到的），
+        # 所以用 setdefault 而不是直接赋值 —— 第一版写成
+        # ``{normalize(...): version for dist in md.distributions()}``，
+        # 后出现的全局旧版本把 venv 的新版本覆盖掉，于是报了 6 个假不一致
+        # （uvicorn 0.49.0 vs 锁 0.53.0 之类）。
+        installed: dict[str, str] = {}
+        for dist in md.distributions():
+            installed.setdefault(normalize(dist.metadata["Name"]), dist.version)
+        needed = {
+            normalize(name): version for name, (version, _m) in locked.items()
+        }
+        bad, skipped = check_against(
+            entries, installed=installed, needed=needed
+        )
         if bad:
             print("当前环境与 requirements.lock 不一致：")
             for line in bad:
@@ -199,13 +292,14 @@ def main() -> int:
                 print(f"  （另有 {len(skipped)} 个包在当前平台不适用，已跳过："
                       f"{', '.join(skipped)}）")
             return 1
+        applicable, _ = select_for_platform(entries)
         note = (
             f"；{len(skipped)} 个在当前平台不适用已跳过（{', '.join(skipped)}）"
             if skipped
             else ""
         )
-        print(f"当前环境与 requirements.lock 一致（{len(applicable)} 个包，"
-              f"Python {py}{note}）")
+        print(f"当前环境与 requirements.lock 一致（锁 {len(entries)} 行，"
+              f"本平台适用 {len(applicable)} 个，Python {py}{note}）")
         return 0
 
     lines = [

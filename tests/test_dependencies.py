@@ -157,6 +157,87 @@ class TestCrossPlatformLock:
             assert parsed.specifier, f"锁文件里这一行没有钉死版本：{line}"
 
 
+class TestLockCheckActuallyChecks:
+    """``--check`` 必须**真的读锁文件** —— 它曾经不是。
+
+    实测到的问题：第一版 ``--check`` 是从当前环境重算一遍闭包（``dist.version``
+    来自已装的包），再拿 ``md.version()`` 去比自己 —— **恒等**，而且从头到尾没打开过
+    ``requirements.lock``。于是这一步**必然绿**，却挂着"依赖声明与锁文件一致"的牌子。
+
+    它是被 CI 当场演示的：第一次在 Ubuntu runner 上跑时，锁文件把 ``colorama``
+    （pytest / click 的 Windows 专属依赖）写成硬依赖，那台机器上根本没有它，
+    这一步照样 ``OK``。**假绿灯比红灯危险**，因为它不产生任何信号。
+
+    这三条测试用**注入数据**构造"锁写错了"的三种情形，所以它们检查的是
+    "这个 check 有没有能力发现问题"，而不是"当前环境恰好是对的"。
+    """
+
+    @staticmethod
+    def _load():
+        spec = importlib.util.spec_from_file_location(
+            "lock_requirements_under_test3", ROOT / "scripts" / "lock_requirements.py"
+        )
+        assert spec and spec.loader
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        return module
+
+    def test_parses_the_real_lock_file(self):
+        """先把真锁文件读进来：条目数、版本、以及 marker 都要解析出来。"""
+        module = self._load()
+        entries = module.parse_lock(ROOT / "requirements.lock")
+        assert len(entries) >= 40, f"锁文件只解析出 {len(entries)} 条，太小了"
+        assert entries["numpy"][0] == "2.5.3"
+        assert entries["colorama"][1] is not None, "colorama 的 marker 没被解析出来"
+        assert "win32" in entries["colorama"][1]
+        # 规范化：锁里写 ast_serialize，键应当是 ast-serialize
+        assert "ast-serialize" in entries
+
+    def test_detects_a_wrong_version_in_the_lock(self):
+        """锁里版本写错必须报出来 —— 旧实现连这个都做不到（自比恒等）。"""
+        module = self._load()
+        entries = {"numpy": ("1.0.0", None)}
+        bad, skipped = module.check_against(
+            entries,
+            installed={"numpy": "2.5.3"},
+            needed={"numpy": "2.5.3"},
+        )
+        assert any("numpy" in b and "1.0.0" in b for b in bad), bad
+        assert skipped == []
+
+    def test_detects_a_package_missing_from_the_lock(self):
+        """环境需要、锁里没有 → 报出来。这正是"加了 mypy 却忘了重新生成锁"那一幕。"""
+        module = self._load()
+        entries = {"numpy": ("2.5.3", None)}
+        bad, _ = module.check_against(
+            entries,
+            installed={"numpy": "2.5.3", "mypy": "2.3.1"},
+            needed={"numpy": "2.5.3", "mypy": "2.3.1"},
+        )
+        assert any("mypy" in b and "锁文件里没有" in b for b in bad), bad
+
+    def test_detects_a_missing_installation(self):
+        module = self._load()
+        entries = {"numpy": ("2.5.3", None), "mypy": ("2.3.1", None)}
+        bad, _ = module.check_against(
+            entries, installed={"numpy": "2.5.3"}, needed={"numpy": "2.5.3"}
+        )
+        assert any("mypy 未安装" in b for b in bad), bad
+
+    def test_clean_case_has_nothing_to_report(self):
+        module = self._load()
+        entries = {"numpy": ("2.5.3", None), "colorama": ("0.4.6", 'sys_platform == "win32"')}
+        bad, skipped = module.check_against(
+            entries,
+            installed={"numpy": "2.5.3"},
+            needed={"numpy": "2.5.3"},
+            environment={"sys_platform": "linux", "platform_system": "Linux"},
+        )
+        assert bad == [], bad
+        assert skipped == ["colorama"], skipped
+
+
 class TestDependencyDeclarations:
     def test_every_third_party_import_is_declared(self):
         """源码里 import 的每个第三方包，都必须在 pyproject 里声明。

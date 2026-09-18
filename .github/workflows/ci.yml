@@ -56,9 +56,14 @@ jobs:
           # 那远好过悄悄换一个版本把后面的检查跑绿。
           python-version-file: .python-version
           cache: pip
-          cache-dependency-path: requirements.txt
-      - name: 安装依赖
-        run: pip install -r requirements.txt
+          cache-dependency-path: requirements.lock
+      - name: 安装依赖（按锁文件，不用 requirements.txt）
+        # **CI 装锁文件**：requirements.txt 只钉死直接依赖，传递依赖交给 resolver ——
+        # 那意味着 CI 上装到的闭包可能与本机锁定的不同，于是下面那步 `--check`
+        # 会因为"传递依赖漂移"而红，而红的原因与代码无关。
+        # 锁文件里带 `; marker` 的行（colorama / tzdata 只在 Windows 需要）
+        # 由 pip 按平台自动跳过 —— 这正是把 marker 写进锁文件的好处。
+        run: pip install -r requirements.lock
       - name: 记录环境（排查 CI 失败时先看这一条）
         run: |
           python -VV
@@ -87,9 +92,9 @@ jobs:
         with:
           python-version-file: .python-version
           cache: pip
-          cache-dependency-path: requirements.txt
-      - name: 安装依赖
-        run: pip install -r requirements.txt
+          cache-dependency-path: requirements.lock
+      - name: 安装依赖（按锁文件，理由见 tests job）
+        run: pip install -r requirements.lock
       # run_all_checks.py 里写死了一条顺序依赖：warehouse 必须排在 m5/m6 之前，
       # 否则那两段的数仓内容会因为 build/warehouse.duckdb 不存在而**静默跳过**
       # （报告里只剩一句"跳过"，汇总却仍然全绿）。

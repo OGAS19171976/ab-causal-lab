@@ -986,11 +986,11 @@ tasks.ps1                  常用命令入口（与 CI 共用 run_all_checks.py�
 requirements.txt           直接依赖（钉死到实测版本）
 requirements.lock          直接依赖 + 传递闭包，共 48 个包
 .gitattributes             统一换行符（这个仓库的行尾曾经是混的）
-tests/                     544 个测试（hashing 25 / assignment 25 / inference 20 /
+tests/                     553 个测试（hashing 25 / assignment 25 / inference 20 /
                            inference_m1 43 / methods 30 / sequential 70 /
                            causal 41 / hte 47 / validation 38 / warehouse 23 /
                            platform 53 / platform_warehouse 31 / platform_m6 28 /
-                           dependencies 8 / ci_contract 25 / reporting 37）
+                           dependencies 17 / ci_contract 25 / reporting 37）
 ```
 
 ### 依赖
@@ -1350,12 +1350,54 @@ python -m mypy                                # 类型检查（范围与档位�
     `pyproject.toml`（声明支持范围）与 `scripts/lock_requirements.py` 里的 `DIRECT`
     （生成锁文件的起点）。实测被第三份坑了：给前两份加了 `mypy`，重新生成
     `requirements.lock` —— 锁里**没有 mypy**，因为生成器根本不知道它。
+    抓住它的是测试 `test_lock_covers_everything_required`（锁必须覆盖
+    requirements.txt 的每一项）；这次又补了**反方向**的一条
+    （`DIRECT` 的每一项都要在 requirements.txt 里）。两个方向都在，
+    三份清单就只能**同时**正确，不能各自漂移。
 
-    而 `lock_requirements.py --check` 抓不到这件事：它比对的是"锁文件 vs 当前环境"，
-    对"两边都没有 mypy"是瞎的。抓住它的是那条早就存在的
-    `test_lock_covers_everything_required`（锁必须覆盖 requirements.txt 的每一项）；
-    这次又补了**反方向**的一条（`DIRECT` 的每一项都要在 requirements.txt 里）。
-    两个方向都在，三份清单就只能**同时**正确，不能各自漂移。
+37. **`--check` 曾经是个"必然绿"的步骤 —— 而它是被真的跑 CI 才揭穿的**
+    这一条值得单独记，因为它同时说明了**假绿灯**有多难用肉眼看出来，
+    以及**把东西真的跑一遍**为什么不可替代。
+
+    现象：在 GitHub 上跑第一轮 CI 时，这一步过了：
+
+        依赖声明与锁文件一致  ->  OK
+
+    而当时的环境是 **Ubuntu**，锁文件里却把 `colorama`（pytest / click 的
+    Windows 专属依赖）写成硬依赖 —— 那台机器上根本没有 colorama。
+    读代码才发现原因：第一版 `--check` **从来没打开过 `requirements.lock`**：
+
+        locked = closure(everything)     # 从**当前环境**重算闭包
+        ...
+        actual = md.version(name)        # 版本也来自当前环境
+        if actual != version:            # 自己和自己比 → 恒等，永远为假
+
+    也就是说：它是**环境和自己比**，与锁文件无关 → 必然通过。
+    在 CI 上它和"真检查"长得一模一样，绿得毫无破绽。
+    **绿灯不产生信号，所以"这一步到底检查了什么"只能靠读代码或靠一次真跑。**
+
+    修法：
+    * `--check` 现在**读锁文件**（`parse_lock`），比"锁里的适用条目 vs 实际装的"；
+    * 再加一条**反向**检查：从直接依赖重算出的闭包，锁里必须都有 ——
+      这才是能抓住"加了依赖忘了重新生成锁"的那一步；
+    * 判定抽成纯函数 `check_against(entries, installed=..., needed=..., environment=...)`，
+      数据可注入，于是"锁里版本写错""锁里少一个包""Linux 上该跳过谁"这三种情形
+      都能在 Windows 上被测到（5 条测试）；
+    * CI 改成 `pip install -r requirements.lock`：`requirements.txt` 只钉直接依赖，
+      传递依赖交给 resolver，那样 CI 装到的闭包可能与本机锁定的不同，
+      `--check` 会因为**漂移**而红，而红的原因与代码无关。
+      锁文件里带 `; marker` 的行由 pip 按平台自动跳过 —— 这正是 marker 写进锁文件的回报。
+
+    顺带纠正一条我之前写错的话：我在第 36 条里说 `--check` "对两边都没有 mypy 是瞎的"，
+    那是**基于对旧实现的误读**写的。真实机制更简单也更糟：它压根没读锁文件。
+    结论（真正抓住 mypy 遗漏的是 `test_lock_covers_everything_required`）不变。
+
+    还有一条小的、但同样是"检查工具自己出错"的实例：为了评估 CI 风险，
+    我写了个脚本查每个包在 Linux + CPython 3.14 上有没有 wheel，
+    判定只认 `cp314` / `abi3` 标签，于是把 **ruff 误报成"缺 Linux wheel"**——
+    ruff 发的是 `py3-none-manylinux`（独立二进制，不绑 ABI）。
+    **检查工具的假报会直接误导决策**（差点让我去改一个根本不存在的问题），
+    已修正判定；最终结论是 48 个包在 Linux + 3.14 上**全部有预编译 wheel**。
 
 ---
 
