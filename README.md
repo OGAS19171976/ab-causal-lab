@@ -1,5 +1,7 @@
 # ab-causal-lab
 
+[![checks](https://github.com/OGAS19171976/ab-causal-lab/actions/workflows/ci.yml/badge.svg)](https://github.com/OGAS19171976/ab-causal-lab/actions/workflows/ci.yml)
+
 > **确定性分流 + A/B 实验分析 + 因果推断仿真验证台**
 >
 > 把"统计课上学的东西"变成"可交付、可验证的工程能力"。
@@ -760,7 +762,7 @@ python -m venv .venv
 .venv/Scripts/activate          # Windows；Linux/macOS 用 source .venv/bin/activate
 pip install -r requirements.txt # 钉死到实测版本；要更严用 requirements.lock
 
-pytest tests                    # 544 个测试，约 6 分钟（别加 -q，会吞掉汇总行）
+pytest tests                    # 556 个测试，约 6 分钟（别加 -q，会吞掉汇总行）
 python scripts/run_all_checks.py            # **全部检查**：测试 + lint + 类型 + M0–M6 + 数仓，约 20 分钟
 python scripts/run_all_checks.py --quick    # 快速版
 python scripts/run_all_checks.py --list     # 只列计划
@@ -986,11 +988,11 @@ tasks.ps1                  常用命令入口（与 CI 共用 run_all_checks.py�
 requirements.txt           直接依赖（钉死到实测版本）
 requirements.lock          直接依赖 + 传递闭包，共 48 个包
 .gitattributes             统一换行符（这个仓库的行尾曾经是混的）
-tests/                     553 个测试（hashing 25 / assignment 25 / inference 20 /
+tests/                     556 个测试（hashing 25 / assignment 25 / inference 20 /
                            inference_m1 43 / methods 30 / sequential 70 /
                            causal 41 / hte 47 / validation 38 / warehouse 23 /
                            platform 53 / platform_warehouse 31 / platform_m6 28 /
-                           dependencies 17 / ci_contract 25 / reporting 37）
+                           dependencies 17 / ci_contract 25 / reporting 39）
 ```
 
 ### 依赖
@@ -1399,6 +1401,29 @@ python -m mypy                                # 类型检查（范围与档位�
     **检查工具的假报会直接误导决策**（差点让我去改一个根本不存在的问题），
     已修正判定；最终结论是 48 个包在 Linux + 3.14 上**全部有预编译 wheel**。
 
+38. **本机全绿 ≠ 跨平台正确 —— 这条只能靠在另一个平台上真的跑一遍**
+    第一次在 GitHub 上跑 CI 时，pytest 在 Ubuntu 上红了 3 条，
+    而本机（Windows）同一份代码 **556 条全绿**。两类原因，性质完全不同：
+
+    * **一条真缺陷**：`relativize_paths` 的兜底分支直接
+      `Path(raw).resolve().relative_to(root)`。而在 POSIX 上
+      `C:\Users\someone\...` 是**相对路径** —— `resolve()` 把它接到 cwd 上，
+      而 cwd 恰好就是 root，于是 `relative_to` **成功**、原样返回：
+      用户名留在正文里，`<绝对路径>` 兜底根本没生效。
+      也就是说**"reports/ 不含绝对路径"这条保证在 Linux 上是打折的**，
+      而本机永远看不出来。修法是先问 `is_absolute()` 再比。
+    * **两条测试写错了**：它们断言"Linux 上 colorama / tzdata 会被跳过"，
+      却从**当前环境**重算闭包 —— 而 Linux 上这两个包根本没装
+      （它们是 Windows 专属依赖），压根不进闭包，"跳过"无从谈起。
+      测试必须自己把输入条件写死（改成注入 entries）—— 与第 32 条同一条教训。
+
+    两类都不是"代码写得糙"，而是**验证覆盖面**的问题：
+    **一个只在某个平台上成立的测试，等于在那个平台之外什么都没保证。**
+    而且第二条还有一层：它本机是全绿的，只是**绿得没有意义** ——
+    和第 37 条的假绿灯是同一个家族：**绿不产生信号，所以"绿的是什么"必须想清楚。**
+
+    所以"能在 Linux 上跑一次"有独立价值，它不是 CI 的副产品。
+
 ---
 
 ## 六、已知边界
@@ -1487,14 +1512,20 @@ M6 生产口径自身的边界：
 
 工程外壳自身的边界（这一节存在是因为"能跑"与"别人能跑"是两件事）：
 
-* **CI 还没有在 GitHub 上真跑过一次。** 能本地验证的部分我都验了：
-  YAML 能解析、工作流引用的每个文件都存在、它引用的每条命令在本机都通过
-  （ruff / 锁文件校验 / 类型检查 / 全部验证脚本 **12 项，实测 1158 秒**，
-  其中测试 **544 个 / 317 秒**），
-  且 `.python-version` 与本机一致、是**唯一**的版本来源（YAML 里不再硬编码）。
-  但有两件事只能真跑才知道：① `actions/setup-python` 是否已提供 `3.14`；
-  ② Ubuntu runner 上 `pip install -r requirements.txt` 能否装齐（wheel 可用性）。
-  **在 CI 真的绿一次之前，不要把那个徽章当成证据。**
+* **CI 已经在 GitHub 上真的跑过了**（这次不是"本地等价验证"，是真的跑）。
+  仓库：<https://github.com/OGAS19171976/ab-causal-lab>。
+  第一次（run #3）**红在 pytest**，红的 3 条全是只有 Linux 才暴露的问题
+  （一条真缺陷 + 两条写错的测试，见第 38 条）；修完后 run #4 **全绿**：
+  两个 job 都 success，总时长 **13.6 分钟**（验证脚本 job 13.5 分、
+  检查+测试 job 4.0 分，其中 pytest **556 个测试 3.4 分**）。
+  * 之前那两个"只有真跑才知道"的未知项，现在都有**实测**答案：
+    ① `actions/setup-python@v5` + `python-version-file: .python-version` 能取到 3.14；
+    ② Ubuntu + CPython 3.14 上依赖装得齐 —— 48 个包**全部**有预编译 wheel
+    （ruff 走 `py3-none-manylinux`，不绑 ABI），CI 实测安装只用 0.4~0.6 分钟。
+  * 边界要写清：**绿的是那一次提交**。徽章只说明"最近一次跑过了"，
+    不说明"永远绿"；依赖与 runner 镜像都会变。
+  * 还有一处**本机测不到**的地方：本地是 Windows，POSIX 语义下的分支
+    （路径处理、编码、大小写敏感）只有 CI 能覆盖 —— 见第 38 条。
 * **类型检查不是 `--strict`，而且 `tests/` 不在检查范围内。** 检查范围是
   `src/ablab` + `scripts`（共 63 个文件，0 错误），档位说明见第 35 条。
   明确**没有**做的：不给每个函数强制注解（数值代码里那会退化成
