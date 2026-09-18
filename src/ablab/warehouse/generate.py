@@ -50,6 +50,13 @@ class ExperimentDef:
     hypothesis: str
     control: str = "control"
     treatment: str = "treatment"
+    #: 设为列名（如 ``"city"``）表示**整簇随机化**：分流在簇级别做，
+    #: 同一个簇里的所有用户拿到同一个分支。
+    #:
+    #: 别小看这一个字段：它决定了"分析单元"是什么。
+    #: 若数据其实是人级随机化，却按簇去做簇级检验，虽然算得出一个数，
+    #: 却答的是另一个问题（平台侧的 ``_verify_clusters_are_randomized`` 会拦住它）。
+    cluster_key: str | None = None
 
 
 DEFAULT_EXPERIMENTS: tuple[ExperimentDef, ...] = (
@@ -146,9 +153,6 @@ def generate_source_data(
             salt=exp.layer_salt,
             slots=(LayerSlot(exp.name, exp.bucket_start, exp.bucket_end),),
         )
-        routed = np.array(
-            [r == exp.name for r in layer.route_many(user_ids, batcher)], dtype=bool
-        )
 
         spec = ExperimentSpec(
             name=exp.name,
@@ -158,8 +162,37 @@ def generate_source_data(
             ),
             salt=f"{exp.name}_v1",
             layer=exp.layer,
+            # 整簇随机化时 unit 就是簇键：分流器本身不关心"单元"是用户还是城市，
+            # 它只把单元标识拼进哈希键。这一点正是 unit 字段该有的语义。
+            unit=exp.cluster_key or "user_id",
         )
-        codes = rz.assign_codes(user_ids, spec, batcher)
+
+        if exp.cluster_key:
+            # ---- 整簇随机化：层路由与分流都在簇级别做 ----
+            if exp.cluster_key != "city":
+                raise ValueError(
+                    f"cluster_key 目前只支持 'city'（收到的 {exp.cluster_key!r}）；"
+                    "DWD 里带出来的簇键只有 city"
+                )
+            cities = np.array(sorted(set(city)), dtype=object)
+            city_batcher = KeyBatcher([str(c) for c in cities])
+            routed_city = np.array(
+                [
+                    r == exp.name
+                    for r in layer.route_many([str(c) for c in cities], city_batcher)
+                ],
+                dtype=bool,
+            )
+            city_codes = rz.assign_codes([str(c) for c in cities], spec, city_batcher)
+            lookup = {c: int(code) for c, code in zip(cities, city_codes)}
+            codes = np.array([lookup[c] for c in city], dtype=int)
+            routed = np.array([routed_city[list(cities).index(c)] for c in city], dtype=bool)
+        else:
+            routed = np.array(
+                [r == exp.name for r in layer.route_many(user_ids, batcher)], dtype=bool
+            )
+            codes = rz.assign_codes(user_ids, spec, batcher)
+
         is_treatment = routed & (codes == 1)
         post_effect += np.where(is_treatment, exp.true_lift, 0.0)
 

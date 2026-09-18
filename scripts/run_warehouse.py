@@ -147,7 +147,7 @@ def main() -> int:
     report = out_dir / "warehouse_report.md"
     report.write_text(
         "# 数仓链路验证报告\n\n```text\n" + "\n".join(for_report(log, root=ROOT)) + "\n```\n",
-        encoding="utf-8",
+        encoding="utf-8", newline="\n",
     )
     print(f"\n报告已写入 {report}")
     return 0

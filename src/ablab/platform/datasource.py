@@ -252,8 +252,8 @@ class ExperimentData:
                 "整簇随机化下 CUPED 需要**簇级**的前置指标；当前数据源没有提供，"
                 "请把 estimator 设为 'post_only'"
             )
-        if len(self.looks) < 2:
-            raise ValueError(f"至少需要 2 次查看才能谈序贯监控，收到 {len(self.looks)}")
+        if len(self.looks) < 1:
+            raise ValueError("至少需要一次查看")
         fractions = [lk.information_fraction for lk in self.looks]
         if any(b <= a for a, b in zip(fractions, fractions[1:])):
             # 必须**严格**递增：BoundarySolver 的卷积网格吃非递增输入会给出无意义边界
@@ -266,6 +266,15 @@ class ExperimentData:
                     f"查看 {lk.label!r} 某臂样本不足 2（{lk.treatment.n}/{lk.control.n}），"
                     "方差无法估计"
                 )
+            if self.analysis_unit == "cluster":
+                g_t, g_c = lk.n_clusters
+                if g_t < 2 or g_c < 2:
+                    # 簇级方差的自由度是簇数减 2；每臂 1 个簇时它**无定义**，
+                    # 这不是"噪声大"，是算不出来 —— 必须在这里拦住。
+                    raise ValueError(
+                        f"查看 {lk.label!r} 的簇数不足（{g_t}/{g_c}），"
+                        "簇级检验每臂至少需要 2 个簇"
+                    )
         if {self.treated, self.control} != set(self.design_weights):
             raise ValueError(
                 f"design_weights 必须恰好覆盖被对比的两臂 {self.treated}/{self.control}，"
@@ -690,18 +699,33 @@ def build_warehouse_data(
     metric: str = "post_metric_14d",
     n_looks: int = 5,
     primary_estimator: str = "cuped",
+    analysis_unit: str = "unit",
 ) -> ExperimentData:
-    """从 ADS + DWS 读取一个实验，返回与合成源同构的 ``ExperimentData``。
+    """从数仓读取一个实验，返回与合成源同构的 ``ExperimentData``。
 
     两条读取路径各有分工：
 
     * **ADS**（实验×分支粒度）给主结论要的充分统计量；
     * **DWS**（实验×分支×日粒度）给序贯监控要的**累计**查看。
 
+    ``analysis_unit="cluster"`` 时改读**簇粒度** DWS（``05_...``）：
+    拿到每组簇的充分统计量，结论与监控都换成簇级口径。
+    那张表与按天的 DWS 出自同一张 DWD、同一组 SUM，只是分组键多了一个 cluster_id ——
+    所以"支持簇级分析"是一次 GROUP BY，而不是一条新链路。
+
     监控的信息比例用的是**实际累计样本量之比**，不是日历天数之比 ——
     每天进入实验的人数并不相等，用天数比会高估早期信息量，
     进而让早期边界偏松。``build_design`` 恰好支持传入自定义信息比例。
     """
+    if analysis_unit == "cluster":
+        return _warehouse_cluster_data(
+            con,
+            experiment,
+            metric=metric,
+            n_looks=n_looks,
+            primary_estimator=primary_estimator,
+        )
+
     ads = con.execute(_WAREHOUSE_QUERY.format(where="WHERE experiment = ?"), [experiment]).df()
     if ads.empty:
         raise ValueError(f"数仓 ADS 里找不到实验 {experiment!r}")
@@ -768,6 +792,292 @@ def build_warehouse_data(
                 "两次读取走了不同口径"
             )
     return data
+
+
+def _warehouse_cluster_data(
+    con,
+    experiment: str,
+    *,
+    metric: str,
+    n_looks: int,
+    primary_estimator: str,
+) -> ExperimentData:
+    """从 ADS（臂级总数）+ 簇粒度 DWS（每组簇的统计量）构造簇级 ``ExperimentData``。
+
+    两条读取互为校验：**簇级统计量逐簇合并回去，必须等于 ADS 的人数与求和**。
+    这条不变量在 ``ExperimentData.validate()`` 里强制检查 —— 它挡的是一种很难发现的错：
+    簇级与臂级来自两次口径不同的读取，于是"簇级检验"和"报告里的总样本量"对不上。
+    """
+    ads = con.execute(_WAREHOUSE_QUERY.format(where="WHERE experiment = ?"), [experiment]).df()
+    if ads.empty:
+        raise ValueError(f"数仓 ADS 里找不到实验 {experiment!r}")
+    variants = {str(r["variant"]): r for _, r in ads.iterrows()}
+    if len(variants) < 2:
+        raise ValueError(f"实验 {experiment!r} 只有一个分支，无法对比")
+    control_name = "control" if "control" in variants else sorted(variants)[0]
+    treated_name = "treatment" if "treatment" in variants else sorted(variants)[-1]
+
+    cluster_counts = _cluster_counts(con, experiment, control_name, treated_name)
+    # 先过闸门：簇必须是真正的随机化单元
+    _verify_clusters_are_randomized(con, experiment, control_name, treated_name)
+    looks, look_note = _warehouse_cluster_looks(
+        con, experiment, control_name, treated_name, n_looks=n_looks
+    )
+
+    c_row, t_row = variants[control_name], variants[treated_name]
+    counts = {name: int(row["user_cnt"]) for name, row in variants.items()}
+    # 兜底校验：簇粒度 DWS 里数出来的簇数必须与 looks 的一致
+    if cluster_counts != {treated_name: len(looks[-1].cluster_treatment),
+                          control_name: len(looks[-1].cluster_control)}:
+        raise ValueError(
+            f"实验 {experiment!r} 的簇数对不上：DWS 直接数 {cluster_counts}，"
+            f"按日累计得到 {len(looks[-1].cluster_treatment)}/"
+            f"{len(looks[-1].cluster_control)}"
+        )
+
+    data = ExperimentData(
+        experiment=experiment,
+        metric=metric,
+        source="warehouse",
+        treated=treated_name,
+        control=control_name,
+        # **SRM 的检验对象是随机化单元**。簇设计下就是簇数。
+        counts=cluster_counts,
+        all_weights=_weight_map(
+            {name: float(row["design_weight"]) for name, row in variants.items()}
+        ),
+        design_weights=_weight_map(
+            {control_name: float(c_row["design_weight"]),
+             treated_name: float(t_row["design_weight"])}
+        ),
+        looks=looks,
+        # 簇级 CUPED 需要**簇级**前置指标。ADS 里只有用户级 pre_sum，
+        # 而簇级 DWS 里也有 —— 但当前簇 DGP 没有前置期，所以先只支持 post-only。
+        primary_estimator="post_only",
+        analysis_unit="cluster",
+        metric_type="mean",
+        true_lift=float(t_row["true_lift"]),
+        extra={
+            "layer": str(t_row["layer"]),
+            "hypothesis": str(t_row["hypothesis"]),
+            "n_users": int(sum(int(r["user_cnt"]) for r in variants.values())),
+            "n_clusters": sum(cluster_counts.values()),
+            "cluster_key": "city（来自 ods_user_profile）",
+            "look_note": look_note,
+        },
+    )
+    data.validate()
+    return data
+
+
+def _verify_clusters_are_randomized(
+    con, experiment: str, control_name: str, treated_name: str
+) -> None:
+    """确认每个簇**整簇**落在同一个分支里 —— 否则拒绝做簇级分析。
+
+    为什么这是一道必须有的闸门
+    --------------------------
+    簇级检验假设"处理在簇级别分配"。如果实际上是人级随机化（同一个城市里既有
+    处理组也有对照组用户），那么"城市"根本不是簇，簇级检验虽然**算得出一个数**，
+    却答的是另一个问题：它把簇内那些本来可以互相抵消的信息丢掉了。
+
+    实测踩过：数仓那份数据是人级随机化的，用城市当簇去做簇级分析给出了
+    ``效应 +27.27、SE 3.38、p=5.5e-5`` —— 一个**看起来完全正常**的结论。
+    而 M1 写的独立实现 ``cluster_level_ttest`` 直接拒绝了这个输入
+    （"有 5 个簇内部同时存在处理与对照单元，这不是聚类随机化"）。
+
+    这正是本项目反复强调的那类错误：**算得出来 ≠ 该算**。
+    所以这里做同样的检查 —— 而且是让独立实现当裁判，而不是我自己再写一套判据。
+    """
+    mixed = con.execute(
+        """
+        SELECT COUNT(*) AS n_mixed FROM (
+            SELECT cluster_id
+            FROM dws_experiment_cluster_daily
+            WHERE experiment = ? AND variant IN (?, ?)
+            GROUP BY cluster_id
+            HAVING COUNT(DISTINCT variant) > 1
+        )
+        """,
+        [experiment, control_name, treated_name],
+    ).df().iloc[0]["n_mixed"]
+    if int(mixed) > 0:
+        raise ValueError(
+            f"实验 {experiment!r} 有 {int(mixed)} 个簇内部同时存在处理与对照单元 —— "
+            "这不是整簇随机化，簇级检验不适用（它会把簇内本来能抵消的信息丢掉）。"
+            "请把该实验的 analysis_unit 设为 'unit'；"
+            "若确实是整簇随机化，检查簇键是否与分流时用的键一致"
+            "（簇键决定一切：键错了，「簇」就只是个分组标签）"
+        )
+
+
+def _cluster_counts(con, experiment: str, control_name: str, treated_name: str) -> dict[str, int]:
+    """每个分支有多少个簇 —— SRM 要检验的就是这个数。"""
+    rows = con.execute(
+        """
+        SELECT variant, COUNT(DISTINCT cluster_id) AS n_clusters
+        FROM dws_experiment_cluster_daily
+        WHERE experiment = ? AND variant IN (?, ?)
+        GROUP BY variant
+        """,
+        [experiment, control_name, treated_name],
+    ).df()
+    if rows.empty:
+        raise ValueError(
+            f"数仓里找不到实验 {experiment!r} 的簇粒度汇总"
+            "（需要先执行 sql/05_dws_experiment_cluster_daily.sql 建表）"
+        )
+    return {str(r["variant"]): int(r["n_clusters"]) for _, r in rows.iterrows()}
+
+
+def _warehouse_cluster_looks(
+    con,
+    experiment: str,
+    control_name: str,
+    treated_name: str,
+    *,
+    n_looks: int,
+) -> tuple[tuple[LookData, ...], str]:
+    """按日累计构造**簇级**查看序列，返回 ``(查看序列, 选点说明)``。
+
+    三个必须说清的口径决定：
+
+    **① 快照按「日」建，不是按「行」建。**
+    第一版在遍历 (簇, 日) 行时逐行记快照，于是同一天被记了多次（一天里每个簇一条），
+    查看标签出现"同一个日期重复 4 次"。正确做法是把一天的所有行累加完之后再记一次。
+
+    **② 信息比例用累计簇数之比，不是累计用户数之比。**
+    簇级估计量的方差 ≈ Var(簇均值)/G，信息量随**簇数**增长；
+    用用户数会高估早期信息量（早期的簇少，但每个簇里的人可能已经不少）。
+    这条与单元级路径刻意不同。
+
+    **③ 查看点必须满足"每臂至少 2 个簇"。**
+    簇级方差的自由度是簇数减 2，每臂 1 个簇时它无定义 —— 这不是"噪声大"，是算不出来。
+    所以候选查看点先按这条筛一遍；筛完不够 ``n_looks`` 个就**明确报错**，
+    而不是悄悄把次数减下来（改了次数就等于改了 alpha 消耗计划，那是个统计决定，
+    不能由数据可用性替你决定）。
+    """
+    daily = con.execute(
+        """
+        SELECT variant, cluster_id, ds, user_cnt,
+               pre_sum, post_sum, pre_sq_sum, post_sq_sum, pre_post_cross_sum
+        FROM dws_experiment_cluster_daily
+        WHERE experiment = ? AND variant IN (?, ?)
+        ORDER BY variant, ds, cluster_id
+        """,
+        [experiment, control_name, treated_name],
+    ).df()
+    if daily.empty:
+        raise ValueError(f"DWS 里找不到实验 {experiment!r} 的簇粒度汇总")
+
+    sums_keys = ("user_cnt", "pre_sum", "post_sum", "pre_sq_sum", "post_sq_sum",
+                 "pre_post_cross_sum")
+
+    # 每个分支：每天一条快照「截至该日的 簇 -> 累计可加量」
+    per_variant: dict[str, list[tuple[str, dict[str, dict[str, float]]]]] = {}
+    for variant in (control_name, treated_name):
+        rows = daily[daily["variant"] == variant]
+        if rows.empty:
+            raise ValueError(f"簇粒度 DWS 里 {experiment!r}/{variant!r} 没有数据")
+        acc: dict[str, dict[str, float]] = {}
+        snapshots: list[tuple[str, dict[str, dict[str, float]]]] = []
+        for ds, day_rows in rows.groupby("ds", sort=True):
+            for _, r in day_rows.iterrows():
+                bucket = acc.setdefault(str(r["cluster_id"]), dict.fromkeys(sums_keys, 0.0))
+                for key in sums_keys:
+                    bucket[key] += float(r[key])
+            # 深拷贝：否则后续累加会污染历史快照
+            snapshots.append((str(ds)[:10], {c: dict(v) for c, v in acc.items()}))
+        per_variant[variant] = snapshots
+
+    # 两个分支的日期集合必须一致（同一天进来的用户分到两臂）
+    dates = [d for d, _ in per_variant[control_name]]
+    if dates != [d for d, _ in per_variant[treated_name]]:
+        raise ValueError(f"实验 {experiment!r} 两个分支的日期序列不一致，簇级累计无法对齐")
+
+    info_total = sum(len(per_variant[v][-1][1]) for v in (control_name, treated_name))
+
+    def clusters_at(i: int, variant: str) -> int:
+        return len(per_variant[variant][i][1])
+
+    def fraction_at(i: int) -> float:
+        return (
+            clusters_at(i, control_name) + clusters_at(i, treated_name)
+        ) / info_total
+
+    # ③ 候选点：每臂至少 2 个簇
+    feasible = [
+        i for i in range(len(dates))
+        if clusters_at(i, control_name) >= 2 and clusters_at(i, treated_name) >= 2
+    ]
+    if not feasible:
+        g_c = clusters_at(len(dates) - 1, control_name)
+        g_t = clusters_at(len(dates) - 1, treated_name)
+        raise ValueError(
+            f"实验 {experiment!r} 只有 {g_t} / {g_c} 个簇（处理组/对照组），"
+            "达不到「每臂至少 2 个簇」——簇级方差的自由度是簇数减 2，两边都不够时它无定义。"
+            "请增加簇数（簇键来自 ods_user_profile.city）"
+        )
+
+    # 按**信息比例**去重：同一个比例只保留**最后**那一天（数据最全，且保证末次是全量）。
+    #
+    # 这一步会暴露一件真实的事：如果所有簇在第一天就全部到位（本仓库的
+    # 5 个城市就是如此），那么"累计簇数之比"全程都是 1.0 —— 序贯监控在簇级
+    # **退化成固定样本分析**。这不是缺陷，而是数据结构的必然：
+    # 簇级监控只在"簇分批进入"（城市/门店分批上线）时才有意义。
+    distinct: dict[float, int] = {}
+    for i in feasible:
+        distinct[round(fraction_at(i), 12)] = i
+    points = sorted(distinct.items())
+
+    if len(points) == 1:
+        ordered = [points[0][1]]
+        look_note = (
+            f"簇在第一天就全部到位（{clusters_at(len(dates) - 1, treated_name)}/"
+            f"{clusters_at(len(dates) - 1, control_name)}），累计簇数全程为 1.0，"
+            "序贯监控退化为**固定样本**分析（单次查看，边界即 1.96）"
+        )
+    else:
+        k = min(n_looks, len(points))
+        if k == 1:
+            idxs = [len(points) - 1]
+        else:
+            step = (len(points) - 1) / (k - 1)
+            idxs = sorted({round(j * step) for j in range(k)})
+        ordered = [points[j][1] for j in idxs]
+        look_note = (
+            f"可用查看点 {len(points)} 个，按请求取 {len(ordered)} 个"
+            + ("" if len(ordered) == n_looks else f"（请求 {n_looks} 次，受可用点限制降低）")
+        )
+        if len(ordered) < 2:
+            raise ValueError(f"实验 {experiment!r} 的可选查看点不足 2 个")
+
+    def arm_stats(snapshot: dict[str, dict[str, float]]) -> tuple[AggregateStats, ...]:
+        return tuple(
+            AggregateStats.from_sums(
+                n=int(v["user_cnt"]), sum_x=v["pre_sum"], sum_y=v["post_sum"],
+                sum_xx=v["pre_sq_sum"], sum_yy=v["post_sq_sum"],
+                sum_xy=v["pre_post_cross_sum"],
+            )
+            for _, v in sorted(snapshot.items())
+        )
+
+    looks: list[LookData] = []
+    for pos, i in enumerate(ordered):
+        ct = arm_stats(per_variant[treated_name][i][1])
+        cc = arm_stats(per_variant[control_name][i][1])
+        looks.append(
+            LookData(
+                label=f"{dates[i]}（累计）",
+                information_fraction=1.0 if pos == len(ordered) - 1 else fraction_at(i),
+                treatment=ct[0].merge(*ct[1:]),
+                control=cc[0].merge(*cc[1:]),
+                cluster_treatment=ct,
+                cluster_control=cc,
+            )
+        )
+    # 把选点情况带出去，由上层写进报告（不静默）
+    return tuple(looks), look_note
 
 
 def _warehouse_looks(

@@ -59,6 +59,10 @@ SQL_ORDER: tuple[str, ...] = (
     "02_dws_experiment_variant_daily.sql",
     "03_ads_experiment_result.sql",
     "04_ads_experiment_srm.sql",
+    # 簇粒度 DWS：与 02 出自同一张 DWD、同一组 SUM，只是分组键多了一个 cluster_id。
+    # 排在 ADS 之后是有意的 —— 它不属于主链路，而是"换个分析单元"的旁路，
+    # 谁需要谁读。这样主链路的依赖关系保持清晰。
+    "05_dws_experiment_cluster_daily.sql",
 )
 
 

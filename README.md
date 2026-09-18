@@ -652,6 +652,47 @@ MDE  = (z_{1−α/2} + z_power) · SE        ← 就是上面那个函数的反�
 顺手量化了"**别做 90/10**"：同一目标下，处理组占比 30% 要多 19% 样本、
 20% 要多 56%、**10% 要多 178%**。
 
+#### 13.4 分析单元落到真实链路：算得出来 ≠ 该算
+
+13.2 的簇级检验是在合成数据上验的。要让它在数仓侧也成立，最初我以为只是"加一次 `GROUP BY`"
+—— DWD 里本来就带出了 `city`，所以确实只加了一张 `sql/05_dws_experiment_cluster_daily.sql`
+（与按天的 DWS **同一张表、同一组 SUM**，分组键多一个 `cluster_id`）。
+
+但第一次拿默认数仓去试就撞上了这个：
+
+```text
+M1 的 cluster_level_ttest 直接拒绝：
+  有 5 个簇内部同时存在处理与对照单元，这不是聚类随机化。
+  若分流其实是用户级的，直接用 welch_ttest 即可，不需要聚类稳健标准误。
+```
+
+**那份数仓是人级随机化的，"城市"根本不是簇。** 而平台的簇级路径在那份数据上
+算出了一个完全正常的外观：`效应 +27.27、SE 3.38、p=5.5e-5`。
+
+这正是本项目一路在防的那类错误 —— **算得出来 ≠ 该算**。所以最终的交付不是"支持它"，而是四件事：
+
+1. **一道闸门**：`_verify_clusters_are_randomized` 检查每个簇是否整簇落在同一臂，
+   不满足就拒绝，并说清为什么（"簇级检验会把簇内本来能抵消的信息丢掉"）。
+   判据不是我另写一套 —— **让 M1 那份独立实现当裁判**，平台侧做同样的检查。
+2. **一项能力**：`ExperimentDef.cluster_key`，让数仓能生成**真正整簇随机化**的数据
+   （分流在簇级别做，整簇同臂；分流器本身不关心"单元"是用户还是城市，
+   这恰好是 `ExperimentSpec.unit` 该有的语义）。默认那两条实验不设它，所以
+   **所有已引用的数字逐位未变**（27.248206 / 23.342905 / 30,741 / 27,946 都已核对）。
+3. **一次交叉验证**：测试内建一份整簇随机化的数仓（40 个城市 —— 簇太少时
+   "每臂凑不齐 2 个簇"会变成运气问题，那测的就不是链路了）。平台的簇级结论与
+   M1 的 `cluster_level_ttest`（吃 DWD 明细）在 **1e-9** 内一致，
+   而且 SRM 检验的是**簇数**、不是用户数。
+4. **一条诚实的退化**：那份数据里城市几乎第一天就全部到位，于是"累计簇数之比"
+   从第一个可用查看点起就接近 1.0 —— 簇级序贯监控**几乎没有中间查看点**。
+   平台照实减少查看次数并写进报告，而不是硬凑几个信息比例相同的假点
+   （那会让 `BoundarySolver` 拿到非递增网格）。
+   **真实的簇级序贯监控需要"簇分批上线"（城市分批开城），这份 DGP 不建模它 ——
+   这是数据边界，不是实现缺陷。**
+
+顺带修掉一个被这组测试逼出来的真 bug：`analyse_experiment_from_warehouse` 忘了把记录上的
+`analysis_unit` 传下去，于是勾了"整簇随机化"的实验被**静默按单元级分析** ——
+声明写了、没人理。函数签名不会因此报错，而这类"静默丢弃声明"正是最难发现的。
+
 ---
 
 ### 五个阶段，同一条线
@@ -678,7 +719,7 @@ python -m venv .venv
 .venv/Scripts/activate          # Windows；Linux/macOS 用 source .venv/bin/activate
 pip install -r requirements.txt # 钉死到实测版本；要更严用 requirements.lock
 
-pytest tests                    # 504 个测试，约 7 分钟（别加 -q，会吞掉汇总行）
+pytest tests                    # 510 个测试，约 5.5 分钟（别加 -q，会吞掉汇总行）
 python scripts/run_all_checks.py            # **全部检查**：测试 + M0–M6 + 数仓，约 18 分钟
 python scripts/run_all_checks.py --quick    # 快速版
 python scripts/run_all_checks.py --list     # 只列计划
@@ -892,18 +933,19 @@ src/ablab/
 │   └── static/index.html  单文件前端（无构建步骤）
 └── plotting.py            图表样式与中文字体探测
 
-sql/                       五层 SQL，每一层都写了"为什么这么写"
-scripts/                   十一个脚本（含 pick_demo_salts.py / lock_requirements.py /
-                           run_all_checks.py —— 后两者分别管依赖与"全部检查"的单一定义）
+sql/                       六个 SQL 文件（ODS→DWD→DWS→ADS + SRM + 簇粒度 DWS）
+scripts/                   十三个脚本（含 pick_demo_salts.py / lock_requirements.py /
+                           run_all_checks.py / check_report_determinism.py ——
+                           后三者分别管依赖、全部检查的单一定义、报告重跑一致性）
 tasks.ps1                  常用命令入口（与 CI 共用 run_all_checks.py）
 .github/workflows/ci.yml   测试 + 验证双 job，并把 reports/ 作为产物发布
 requirements.txt           直接依赖（钉死到实测版本）
 requirements.lock          直接依赖 + 传递闭包，共 42 个包
 .gitattributes             统一换行符（这个仓库的行尾曾经是混的）
-tests/                     504 个测试（hashing 25 / assignment 25 / inference 20 /
+tests/                     510 个测试（hashing 25 / assignment 25 / inference 20 /
                            inference_m1 43 / methods 30 / sequential 70 /
                            causal 41 / hte 47 / validation 38 / warehouse 23 /
-                           platform 53 / platform_warehouse 25 / platform_m6 28 /
+                           platform 53 / platform_warehouse 31 / platform_m6 28 /
                            dependencies 7 / ci_contract 12 / reporting 17）
 ```
 
@@ -1116,7 +1158,17 @@ python scripts/lock_requirements.py --check   # 校验当前环境是否等于�
     ② 换台机器跑，diff 里全是无关变化，真正的数字变化被淹掉。
     所以规则做成**写出时的统一过滤**（`ablab/reporting.py`），而不是逐个改
     `say(...)` 调用 —— 将来有人加一行带耗时的输出时，不需要记得这条规则。
-    实测收益：过滤之后同一份代码重跑，`reports/` 逐字节不变。
+    实测工具是 `scripts/check_report_determinism.py`：跑两遍全部脚本，
+    逐字节比对 `reports/`（含图 —— matplotlib 的 PNG 输出是可复现的，
+    只有 `Software` 字段带版本号，没有时间戳）。
+
+29. **"算得出来"不等于"该算"，所以闸门要做在入口**
+    数仓那份数据是人级随机化的，拿城市当簇去做簇级检验会给出
+    `效应 +27.27、SE 3.38、p=5.5e-5` —— 一个看起来完全正常的结论，而它答的是另一个问题。
+    判据不是我另写一套：**让 M1 那份独立实现（`cluster_level_ttest`）当裁判**，
+    平台侧做同样的检查（`_verify_clusters_are_randomized`），不满足就拒绝。
+    这条的普遍形式是：**一个会静默给出"合理但错误"答案的能力，比一个缺失的能力危险得多** ——
+    缺失的能力有人报 bug，错误的答案会被写进决策。
 
 ---
 
@@ -1184,9 +1236,15 @@ M6 生产口径自身的边界：
 * **整簇路径只支持 post-only**。CUPED 需要**簇级**前置指标，而 M1 那个簇 DGP 没有前置期；
   数仓侧同理（DWD 有 `pre_metric`，但簇级 DWS 还没建）。所以"簇级 CUPED"没做，
   注册表在创建时就拦住 `analysis_unit=cluster` + `estimator=cuped` 这个组合。
-* **数仓路径目前只支持"单元 + 人均指标"**。簇粒度需要新增一张 `(experiment, variant, city, ds)`
-  粒度的 DWS —— 落在可加量上，那只是换一个 `GROUP BY`，但没有做；
-  比值指标需要在 ADS 里有分母列，同样没有。合成路径下两者都已跑通并有测试。
+* **数仓路径支持单元级与簇级，但不支持比值指标**。比值指标需要在 ADS 里有一列**分母**，
+  而当前 ADS 的 `x` 是前置指标 —— 语义不同不能混用。要接的话得新增一张比值 ADS
+  （`x` 放曝光/订单数，`y` 放点击/金额），而不是改这一层的读取口径。
+  合成路径下比值指标已经跑通并有测试。
+* **簇级序贯监控需要"簇分批上线"**，而当前仓库的数据里簇在第一天就基本全部到位，
+  所以数仓侧的簇级路径几乎只有一个可用查看点（平台会照实减少并写进报告）。
+  这不是实现缺陷，是 DGP 不建模"分批开城"。
+* **默认那份数仓是人级随机化的**，所以它的簇级分析会被平台**拒绝** ——
+  这是正确行为，而且有测试守着。整簇随机化的链路用测试内那份 40 城市的数仓验证。
 * **比值口径差的"相对差"本身不稳定**。效应接近 0 时它会爆炸（40 个 salt 上跨了 250 个百分点），
   所以能依赖的只有"两个估计量不是同一个数"，不能拿单次的相对差当结论。
 * **MDE / 功效用的是 z 近似，不是 t**。大样本下没问题，小样本（每组几十）会略微乐观。

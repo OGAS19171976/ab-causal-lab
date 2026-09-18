@@ -382,7 +382,7 @@ def main() -> int:
         "> 由 `python scripts/run_m6_validation.py` 生成，全部数字可复现。\n"
         "> M5 把引擎接成了服务，M6 修的是「接得对不对」：口径一致、分析单元、MDE/功效。\n\n"
         "```text\n" + "\n".join(for_report(log, root=ROOT)) + "\n```\n",
-        encoding="utf-8",
+        encoding="utf-8", newline="\n",
     )
     print(f"报告已写入 {report}")
     return 0

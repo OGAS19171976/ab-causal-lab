@@ -437,6 +437,7 @@ def analyse_data(data: ExperimentData, *, alpha: float = 0.05) -> ExperimentRepo
             f"{'越界' if primary_crossed else '未越界'}），判定按 {primary_name}"
         )
     unit_tag = "簇（随机化单元）" if data.analysis_unit == "cluster" else "用户"
+    look_note = data.extra.get("look_note")
     checks.append(
         CheckItem(
             name="序贯监控",
@@ -450,6 +451,7 @@ def analyse_data(data: ExperimentData, *, alpha: float = 0.05) -> ExperimentRepo
                 f"{float(monitoring[-1]['always_valid_p_running_min']):.4f}。"
                 "OBF 边界与 always-valid p 不一致是正常的：前者按**计划的查看次数**换来，"
                 "后者对**任意**查看次数都有效，代价是更保守"
+                + (f"。查看点：{look_note}" if look_note else "")
                 + warn
             ),
             statistic=design.final_boundary,
@@ -638,15 +640,27 @@ def analyse_experiment_from_warehouse(
     这一步是"数仓层与推断层的接口面"真正被用起来的地方：
     平台不碰明细，只读充分统计量；而 CUPED 的原料
     ``pre_post_cross_sum`` 正是 M1 为了让这条路径成立而加进 DWS 的那一列。
+
+    **记录上的声明必须原样传下去。** 第一版漏了 ``analysis_unit``，
+    于是勾了"整簇随机化"的实验被静默按单元级分析 —— 声明写了、没人理。
+    这类"静默丢弃声明"是本项目反复在防的错，而它恰好又是最容易漏的一处，
+    因为函数签名本身不会报错。
     """
     if not record.warehouse_experiment:
         raise ValueError(f"实验 {record.name!r} 没有绑定数仓实验")
+    if record.metric_type != "mean":
+        raise ValueError(
+            "数仓路径目前只支持人均指标（metric_type='mean'）。"
+            "比值指标需要 ADS 里有一列**分母**，而当前 ADS 的 x 是前置指标，"
+            "语义不同不能混用：那要么新增一张比值 ADS，要么改这一层的读取口径"
+        )
     data = build_warehouse_data(
         con,
         record.warehouse_experiment,
         metric=record.primary_metric,
         n_looks=n_looks,
         primary_estimator=record.estimator,
+        analysis_unit=record.analysis_unit,
     )
     data = _with_record_metadata(data, record)
     return analyse_data(data, alpha=alpha)

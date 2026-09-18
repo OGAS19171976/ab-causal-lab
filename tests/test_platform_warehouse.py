@@ -16,9 +16,11 @@ import duckdb
 import pytest
 from fastapi.testclient import TestClient
 
+from ablab.inference import cluster_level_ttest
 from ablab.platform import (
     ExperimentRegistry,
     RegistryError,
+    analyse_data,
     analyse_experiment,
     run_source_equivalence_audit,
 )
@@ -291,6 +293,165 @@ def plain_client(work_dir):
     with TestClient(app) as c:
         yield c
     app.state.registry.close()
+
+
+# --------------------------------------------------------------------------- #
+# 分析单元：数仓侧
+# --------------------------------------------------------------------------- #
+@pytest.fixture(scope="session")
+def cluster_warehouse_path(project_root):
+    """一个**真正整簇随机化**的小数仓（分流在城市级别做）。
+
+    为什么不把它加进默认的 ``DEFAULT_EXPERIMENTS``：
+    ① 那会改变 ODS 曝光行数，而 README 引用了那个数字 —— 改掉真数字要连带改文档，
+       而且很容易忘；
+    ② 默认那份数仓是**人级随机化**的，它的价值恰恰在于"平台会正确拒绝把它当簇级做"。
+       两份数据各司其职，比混在一起清楚。
+
+    城市数提到 40（默认只有 5 个）：簇太少时"每臂至少 2 个簇"都凑不齐，
+    簇级检验根本算不出来 —— 那测的就不是链路，是运气。
+    """
+    from ablab.warehouse import WarehouseConfig, build_warehouse
+    from ablab.warehouse.generate import ExperimentDef
+
+    base = project_root / "build" / "_test_tmp" / "cluster_warehouse"
+    base.mkdir(parents=True, exist_ok=True)
+    path = base / "wh.duckdb"
+    cluster_exp = ExperimentDef(
+        name="exp_city_rollout",
+        layer="city_rollout",
+        layer_salt="layer_city_rollout",
+        bucket_start=0,
+        bucket_end=8000,  # 80% 的城市进入实验
+        true_lift=0.0,    # 真效应为零：不影响共享的事件数据，也就不动已有数字
+        hypothesis="【整簇随机化】城市级灰度，预期零效应",
+        cluster_key="city",
+    )
+    con = build_warehouse(
+        path,
+        base / "source",
+        project_root / "sql",
+        config=WarehouseConfig(
+            n_users=2000,
+            cities=tuple(f"city{i:02d}" for i in range(40)),
+            experiments=(cluster_exp,),
+        ),
+        force_data=True,
+        verbose=False,
+    )
+    con.close()
+    return path
+
+
+@pytest.fixture
+def cluster_con(cluster_warehouse_path):
+    con = duckdb.connect(str(cluster_warehouse_path), read_only=True)
+    yield con
+    con.close()
+
+
+class TestWarehouseAnalysisUnit:
+    def test_mixed_clusters_are_refused(self, warehouse_con):
+        """**误用必须被拒绝，而不是给出一个看起来正常的数。**
+
+        默认那份数仓是人级随机化的，用城市当簇去做簇级分析会算出
+        ``效应 +27.27、SE 3.38、p=5.5e-5`` —— 一个完全正常的外观。
+        而它答的是另一个问题：簇级检验假设处理在**簇**级别分配。
+
+        M1 写的独立实现 ``cluster_level_ttest`` 会直接拒绝这种输入；
+        平台侧也必须拒绝，否则"能算"就会被当成"该算"。
+        """
+        for experiment in ("exp_rank_v2", "exp_rec_emb"):
+            with pytest.raises(ValueError, match="不是整簇随机化"):
+                build_warehouse_data(warehouse_con, experiment, analysis_unit="cluster")
+
+    def test_cluster_randomized_experiment_is_accepted(self, cluster_con):
+        data = build_warehouse_data(cluster_con, "exp_city_rollout", analysis_unit="cluster")
+        assert data.analysis_unit == "cluster"
+        assert data.primary_estimator == "post_only"
+        assert data.total.has_clusters
+        assert data.total.clusters_consistent()
+        # SRM 的对象是随机化单元 —— 簇数，不是用户数
+        assert sum(data.counts.values()) < 0.1 * data.extra["n_users"]
+        assert data.counts["treatment"] >= 2 and data.counts["control"] >= 2
+
+    def test_every_cluster_is_wholly_in_one_arm(self, cluster_con):
+        """整簇随机化的定义就是这一条：簇内不混臂。"""
+        rows = cluster_con.execute(
+            """
+            SELECT cluster_id, COUNT(DISTINCT variant) AS n_variants
+            FROM dws_experiment_cluster_daily
+            WHERE experiment = 'exp_city_rollout'
+            GROUP BY cluster_id
+            """
+        ).df()
+        assert (rows["n_variants"] == 1).all(), "有簇内部混臂，那就不是整簇随机化"
+
+    def test_cluster_level_matches_the_independent_implementation(self, cluster_con):
+        """平台簇级结论 vs M1 的 ``cluster_level_ttest``（吃 DWD 明细）。"""
+        data = build_warehouse_data(cluster_con, "exp_city_rollout", analysis_unit="cluster")
+        rep = analyse_data(data)
+        assert rep.primary_estimator_name == "cluster_level"
+        assert rep.alt_estimator_name == "unit_level"
+
+        detail = cluster_con.execute(
+            """
+            SELECT d.variant, d.post_metric, p.city
+            FROM dwd_experiment_user d
+            LEFT JOIN ods_user_profile p ON p.user_id = d.user_id
+            WHERE d.experiment = 'exp_city_rollout'
+            """
+        ).df()
+        ref = cluster_level_ttest(
+            detail["city"].fillna("UNKNOWN").to_numpy(),
+            (detail["variant"] == "treatment").to_numpy(),
+            detail["post_metric"].to_numpy(),
+        )
+        assert rep.primary.absolute_effect == pytest.approx(ref.absolute_effect, abs=1e-9)
+        assert rep.primary.std_error == pytest.approx(ref.std_error, abs=1e-9)
+        assert rep.primary.n_treatment == ref.n_treatment
+        assert rep.primary.n_control == ref.n_control
+
+    def test_clusters_barely_accrue_so_monitoring_shrinks(self, cluster_con):
+        """簇不分批进入时，簇级序贯监控**几乎没有可用的中间查看点**。
+
+        这份 DGP 里几乎所有城市第一天就有用户进来，于是"累计簇数之比"从第一个
+        可用的查看点起就已经接近 1.0 —— 请求 5 次查看只能给出 1~2 个点。
+        正确行为是**照实减少并在报告里说清**，而不是硬凑出几个信息比例相同的假查看点
+        （那样 BoundarySolver 会拿到非递增的网格，给出无意义的边界）。
+
+        真实的簇级序贯监控需要"簇分批上线"（城市/门店分批开城），这份数据不建模这件事 ——
+        这是个数据边界，不是实现缺陷。
+        """
+        data = build_warehouse_data(cluster_con, "exp_city_rollout", analysis_unit="cluster")
+        assert data.n_looks < 5, "请求了 5 次查看，但簇不累积时应给出更少的点"
+        assert data.total.information_fraction == 1.0
+        # 第一个可用点就已经接近全量 —— 这就是"簇几乎不随时间累积"的量化说法
+        assert data.looks[0].information_fraction > 0.8
+        assert "可用查看点" in data.extra["look_note"]
+        assert "请求 5 次" in data.extra["look_note"]
+        rep = analyse_data(data)
+        msg = next(c for c in rep.checks if c.name == "序贯监控")
+        assert "可用查看点" in msg.message
+        # 每一次查看都必须是合法的簇级输入
+        assert all(lk.n_clusters[0] >= 2 and lk.n_clusters[1] >= 2 for lk in data.looks)
+
+    def test_api_returns_400_for_cluster_misuse(self, wh_client):
+        """接口层也要把误用挡在 400，而不是 200 给一份错口径的报告。"""
+        items = {i["name"]: i["id"] for i in wh_client.get("/api/experiments").json()}
+        created = wh_client.post("/api/experiments", json={
+            "name": "wh_cluster_misuse",
+            "variants": [{"name": "control", "weight": 0.5},
+                         {"name": "treatment", "weight": 0.5}],
+            "analysis_unit": "cluster",
+            "estimator": "post_only",
+            "warehouse_experiment": "exp_rank_v2",
+        })
+        assert created.status_code == 201
+        r = wh_client.post(f"/api/experiments/{created.json()['id']}/analyze",
+                           json={"n_looks": 5})
+        assert r.status_code == 400
+        assert "不是整簇随机化" in r.json()["detail"]
 
 
 class TestWarehouseAPI:
