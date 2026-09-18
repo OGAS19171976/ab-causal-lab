@@ -26,6 +26,7 @@ CATE 估计才是渐近正态的（Wager & Athey 2018）。
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+
 import numpy as np
 
 __all__ = ["CausalTree", "CausalForest", "ForestConfig"]

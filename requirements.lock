@@ -19,9 +19,11 @@
 #   uvicorn==0.53.0
 #   pydantic==2.13.5
 
-# ---- 测试 ----
+# ---- 测试 / 工具 ----
 #   pytest==9.1.1
 #   httpx==0.28.1
+#   packaging==26.3
+#   ruff==0.16.8
 
 # ---- 传递依赖 ----
 annotated-doc==0.0.5
@@ -57,6 +59,7 @@ Pygments==2.21.0
 pyparsing==3.3.2
 pytest==9.1.1
 python-dateutil==2.9.0.post0
+ruff==0.16.8
 scikit-learn==1.9.1
 scipy==1.18.1
 six==1.17.0

@@ -39,7 +39,7 @@ from .generate import WarehouseConfig, generate_source_data
 
 __all__ = [
     "SQL_ORDER",
-    "SplitStatements",
+    "split_statements",
     "build_warehouse",
     "run_sql_files",
     "load_ads_result",

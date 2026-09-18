@@ -32,7 +32,7 @@ DIRECT: dict[str, tuple[str, ...]] = {
     "运行时": ("numpy", "scipy", "pandas", "duckdb", "pyarrow", "matplotlib"),
     "M4 机器学习": ("scikit-learn",),
     "M5/M6 接口": ("fastapi", "uvicorn", "pydantic"),
-    "测试": ("pytest", "httpx"),
+    "测试 / 工具": ("pytest", "httpx", "packaging", "ruff"),
 }
 
 

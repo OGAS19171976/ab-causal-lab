@@ -8,7 +8,8 @@
 #
 # 用法：
 #   powershell -File tasks.ps1 test       只跑测试
-#   powershell -File tasks.ps1 verify     全部检查（约 15 分钟）
+#   powershell -File tasks.ps1 lint       只跑 ruff
+#   powershell -File tasks.ps1 verify     全部检查（约 18 分钟）
 #   powershell -File tasks.ps1 quick      快速版
 #   powershell -File tasks.ps1 deps       重新生成并校验锁文件
 #   powershell -File tasks.ps1 serve      起平台（默认 8077 端口）
@@ -49,6 +50,10 @@ elseif ($Task -eq 'verify') {
 elseif ($Task -eq 'quick') {
     & $py scripts/run_all_checks.py --quick
 }
+elseif ($Task -eq 'lint') {
+    # 与检查集里用的是同一条命令（python -m ruff），配置在 pyproject 的 [tool.ruff]
+    & $py -m ruff check src scripts tests
+}
 elseif ($Task -eq 'list') {
     & $py scripts/run_all_checks.py --list
 }
@@ -73,7 +78,7 @@ elseif ($Task -eq 'serve') {
     }
 }
 else {
-    Write-Host '可用命令：setup / test / verify / quick / list / deps / warehouse / serve'
+    Write-Host '可用命令：setup / test / lint / verify / quick / list / deps / warehouse / serve'
     Write-Host '例如：powershell -File tasks.ps1 verify'
 }
 

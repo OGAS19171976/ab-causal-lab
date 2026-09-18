@@ -428,7 +428,7 @@ def run_demo_decomposition(
     """
     from ..assignment import ExperimentSpec, Randomizer, Variant
     from ..hashing import KeyBatcher
-    from ..sim.generator import generate_population, simulate_outcomes_treated
+    from ..sim.generator import generate_population
 
     if demos is None:
         from .demo import DEMO_EXPERIMENTS
@@ -462,7 +462,6 @@ def run_demo_decomposition(
         codes = Randomizer().assign_codes(ids, spec, KeyBatcher(ids))
         treated, control = codes == len(spec.variants) - 1, codes == 0
 
-        beta = cfg.corr_pre_post * cfg.post_sd / cfg.pre_sd
         eps_sd = cfg.post_sd * float(np.sqrt(1.0 - cfg.corr_pre_post**2))
         eps = np.random.default_rng(base_seed + 1).normal(0.0, eps_sd, pop.pre_metric.size)
         pre = pop.pre_metric

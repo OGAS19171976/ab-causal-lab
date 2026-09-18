@@ -37,12 +37,12 @@ from ablab.sequential import (  # noqa: E402
     msprt_p_value,
     repeated_ci,
 )
+from ablab.sim import PopulationConfig, generate_population  # noqa: E402
 from ablab.sim.sequential import (  # noqa: E402
     default_information_fractions,
     simulate_canonical_sequences,
     simulate_experiment_sequence,
 )
-from ablab.sim import PopulationConfig, generate_population  # noqa: E402
 from ablab.validation import (  # noqa: E402
     run_monitoring_intensity,
     run_stopping_rule_comparison,

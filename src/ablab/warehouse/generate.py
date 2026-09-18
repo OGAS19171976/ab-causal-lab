@@ -125,7 +125,6 @@ def generate_source_data(
 
     # ---- 用户维表 -------------------------------------------------------- #
     user_ids = [f"u{i:07d}" for i in range(n)]
-    id_arr = np.array(user_ids, dtype=object)
     level = rng.normal(cfg.user_level_mean, cfg.user_level_sd, n)
     expose_ds = [
         cfg.start_ds + timedelta(days=int(d)) for d in rng.integers(0, cfg.entry_span_days, n)

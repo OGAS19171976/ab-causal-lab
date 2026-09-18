@@ -27,11 +27,10 @@ import contextlib
 from pathlib import Path
 from typing import Any, Iterator, Literal
 
+import numpy as np
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
-
-import numpy as np
 
 from ..inference import mde, required_n_per_arm
 from .analysis import (

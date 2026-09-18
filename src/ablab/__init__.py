@@ -22,15 +22,6 @@ from .assignment import (
     Randomizer,
     Variant,
 )
-from .hashing import KeyBatcher, murmur3_32, murmur3_32_str
-from .inference import (
-    Diagnostic,
-    Estimate,
-    srm_check,
-    two_proportion_ztest,
-    welch_ttest,
-    welch_ttest_from_stats,
-)
 from .causal import (
     CausalForest,
     ForestConfig,
@@ -49,7 +40,15 @@ from .causal import (
     twfe,
     twfe_decomposition,
 )
-from .sim import Population, PopulationConfig, generate_population, two_arm_spec
+from .hashing import KeyBatcher, murmur3_32, murmur3_32_str
+from .inference import (
+    Diagnostic,
+    Estimate,
+    srm_check,
+    two_proportion_ztest,
+    welch_ttest,
+    welch_ttest_from_stats,
+)
 from .sequential import (
     BoundarySolver,
     NormalPrior,
@@ -65,6 +64,7 @@ from .sequential import (
     probability_better,
     repeated_ci,
 )
+from .sim import Population, PopulationConfig, generate_population, two_arm_spec
 from .validation import (
     AAResult,
     AssignmentAudit,

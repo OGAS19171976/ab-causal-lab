@@ -35,10 +35,10 @@ from ..inference import (
 )
 from ..sim import Population, simulate_outcomes_treated, two_arm_spec
 from ..sim.scenarios import (
-    ClusterScenarioConfig,
     ClusterSample,
-    RatioScenarioConfig,
+    ClusterScenarioConfig,
     RatioSample,
+    RatioScenarioConfig,
     generate_cluster_scenario,
     generate_ratio_scenario,
 )

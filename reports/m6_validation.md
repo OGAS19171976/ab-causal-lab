@@ -21,7 +21,7 @@ CUPED 的 FWER 区间盖住 alpha? True
 结论：CUPED 的 z 配同一组 OBF 边界，FWER 仍然守住 5% ——
       所以对齐到 CUPED 不是拿有效性换灵敏度，而是纯收益。
 
-真实效应 0.25 下（400 个 salt，95s）
+真实效应 0.25 下（400 个 salt，64s）
   post-only 检出率 = 0.6725
   CUPED     检出率 = 0.8975   （相对提升 +40.1%）
 

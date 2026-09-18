@@ -438,7 +438,6 @@ class TestWarehouseAnalysisUnit:
 
     def test_api_returns_400_for_cluster_misuse(self, wh_client):
         """接口层也要把误用挡在 400，而不是 200 给一份错口径的报告。"""
-        items = {i["name"]: i["id"] for i in wh_client.get("/api/experiments").json()}
         created = wh_client.post("/api/experiments", json={
             "name": "wh_cluster_misuse",
             "variants": [{"name": "control", "weight": 0.5},

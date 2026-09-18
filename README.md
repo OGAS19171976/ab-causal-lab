@@ -719,8 +719,8 @@ python -m venv .venv
 .venv/Scripts/activate          # Windows；Linux/macOS 用 source .venv/bin/activate
 pip install -r requirements.txt # 钉死到实测版本；要更严用 requirements.lock
 
-pytest tests                    # 510 个测试，约 5.5 分钟（别加 -q，会吞掉汇总行）
-python scripts/run_all_checks.py            # **全部检查**：测试 + M0–M6 + 数仓，约 18 分钟
+pytest tests                    # 514 个测试，约 6 分钟（别加 -q，会吞掉汇总行）
+python scripts/run_all_checks.py            # **全部检查**：测试 + lint + M0–M6 + 数仓，约 19 分钟
 python scripts/run_all_checks.py --quick    # 快速版
 python scripts/run_all_checks.py --list     # 只列计划
 
@@ -942,11 +942,11 @@ tasks.ps1                  常用命令入口（与 CI 共用 run_all_checks.py�
 requirements.txt           直接依赖（钉死到实测版本）
 requirements.lock          直接依赖 + 传递闭包，共 42 个包
 .gitattributes             统一换行符（这个仓库的行尾曾经是混的）
-tests/                     510 个测试（hashing 25 / assignment 25 / inference 20 /
+tests/                     514 个测试（hashing 25 / assignment 25 / inference 20 /
                            inference_m1 43 / methods 30 / sequential 70 /
                            causal 41 / hte 47 / validation 38 / warehouse 23 /
                            platform 53 / platform_warehouse 31 / platform_m6 28 /
-                           dependencies 7 / ci_contract 12 / reporting 17）
+                           dependencies 7 / ci_contract 16 / reporting 17）
 ```
 
 ### 依赖
@@ -969,7 +969,23 @@ pip install -r requirements.txt        # 推荐：拿到的就是实测过的那
 pip install -r requirements.lock       # 更严：连传递依赖也钉死
 pip install -e ".[dev]"                # 开发：可编辑安装 + 全部可选依赖
 python scripts/lock_requirements.py --check   # 校验当前环境是否等于锁文件
+python -m ruff check src scripts tests        # 静态检查（配置见 pyproject）
 ```
+
+> **lint 的配置刻意保守。** 未配置时 ruff 0.16 的默认规则集比 `E4/E7/E9/F` 宽得多
+> （实测在这份代码上扫出 **196 条**），其中大量是风格性改写（UP / SIM / RUF / FURB）——
+> 那会产出一个几百行的纯风格 diff，把真正的改动淹没，且**不改变任何正确性**。
+> 所以 `[tool.ruff]` 只开 `E4/E7/E9 + F`（语法级错误、未定义名、未使用的导入与变量）、
+> `I`（导入顺序）、`RUF100`（失效的 `# noqa`）。
+>
+> **第一次跑就抓到了真东西**（不是风格）：`hashing.py` 的**注解**用了惰性导入的 `np`；
+> `analysis.py` 的注解用了没导入的 `LookData`；`warehouse/build.py` 的 `__all__`
+> 列了**不存在的** `SplitStatements`（真名 `split_statements`，于是 `import *` 会炸）；
+> 2 个未使用导入；7 个未使用变量。
+>
+> 更有意思的是它当场抓住了**我自己刚引入的回归**：我按 `F841` 删掉了一个"未使用"的
+> `counts` 赋值，却删错了地方（真正用它的那处在 40 行之外），ruff 立刻报
+> `F821 Undefined name 'counts'` —— **`F841` 与 `F821` 成对出现，基本就是"删错了变量"的信号**。
 
 > **实测环境：CPython 3.14.0 / win64。** numpy 2.5.3、scipy 1.18.1、pandas 3.0.3、
 > duckdb 1.5.5、pyarrow 25.0.1、matplotlib 3.11.1、scikit-learn 1.9.1、
@@ -1169,6 +1185,13 @@ python scripts/lock_requirements.py --check   # 校验当前环境是否等于�
     平台侧做同样的检查（`_verify_clusters_are_randomized`），不满足就拒绝。
     这条的普遍形式是：**一个会静默给出"合理但错误"答案的能力，比一个缺失的能力危险得多** ——
     缺失的能力有人报 bug，错误的答案会被写进决策。
+
+30. **lint 只开"能查出真问题"的规则，而且把它放进检查集**
+    全量规则集会产出几百行纯风格 diff，把真改动淹没；而"没配 lint"又会让真问题
+    靠人眼发现（这次是靠 ruff 才发现 `__all__` 里有个不存在的导出名）。
+    所以取一个中间态：显式 select 真问题类别，并让 `run_all_checks.py` 把它当一步跑 ——
+    这样"lint 绿"是被强制执行的，不是"我本地跑过一次"。
+    顺序也有讲究：秒级的检查（lock / lint）排在最前面，早失败早反馈。
 
 ---
 

@@ -20,7 +20,10 @@
 
 from __future__ import annotations
 
-from typing import Sequence
+from typing import TYPE_CHECKING, Sequence
+
+if TYPE_CHECKING:  # 仅供类型检查；运行时 numpy 是惰性的（见 _require_numpy）
+    import numpy as np
 
 __all__ = [
     "murmur3_32",

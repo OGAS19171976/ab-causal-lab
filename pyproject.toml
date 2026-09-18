@@ -34,6 +34,7 @@ dev = [
     "pytest>=7.4",
     "httpx>=0.27",
     "packaging>=22",
+    "ruff>=0.6",
     "scikit-learn>=1.3",
     "fastapi>=0.110",
     "uvicorn>=0.29",
@@ -55,3 +56,29 @@ testpaths = ["tests"]
 # 想要汇总就走 `pytest tests/`，别加额外的 -q。
 addopts = "-q -p no:cacheprovider"
 filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+# ruff 的配置刻意**保守**。理由：这个仓库注释密度高、命名故意很长
+# （`cuped_variance_reduction` 而不是 `vr`），而 ruff 的"现代化"规则
+# （UP / SIM / RUF / FURB / PLW / BLE）会大量改写这类写法 —— 那会产出一个
+# 几百行的纯风格 diff，把真正的改动淹没，且**不改变任何正确性**。
+#
+# 所以只开"能查出真问题"的几类：
+#   E4/E7/E9 + F —— 语法级错误、未定义名、未使用的导入与变量（ruff 默认集）
+#   I            —— 导入顺序（机器管，不靠人记）
+#   RUF100       —— 失效的 `# noqa`（残留的抑制注释会让后来人以为那儿还有问题）
+#
+# 首次接入的实测收获（都是真缺陷，不是风格）：`hashing.py` 的注解用了惰性导入的 `np`、
+# `analysis.py` 的注解用了没导入的 `LookData`、`build.py` 的 `__all__` 列了不存在的
+# `SplitStatements`（真名 `split_statements`）、2 个未使用导入、7 个未使用变量。
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "RUF100"]
+# 中文注释按字符计宽会误报行长；行长本身交给格式化的概念去管
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# 测试里为可读性会保留构造用的中间量，那些"未使用"是刻意的
+"tests/*" = ["F841"]

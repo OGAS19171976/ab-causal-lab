@@ -175,7 +175,6 @@ def fig_scm_placebo(data, main, placebo, out: Path) -> None:
     ax = axes[0]
     T = data.outcome.shape[1]
     periods = np.arange(1, T + 1)
-    donors = data.outcome[1:]
     ax.plot(periods, data.outcome[0], "o-", color=RED, ms=3.5, lw=1.8,
             label=label("处置单元", "Treated"))
     ax.plot(periods, main.synthetic_pre.tolist() + main.synthetic_post.tolist(), "s--",

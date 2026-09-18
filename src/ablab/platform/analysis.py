@@ -42,9 +42,15 @@ from ..inference import (
     welch_ttest_from_stats,
     z_power,
 )
-from ..sim.generator import PopulationConfig
 from ..sequential import SequentialDesign, msprt_p_value
-from .datasource import ExperimentData, build_synthetic_data, build_warehouse_data, design_for
+from ..sim.generator import PopulationConfig
+from .datasource import (
+    ExperimentData,
+    LookData,
+    build_synthetic_data,
+    build_warehouse_data,
+    design_for,
+)
 from .registry import ExperimentRecord
 
 __all__ = [

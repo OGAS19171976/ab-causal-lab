@@ -60,7 +60,7 @@ class Step:
 #: m5/m6 的数仓段落要 ``build/warehouse.duckdb`` 存在，否则会**静默跳过**那一段
 #: （报告里只剩一句"跳过"，汇总却仍然全绿）。这种"因为缺前置条件而少测一段"
 #: 是本项目最该防的行为，所以顺序在这里写死并加了断言。
-_ORDER_HEAD = ("lock", "warehouse")
+_ORDER_HEAD = ("lock", "lint", "warehouse")
 
 
 def steps() -> list[Step]:
@@ -68,6 +68,10 @@ def steps() -> list[Step]:
     every = [
         Step("lock", "锁文件与当前环境一致",
              (py, "scripts/lock_requirements.py", "--check")),
+        # ruff 走 `python -m ruff` 而不是直接调可执行文件 —— 后者在 Windows 上叫
+        # ruff.exe、在 Linux 上叫 ruff，路径拼接容易写错，而 python -m 是跨平台的。
+        Step("lint", "ruff 静态检查（配置见 pyproject，刻意只查真问题）",
+             (py, "-m", "ruff", "check", "src", "scripts", "tests")),
         Step("warehouse", "数仓链路（m5/m6 的前提）",
              (py, "scripts/run_warehouse.py")),
         Step("m0", "M0 分流层 + 推断层",
@@ -88,7 +92,7 @@ def steps() -> list[Step]:
     head = [s for k in _ORDER_HEAD for s in every if s.key == k]
     rest = [s for s in every if s.key not in _ORDER_HEAD]
     ordered = head + rest
-    assert [s.key for s in ordered[:2]] == list(_ORDER_HEAD), "前置顺序被破坏"
+    assert [s.key for s in ordered[: len(_ORDER_HEAD)]] == list(_ORDER_HEAD), "前置顺序被破坏"
     return ordered
 
 
@@ -129,6 +133,7 @@ def main() -> int:
     ap.add_argument("--only", default=None, help="只跑指定验证项（逗号分隔，如 m5,m6）；pytest 用 --skip-tests 控制")
     ap.add_argument("--skip-tests", action="store_true", help="跳过 pytest")
     ap.add_argument("--skip-lock", action="store_true", help="跳过锁文件校验")
+    ap.add_argument("--skip-lint", action="store_true", help="跳过 ruff")
     ap.add_argument("--log-dir", default=str(ROOT / "build" / "checks"))
     args = ap.parse_args()
 
@@ -138,6 +143,8 @@ def main() -> int:
         plan = [s for s in plan if s.key in wanted]
     if args.skip_lock:
         plan = [s for s in plan if s.key != "lock"]
+    if args.skip_lint:
+        plan = [s for s in plan if s.key != "lint"]
 
     if args.list:
         print(f"计划（{'快速' if args.quick else '完整'}）：")

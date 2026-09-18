@@ -440,15 +440,12 @@ def _synthetic_ratio(
     )
     treated, control = sample.treated, ~sample.treated
     views, clicks = sample.views, sample.clicks
-
-    t_stats = AggregateStats.from_arrays(clicks[treated], views[treated])
-    c_stats = AggregateStats.from_arrays(clicks[control], views[control])
+    counts = {"control": int(control.sum()), "treatment": int(treated.sum())}
 
     looks = _nested_prefix_looks(
         post=clicks, pre=views, treated=treated, control=control,
         n_looks=n_looks, seed=seed + 2, labels=lambda k: f"look {k + 1}",
     )
-    counts = {"control": int(control.sum()), "treatment": int(treated.sum())}
     data = ExperimentData(
         experiment=experiment,
         metric=metric,
@@ -825,7 +822,6 @@ def _warehouse_cluster_data(
     )
 
     c_row, t_row = variants[control_name], variants[treated_name]
-    counts = {name: int(row["user_cnt"]) for name, row in variants.items()}
     # 兜底校验：簇粒度 DWS 里数出来的簇数必须与 looks 的一致
     if cluster_counts != {treated_name: len(looks[-1].cluster_treatment),
                           control_name: len(looks[-1].cluster_control)}:

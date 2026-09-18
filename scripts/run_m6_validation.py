@@ -44,8 +44,8 @@ from ablab.platform import (  # noqa: E402
     run_monitoring_fwer_audit,
     run_unit_awareness_audit,
 )
-from ablab.platform.registry import ExperimentRecord  # noqa: E402
 from ablab.platform.analysis import PLATFORM_POPULATION  # noqa: E402
+from ablab.platform.registry import ExperimentRecord  # noqa: E402
 from ablab.plotting import label, plt, save, setup_style  # noqa: E402
 from ablab.reporting import for_report  # noqa: E402
 
@@ -318,7 +318,7 @@ def main() -> int:
     say(f"  {len(gaps)} 个 salt 上，delta method 相对人均比值的口径差：")
     say(f"    均值 {gap_arr.mean():+.2%}  中位数 {np.median(gap_arr):+.2%}  "
         f"范围 [{gap_arr.min():+.2%}, {gap_arr.max():+.2%}]")
-    say(f"  M1 用另一个 DGP 量到的是 −12.6%。两个数不能直接比 ——")
+    say("  M1 用另一个 DGP 量到的是 −12.6%。两个数不能直接比 ——")
     say("  口径差取决于暴露量分布与点击率水平，符号也会变。")
     say("  **而且这个'相对差'本身不稳**：效应接近 0 时它会爆炸（范围跨了 250 个百分点）。")
     say("  可以依赖的只有一件事：两个估计量系统性地不是同一个数，"

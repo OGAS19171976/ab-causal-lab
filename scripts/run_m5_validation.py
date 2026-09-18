@@ -415,7 +415,7 @@ def main() -> int:
         con = duckdb.connect(str(wh_path), read_only=True)
         say(f"数仓: {wh_path}")
         say("")
-        say(f"可绑定的数仓实验：")
+        say("可绑定的数仓实验：")
         for item in list_warehouse_experiments(con):
             say(f"  {item['experiment']:<16} 层={item['layer']:<10} "
                 f"分支={item['n_variants']}  人数={item['n_users']:,}")

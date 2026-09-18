@@ -51,9 +51,19 @@ def _accepts_quick(script: Path) -> bool:
     return '"--quick"' in script.read_text(encoding="utf-8")
 
 
+def _script_steps(runner) -> list:
+    """只挑"直接跑某个 .py 脚本"的步骤。
+
+    新增的 lint 步骤走的是 ``python -m ruff``，``argv[1]`` 是 ``-m`` 而不是脚本路径 ——
+    按原样去 ``ROOT / "-m"`` 会直接 FileNotFoundError。所以这里统一过滤一次，
+    两条依赖"argv[1] 是脚本"的测试都用它。
+    """
+    return [s for s in runner.steps() if str(s.argv[1]).endswith(".py")]
+
+
 class TestCheckPlan:
     def test_scripts_exist(self, runner):
-        missing = [s.key for s in runner.steps() if not (ROOT / s.argv[1]).exists()]
+        missing = [s.key for s in _script_steps(runner) if not (ROOT / s.argv[1]).exists()]
         assert not missing, f"检查计划里引用了不存在的脚本：{missing}"
 
     def test_warehouse_precedes_its_consumers(self, runner):
@@ -71,9 +81,49 @@ class TestCheckPlan:
     def test_lock_runs_first(self, runner):
         assert [s.key for s in runner.steps()][0] == "lock"
 
+    def test_fast_checks_run_first(self, runner):
+        """秒级的检查（锁文件、lint）与前置条件（数仓）必须排在最前面。
+
+        早失败就早反馈 —— 不用等五分钟的 pytest 跑完才发现少了个导入。
+        """
+        keys = [s.key for s in runner.steps()]
+        assert keys[:3] == ["lock", "lint", "warehouse"], keys[:3]
+
+    def test_lint_step_uses_module_invocation(self, runner):
+        """``python -m ruff`` 而不是直接调可执行文件。
+
+        前者跨平台（Windows 上叫 ruff.exe、Linux 上叫 ruff），
+        后者要在代码里拼平台相关的名字，容易写错。
+        """
+        lint = next(s for s in runner.steps() if s.key == "lint")
+        assert lint.argv[1:3] == ("-m", "ruff"), lint.argv
+        assert "src" in lint.argv and "tests" in lint.argv
+
+    def test_ruff_config_is_deliberate(self):
+        """ruff 的配置必须是**显式**的。
+
+        未配置时 ruff 0.16 的默认规则集比 E4/E7/E9/F 宽得多（实测在这份代码上
+        扫出 196 条），其中大量是风格性改写（UP / SIM / RUF / FURB）。
+        配上显式的 select 才能保证"lint 绿"意味着"没有真问题"，
+        而不是"碰巧没触发风格规则"—— 也避免 lint 结果随 ruff 版本漂移。
+        """
+        import tomllib
+
+        cfg = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+        ruff = cfg.get("tool", {}).get("ruff")
+        assert ruff, "pyproject.toml 里没有 [tool.ruff]"
+        selected = ruff["lint"]["select"]
+        for must in ("F", "I"):
+            assert any(s.startswith(must) for s in selected), f"select 里缺 {must}"
+
+    def test_ruff_is_declared_and_locked(self):
+        """ruff 必须在依赖里声明并出现在锁文件中（否则 CI 上 lint 会直接失败）。"""
+        assert "ruff" in (ROOT / "requirements.txt").read_text(encoding="utf-8")
+        assert "ruff==" in (ROOT / "requirements.lock").read_text(encoding="utf-8")
+
     def test_quick_flag_matches_what_scripts_accept(self, runner):
         """``accepts_quick`` 必须与脚本自己的 argparse 一致，两个方向都要查。"""
-        for step in runner.steps():
+        for step in _script_steps(runner):
             script = ROOT / step.argv[1]
             actual = _accepts_quick(script)
             assert actual == step.accepts_quick, (

@@ -285,7 +285,7 @@ def main() -> int:
     emit("    -> 更多数据只会让有偏的区间更自信地错")
     emit(f"    诚实的边界：n={small.n} 时 DML 自己也偏（{small.dml_bias:+.3f}）——"
          " nuisance 太弱时不满足 n^{-1/4} 收敛条件")
-    emit(f"[2] 四种 CATE 形式下，弹性模型的 MSE 相对常数基线分别是 "
+    emit("[2] 四种 CATE 形式下，弹性模型的 MSE 相对常数基线分别是 "
          + " / ".join(
              ("∞" if not np.isfinite(r.mse_ratio) else f"{r.mse_ratio:.2f}")
              for r in comparison.results

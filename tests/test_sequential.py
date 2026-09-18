@@ -22,11 +22,11 @@ from ablab.sequential import (
     repeated_ci,
 )
 from ablab.sequential.always_valid import rejection_threshold
+from ablab.sim import PopulationConfig, generate_population
 from ablab.sim.sequential import (
     default_information_fractions,
     simulate_experiment_sequence,
 )
-from ablab.sim import PopulationConfig, generate_population
 from ablab.validation import (
     run_monitoring_intensity,
     run_stopping_rule_comparison,
