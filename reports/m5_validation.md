@@ -86,7 +86,7 @@ GET  /api/experiments?status=running -> 3 条
 GET  /api/experiments?status=nope    -> 400
 POST /api/experiments（权重和!=1）    -> 400 实验 'bad' 的分支权重之和必须为 1，当前为 0.…
 POST /api/experiments（重名）         -> 400
-POST /api/experiments/{id}/analyze   -> health=pass，体检项 6 条：SRM, 协变量平衡, CUPED 收益, 效应分解, 序贯监控, 功效 / MDE
+POST /api/experiments/{id}/analyze   -> health=pass，体检项 7 条：SRM, 协变量平衡, CUPED 收益, 效应分解, 序贯监控, 功效 / MDE, 护栏指标
      效应分解字段 imbalance=-0.1638 residual=+0.2586
 GET  /api/experiments/{id}           -> 200
 GET  /api/experiments/nope           -> 404
@@ -116,7 +116,7 @@ GET  /api/experiments/{id}（删除后） -> 404
 exp_rank_v2    ① DWD 明细       27.248206    2.975240     23.342905    1.799728
 exp_rank_v2    ② ADS 汇总       27.248206    2.975240     23.342905    1.799728
 exp_rank_v2    ③ 平台编排         27.248206    2.975240     23.342905    1.799728
-               最大偏差           2.274e-13                        一致
+               最大偏差           4.547e-13                        一致
                最后一次查看 == 主结论：True
                监控信息比例（实际累计，不是日历天数）：[0.1924, 0.381, 0.6181, 0.8092, 1.0]
 
@@ -127,7 +127,7 @@ exp_rank_v2    ③ 平台编排         27.248206    2.975240     23.342905    1
 exp_rec_emb    ① DWD 明细       -9.941730    3.455110     -3.924325    2.094011
 exp_rec_emb    ② ADS 汇总       -9.941730    3.455110     -3.924325    2.094011
 exp_rec_emb    ③ 平台编排         -9.941730    3.455110     -3.924325    2.094011
-               最大偏差           1.137e-13                        一致
+               最大偏差           4.547e-13                        一致
                最后一次查看 == 主结论：True
                监控信息比例（实际累计，不是日历天数）：[0.1946, 0.3862, 0.6211, 0.8089, 1.0]
 

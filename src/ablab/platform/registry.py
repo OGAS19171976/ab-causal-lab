@@ -33,6 +33,7 @@ from typing import Any, Sequence
 from ..assignment import ExperimentSpec, Variant
 
 __all__ = [
+    "ExperimentEvent",
     "ExperimentRecord",
     "ExperimentRegistry",
     "RegistryError",
@@ -63,6 +64,45 @@ CREATE TABLE IF NOT EXISTS experiments (
     metric_type   TEXT NOT NULL DEFAULT 'mean',
     created_at    TEXT NOT NULL
 );
+
+-- 操作审计：**append-only**。
+--
+-- 为什么需要它：M6 特意允许改 ``estimator``（口径是策略不是数据），
+-- 也允许改状态、绑数仓、删实验 —— 于是"谁在什么时候把判定口径从 CUPED
+-- 改成 post-only"这件事必须留痕。否则改口径就是一个**事后挑口径的通道**：
+-- 报告里始终写着"用的是哪个口径"，但没人知道它是不是在看到结果之后才改的。
+--
+-- 三条不可动摇的设计：
+--   1. **写在业务变更的同一个事务里**。分开写就会出现"改了但没记"，
+--      而那种缺失是静默的 —— 审计表看起来"没有这条记录"，与"没发生过"无法区分。
+--   2. **触发器禁止 UPDATE / DELETE**。不是"我们不写 UPDATE"，是**写不动**。
+--      靠约定的不可变性，迟早被某次维护脚本破坏。
+--   3. **没有外键级联**。删掉实验之后审计必须还在 —— 那恰恰是最需要它的时候。
+CREATE TABLE IF NOT EXISTS experiment_events (
+    seq           INTEGER PRIMARY KEY AUTOINCREMENT,
+    experiment_id TEXT NOT NULL,
+    at            TEXT NOT NULL,
+    action        TEXT NOT NULL,
+    field         TEXT,
+    before        TEXT,
+    after         TEXT,
+    note          TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_events_experiment
+    ON experiment_events(experiment_id, seq);
+
+CREATE TRIGGER IF NOT EXISTS experiment_events_no_update
+BEFORE UPDATE ON experiment_events
+BEGIN
+    SELECT RAISE(ABORT, 'experiment_events 是 append-only：不允许 UPDATE');
+END;
+
+CREATE TRIGGER IF NOT EXISTS experiment_events_no_delete
+BEFORE DELETE ON experiment_events
+BEGIN
+    SELECT RAISE(ABORT, 'experiment_events 是 append-only：不允许 DELETE');
+END;
 """
 
 #: 建表之后新增的列（列名 -> 列定义）。
@@ -92,6 +132,32 @@ class RegistryError(ValueError):
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+@dataclass(frozen=True)
+class ExperimentEvent:
+    """审计表里的一条记录。**只读**（表本身也禁止 UPDATE / DELETE）。"""
+
+    seq: int
+    experiment_id: str
+    at: str
+    action: str
+    field: str | None = None
+    before: str | None = None
+    after: str | None = None
+    note: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    def describe(self) -> str:
+        """给人看的一行。"""
+        if self.field:
+            return (
+                f"[{self.at}] {self.action} {self.field}: "
+                f"{self.before or '（空）'} -> {self.after or '（空）'}"
+            )
+        return f"[{self.at}] {self.action} {self.after or ''}".rstrip()
 
 
 @dataclass
@@ -176,6 +242,87 @@ class ExperimentRegistry:
 
     def close(self) -> None:
         self._conn.close()
+
+    # -- 审计（append-only） ------------------------------------------------ #
+    def _record_event(
+        self,
+        experiment_id: str,
+        action: str,
+        *,
+        field: str | None = None,
+        before: Any = None,
+        after: Any = None,
+        note: str = "",
+    ) -> None:
+        """把一条审计写进**当前事务**。
+
+        **故意不 commit**：调用方把业务变更和这一条放在同一个 ``with self._conn``
+        里，要么都落盘、要么都不落。分开写就会出现"改了但没记"——
+        而审计表里"没有这条"与"这件事没发生"长得一模一样，是最难发现的那种缺失。
+        """
+        self._conn.execute(
+            """
+            INSERT INTO experiment_events
+            (experiment_id, at, action, field, before, after, note)
+            VALUES (?,?,?,?,?,?,?)
+            """,
+            (
+                experiment_id,
+                _now(),
+                action,
+                field,
+                None if before is None else str(before),
+                None if after is None else str(after),
+                note,
+            ),
+        )
+
+    def events(self, experiment_id: str, *, limit: int | None = None) -> list[ExperimentEvent]:
+        """某个实验的全部审计，按发生顺序。
+
+        **实验被删掉之后这里仍然查得到** —— 审计表没有外键级联，这是有意的：
+        "谁删了它"恰恰是删掉之后最需要回答的问题。
+        """
+        sql = "SELECT * FROM experiment_events WHERE experiment_id = ? ORDER BY seq"
+        params: tuple[Any, ...] = (experiment_id,)
+        if limit is not None:
+            sql = (
+                "SELECT * FROM (SELECT * FROM experiment_events WHERE experiment_id = ? "
+                "ORDER BY seq DESC LIMIT ?) ORDER BY seq"
+            )
+            params = (experiment_id, int(limit))
+        return [
+            ExperimentEvent(
+                seq=row["seq"],
+                experiment_id=row["experiment_id"],
+                at=row["at"],
+                action=row["action"],
+                field=row["field"],
+                before=row["before"],
+                after=row["after"],
+                note=row["note"],
+            )
+            for row in self._conn.execute(sql, params)
+        ]
+
+    def recent_events(self, *, limit: int = 50) -> list[ExperimentEvent]:
+        """全局最近的操作（跨实验，倒序）——用于"最近发生了什么"。"""
+        rows = self._conn.execute(
+            "SELECT * FROM experiment_events ORDER BY seq DESC LIMIT ?", (int(limit),)
+        )
+        return [
+            ExperimentEvent(
+                seq=row["seq"],
+                experiment_id=row["experiment_id"],
+                at=row["at"],
+                action=row["action"],
+                field=row["field"],
+                before=row["before"],
+                after=row["after"],
+                note=row["note"],
+            )
+            for row in rows
+        ]
 
     # -- 校验 -------------------------------------------------------------- #
     @staticmethod
@@ -309,6 +456,12 @@ class ExperimentRegistry:
                 record.created_at,
             ),
         )
+        self._record_event(
+            record.id,
+            "create",
+            after=record.name,
+            note=f"salt={record.salt}；口径={record.estimator}；单元={record.analysis_unit}",
+        )
         self._conn.commit()
         return record
 
@@ -317,10 +470,14 @@ class ExperimentRegistry:
         if status not in STATUSES:
             raise RegistryError(f"status 必须是 {STATUSES} 之一，收到 {status!r}")
         record = self.get(experiment_id)
-        self._conn.execute(
-            "UPDATE experiments SET status = ? WHERE id = ?", (status, experiment_id)
-        )
-        self._conn.commit()
+        with self._conn:  # 变更 + 审计同一事务
+            self._conn.execute(
+                "UPDATE experiments SET status = ? WHERE id = ?", (status, experiment_id)
+            )
+            self._record_event(
+                experiment_id, "set_status", field="status",
+                before=record.status, after=status,
+            )
         record.status = status
         return record
 
@@ -329,15 +486,21 @@ class ExperimentRegistry:
 
         允许改 —— 口径是**策略**不是数据，改了不会让任何人的分组失效。
         但要注意它改变的是判定规则本身：切完之后，"历史上有没有越界"这个问题
-        的答案会跟着变。所以报告里始终写着用的是哪个口径。
+        的答案会跟着变。所以报告里始终写着用的是哪个口径，
+        而**这次改动会进审计表** —— 否则"改口径"就是一条事后挑口径的通道。
         """
         if estimator not in ESTIMATORS:
             raise RegistryError(f"estimator 必须是 {ESTIMATORS} 之一，收到 {estimator!r}")
         record = self.get(experiment_id)
-        self._conn.execute(
-            "UPDATE experiments SET estimator = ? WHERE id = ?", (estimator, experiment_id)
-        )
-        self._conn.commit()
+        with self._conn:
+            self._conn.execute(
+                "UPDATE experiments SET estimator = ? WHERE id = ?", (estimator, experiment_id)
+            )
+            self._record_event(
+                experiment_id, "set_estimator", field="estimator",
+                before=record.estimator, after=estimator,
+                note="判定口径变更：历史结论的判定规则会随之改变",
+            )
         record.estimator = estimator
         return record
 
@@ -351,19 +514,30 @@ class ExperimentRegistry:
         binding = warehouse_experiment.strip() if warehouse_experiment else None
         if warehouse_experiment is not None and not binding:
             raise RegistryError("warehouse_experiment 不能是空白字符串（解绑请传 None）")
-        self._conn.execute(
-            "UPDATE experiments SET warehouse_experiment = ? WHERE id = ?",
-            (binding, experiment_id),
-        )
-        self._conn.commit()
+        with self._conn:
+            self._conn.execute(
+                "UPDATE experiments SET warehouse_experiment = ? WHERE id = ?",
+                (binding, experiment_id),
+            )
+            self._record_event(
+                experiment_id, "bind_warehouse", field="warehouse_experiment",
+                before=record.warehouse_experiment, after=binding,
+                note="数据源绑定变更：改变读哪份数据，不改变任何用户的分组",
+            )
         record.warehouse_experiment = binding
         return record
 
     def delete(self, experiment_id: str) -> None:
         if self.get(experiment_id) is None:
             raise RegistryError(f"找不到实验 {experiment_id!r}")
-        self._conn.execute("DELETE FROM experiments WHERE id = ?", (experiment_id,))
-        self._conn.commit()
+        with self._conn:
+            self._conn.execute("DELETE FROM experiments WHERE id = ?", (experiment_id,))
+            # 审计**不删**：删掉实验之后，"谁删的、删之前是什么状态"正是要回答的问题。
+            self._record_event(
+                experiment_id, "delete",
+                before=experiment_id, after=None,
+                note="实验已删除；这条审计保留（append-only，无级联）",
+            )
 
     # -- 读 ---------------------------------------------------------------- #
     @staticmethod

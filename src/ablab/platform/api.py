@@ -274,6 +274,28 @@ def create_app(
         except RegistryError as exc:
             raise HTTPException(404 if "找不到" in str(exc) else 400, str(exc)) from exc
 
+    # ---- 操作审计（只读） -------------------------------------------------- #
+    @app.get("/api/experiments/{experiment_id}/events", tags=["审计"])
+    def experiment_events(experiment_id: str, limit: int | None = None) -> dict[str, Any]:
+        """某个实验的操作审计（append-only，按发生顺序）。
+
+        **实验删掉之后这个接口仍然可用** —— 那正是最需要它的时候。
+        所以这里**不**先校验实验是否存在（否则删掉之后永远 404，
+        而"谁删的"恰恰是要回答的问题）。
+        """
+        events = registry.events(experiment_id, limit=limit)
+        return {
+            "experiment_id": experiment_id,
+            "count": len(events),
+            "events": [e.to_dict() for e in events],
+        }
+
+    @app.get("/api/events", tags=["审计"])
+    def recent_events(limit: int = 50) -> dict[str, Any]:
+        """最近的操作（跨实验，倒序）——用来回答"刚才谁动了什么"。"""
+        events = registry.recent_events(limit=limit)
+        return {"count": len(events), "events": [e.to_dict() for e in events]}
+
     # ---- 数仓绑定 -------------------------------------------------------- #
     @app.get("/api/warehouse/experiments", tags=["数仓"])
     def warehouse_experiments() -> dict[str, Any]:

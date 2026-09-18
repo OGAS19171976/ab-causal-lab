@@ -108,7 +108,9 @@ class Step:
 #: m5/m6 的数仓段落要 ``build/warehouse.duckdb`` 存在，否则会**静默跳过**那一段
 #: （报告里只剩一句"跳过"，汇总却仍然全绿）。这种"因为缺前置条件而少测一段"
 #: 是本项目最该防的行为，所以顺序在这里写死并加了断言。
-_ORDER_HEAD = ("lock", "lint", "types", "warehouse")
+#: ``gov``（治理：审计 + 护栏）不依赖数仓，但它是秒级的、且属于"平台自己会不会
+#: 静默骗人"那一类，所以跟静态检查一起放在前面，早失败早反馈。
+_ORDER_HEAD = ("lock", "lint", "types", "warehouse", "gov")
 
 
 def steps() -> list[Step]:
@@ -125,6 +127,8 @@ def steps() -> list[Step]:
              (py, "-m", "mypy")),
         Step("warehouse", "数仓链路（m5/m6 的前提）",
              (py, "scripts/run_warehouse.py")),
+        Step("gov", "治理：操作审计（append-only）+ 护栏指标显式化",
+             (py, "scripts/run_governance_validation.py")),
         Step("m0", "M0 分流层 + 推断层",
              (py, "scripts/run_m0_validation.py"), accepts_quick=True),
         Step("m1", "M1 CUPED / 比值 / 聚类",

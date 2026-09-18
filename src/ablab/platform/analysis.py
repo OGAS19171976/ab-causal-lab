@@ -559,6 +559,34 @@ def analyse_data(data: ExperimentData, *, alpha: float = 0.05) -> ExperimentRepo
             statistic=mde_abs,
         )
     )
+    # ---- 护栏指标：**声明了但本平台不分析**，这件事必须说出来 --------------- #
+    #
+    # 这是"把静默变成显式"的一个实例。``guardrails`` 字段一直存在、界面上也显示了，
+    # 而引擎从头到尾没读过它 —— 于是用户合理地以为护栏被看着。
+    # 真正的解法不是"假装分析"（数据模型里只有一个主指标，护栏需要另建一张指标表），
+    # 而是在报告里**明说没分析**，并说清为什么。
+    #
+    # 状态取 ``info`` 而不是 ``warn``：``health`` 的含义是"**这一次**运行有没有
+    # 需要你看一眼的东西"，而护栏未接入是**平台级**缺口 —— 它跟这批数据没关系，
+    # 声明了护栏的每一个实验都会永远 warn。那正是第 31 条那条教训：
+    # **一条永远亮的告警等于没有告警**，久了 health 就没人看了。
+    # 所以信息要**显式**（这条检查永远在报告里），但不占用"这次运行有问题"这个信号。
+    if data.guardrails:
+        checks.append(
+            CheckItem(
+                name="护栏指标",
+                status="info",
+                message=(
+                    f"已声明 {len(data.guardrails)} 个护栏：{'、'.join(data.guardrails)}；"
+                    "**本平台尚不分析护栏指标** —— 数据模型只有主指标一条时间序列，"
+                    "护栏需要在数仓里另建指标表。"
+                    "也就是说：这批护栏**目前没有任何东西在看着**，"
+                    "主结论显著不代表可以上线。"
+                ),
+                statistic=float(len(data.guardrails)),
+            )
+        )
+
     statuses = {c.status for c in checks}
     health = "fail" if "fail" in statuses else ("warn" if "warn" in statuses else "pass")
 
@@ -677,11 +705,16 @@ def analyse_experiment_from_warehouse(
 
 
 def _with_record_metadata(data: ExperimentData, record: ExperimentRecord) -> ExperimentData:
-    """把注册表里的展示字段带进数据对象（报告的标题栏要用）。"""
+    """把注册表里的展示字段带进数据对象（报告的标题栏要用）。
+
+    **护栏也在这里挂上去**，而且是刻意放在这一个函数里：它是"记录 → 数据对象"的
+    唯一通道，所以合成路径与数仓路径都会带上护栏，不可能只挂一条。
+    """
     from dataclasses import replace as _replace
 
     return _replace(
         data,
+        guardrails=tuple(record.guardrails or ()),
         extra={
             **data.extra,
             "experiment_id": record.id,

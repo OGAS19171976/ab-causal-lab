@@ -237,6 +237,13 @@ class ExperimentData:
     metric_type: str = "mean"
     #: 仅合成/演示数据有真值；真实数仓没有
     true_lift: float | None = None
+    #: **已声明的护栏指标名**（记录上声明的，不是分析出来的）。
+    #:
+    #: 之所以让它进"分析输入"而不是留在记录里：报告必须能说一句
+    #: "你声明了 N 个护栏，而**本平台不分析它们**"。数据模型只有一个主指标，
+    #: 护栏需要另建一张指标表；在那之前，"存了字段、界面显示了、引擎没读过"
+    #: 会让用户以为护栏被看着 —— 那是静默的不作为，比缺功能危险。
+    guardrails: tuple[str, ...] = ()
     extra: dict[str, Any] = field(default_factory=dict)
 
     @property
