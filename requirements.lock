@@ -1,30 +1,34 @@
 # 由 scripts/lock_requirements.py 生成 —— 不要手改。
 # 生成环境：CPython 3.14.0 / win32
 # 内容 = 直接依赖 + 传递闭包，全部钉死版本。
+# 带 `; marker` 的行是**平台条件依赖**：换个平台它可能根本不该被安装
+#   （实测：colorama / tzdata 只在 Windows 上需要），--check 会先判 marker 再查。
+# 注意这份闭包是在**生成平台**上算的：换平台只保证「已锁的都在」，
+#   不保证「该平台需要、而生成平台上不需要」的包也被锁进来。
 # 校验：python scripts/lock_requirements.py --check
 
 # ---- 运行时 ----
-#   numpy==2.5.3
-#   scipy==1.18.1
-#   pandas==3.0.3
-#   duckdb==1.5.5
-#   pyarrow==25.0.1
-#   matplotlib==3.11.1
+#   numpy==('2.5.3', None)
+#   scipy==('1.18.1', None)
+#   pandas==('3.0.3', None)
+#   duckdb==('1.5.5', None)
+#   pyarrow==('25.0.1', None)
+#   matplotlib==('3.11.1', None)
 
 # ---- M4 机器学习 ----
-#   scikit-learn==1.9.1
+#   scikit-learn==('1.9.1', None)
 
 # ---- M5/M6 接口 ----
-#   fastapi==0.141.1
-#   uvicorn==0.53.0
-#   pydantic==2.13.5
+#   fastapi==('0.141.1', None)
+#   uvicorn==('0.53.0', None)
+#   pydantic==('2.13.5', None)
 
 # ---- 测试 / 工具 ----
-#   pytest==9.1.1
-#   httpx==0.28.1
-#   packaging==26.3
-#   ruff==0.16.8
-#   mypy==2.3.1
+#   pytest==('9.1.1', None)
+#   httpx==('0.28.1', None)
+#   packaging==('26.3', None)
+#   ruff==('0.16.8', None)
+#   mypy==('2.3.1', None)
 
 # ---- 传递依赖 ----
 annotated-doc==0.0.5
@@ -34,7 +38,7 @@ ast_serialize==0.11.2
 certifi==2026.7.22
 click==8.5.0
 cloudpickle==3.1.2
-colorama==0.4.6
+colorama==0.4.6 ; sys_platform == "win32"
 contourpy==1.3.3
 cycler==0.12.1
 duckdb==1.5.5
@@ -47,7 +51,7 @@ idna==3.19
 iniconfig==2.3.0
 joblib==1.6.0
 kiwisolver==1.5.1
-librt==0.15.0
+librt==0.15.0 ; platform_python_implementation != "PyPy"
 matplotlib==3.11.1
 mypy==2.3.1
 mypy_extensions==1.1.0
@@ -73,5 +77,5 @@ starlette==1.6.0
 threadpoolctl==3.7.0
 typing-inspection==0.4.4
 typing_extensions==4.16.0
-tzdata==2026.2
+tzdata==2026.2 ; sys_platform == "win32"
 uvicorn==0.53.0

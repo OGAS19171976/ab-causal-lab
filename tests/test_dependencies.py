@@ -77,6 +77,86 @@ def _third_party_imports() -> dict[str, set[str]]:
     return found
 
 
+class TestCrossPlatformLock:
+    """锁文件必须在**另一个平台**上也能通过校验 —— 这是 CI 第一次跑就会撞上的事。
+
+    背景（实测）：`requirements.lock` 是在 Windows 上生成的闭包，里面必然带上
+    Windows 专属的传递依赖 —— `colorama`（pytest / click 只在 Windows 上要）、
+    `tzdata`（pandas 只在 Windows / emscripten 上要）。而 `lock_requirements.py
+    --check` 原本要求"每个锁定包都已安装"，于是在 Ubuntu runner 上会报
+    "colorama 未安装" → **CI 第一步就红**，而本机永远看不到。
+
+    修法是把"这个包在什么条件下需要"（PEP 508 marker）写进锁文件，校验时先判
+    marker。下面这些测试**在 Windows 上模拟 Linux**，所以这条 CI-only 的失败路径
+    在本机就能被覆盖 —— 而不是等推上去才发现。
+    """
+
+    LINUX = {"sys_platform": "linux", "platform_system": "Linux", "os_name": "posix"}
+    WINDOWS = {"sys_platform": "win32", "platform_system": "Windows", "os_name": "nt"}
+
+    @staticmethod
+    def _load():
+        spec = importlib.util.spec_from_file_location(
+            "lock_requirements_under_test2", ROOT / "scripts" / "lock_requirements.py"
+        )
+        assert spec and spec.loader
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        return module
+
+    def test_windows_only_packages_are_marked(self):
+        """平台专属依赖必须带 marker，否则别的平台会把它当成"必须已安装"。"""
+        text = (ROOT / "requirements.lock").read_text(encoding="utf-8")
+        marked = {
+            line.split("==")[0].strip(): line.split(";", 1)[1].strip()
+            for line in text.splitlines()
+            if line.strip() and not line.strip().startswith("#") and ";" in line
+        }
+        assert "colorama" in marked, "colorama 是 Windows 专属依赖，却没写 marker"
+        assert "win32" in marked["colorama"], marked["colorama"]
+        assert "tzdata" in marked, "tzdata（pandas 只在 Windows/emscripten 要）也没写 marker"
+
+    def test_check_skips_them_on_linux(self):
+        """模拟 Linux：这两个包必须被跳过，而其余包照旧检查。"""
+        module = self._load()
+        locked = module.closure(tuple(n for g in module.DIRECT.values() for n in g))
+        applicable, skipped = module.select_for_platform(locked, self.LINUX)
+
+        assert "colorama" in skipped and "tzdata" in skipped, skipped
+        assert "colorama" not in applicable
+        # librt（mypy 的依赖）条件是非 PyPy —— Linux 上照样需要，不能被误跳
+        assert "librt" in applicable, "librt 在 Linux 上也需要，不该被跳过"
+        # 直接依赖一个都不能被跳过（它们无条件需要）
+        direct = {n.lower() for g in module.DIRECT.values() for n in g}
+        assert not (direct & set(skipped)), f"直接依赖被误判为不适用：{direct & set(skipped)}"
+
+    def test_check_keeps_them_on_windows(self):
+        """模拟 Windows：它们就该被要求存在（本机是真装着的）。"""
+        module = self._load()
+        locked = module.closure(tuple(n for g in module.DIRECT.values() for n in g))
+        applicable, skipped = module.select_for_platform(locked, self.WINDOWS)
+        assert "colorama" in applicable and "tzdata" in applicable
+        assert skipped == [], f"Windows 上不该跳过任何包：{skipped}"
+
+    def test_every_lock_line_is_a_valid_requirement(self):
+        """锁文件必须能被标准 PEP 508 解析器读 —— pip 就是那么读的。
+
+        带 marker 的写法（``name==1.0 ; sys_platform == "win32"``）是标准
+        requirements 语法，不是我们自创的；这条测试把它钉住，
+        否则 ``pip install -r requirements.lock`` 会在别的平台上解析失败。
+        """
+        from packaging.requirements import Requirement
+
+        text = (ROOT / "requirements.lock").read_text(encoding="utf-8")
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parsed = Requirement(line)  # 解析失败会直接抛异常
+            assert parsed.specifier, f"锁文件里这一行没有钉死版本：{line}"
+
+
 class TestDependencyDeclarations:
     def test_every_third_party_import_is_declared(self):
         """源码里 import 的每个第三方包，都必须在 pyproject 里声明。

@@ -45,10 +45,14 @@ DIRECT: dict[str, tuple[str, ...]] = {
 }
 
 
-def _marker_applies(marker: str | None) -> bool:
+def _marker_applies(marker: str | None, environment: dict | None = None) -> bool:
     """判断依赖的 environment marker 在当前环境是否成立。
 
     拿不到 ``packaging`` 时保守地返回 True（宁可多写一行，不要漏一个依赖）。
+
+    ``environment`` 传 None 表示用真实环境；传一个字典可以**模拟别的平台** ——
+    这让"在 Linux 上 --check 会不会因为 Windows 专属包而失败"这件事
+    能在 Windows 上被测试覆盖（见 tests/test_dependencies.py）。
     """
     if not marker:
         return True
@@ -57,7 +61,7 @@ def _marker_applies(marker: str | None) -> bool:
     except Exception:
         return True
     try:
-        return bool(Marker(marker).evaluate())
+        return bool(Marker(marker).evaluate(environment))
     except Exception:
         return True
 
@@ -84,12 +88,27 @@ def _requirement_name(req: str) -> str | None:
     return m.group(1) if m else None
 
 
-def closure(direct: tuple[str, ...]) -> dict[str, str]:
-    """从直接依赖出发，递归收集传递闭包 {分发名: 版本}。"""
-    seen: dict[str, str] = {}
-    queue = list(direct)
+def closure(direct: tuple[str, ...]) -> dict[str, tuple[str, str | None]]:
+    """从直接依赖出发，递归收集传递闭包 ``{分发名: (版本, marker)}``。
+
+    **为什么要带着 marker 走**：闭包是在**当前平台**上算的，而依赖里有一类是
+    平台条件依赖 —— 实测这份锁里有 ``colorama``（pytest / click 只在 Windows 上要）
+    与 ``tzdata``（pandas 只在 Windows / emscripten 上要）。它们在 Ubuntu 上
+    **不会被安装**，而 ``--check`` 要求"每个锁定包都已安装" → CI 第一次跑就红。
+
+    所以把"这个包是在什么条件下需要的"记进锁文件（标准 requirements 语法
+    ``name==version ; marker``）：
+    * 别的平台 ``--check`` 时能正确跳过（pip 装锁文件时也会跳过）；
+    * 这份锁仍然只描述**生成平台上真实存在的那套环境**，不做跨平台推断。
+
+    marker 用**到达路径的合取**累积：A 依 B（m1）、B 依 C（m2）→ C 的条件是
+    ``m1 and m2``。同一个包被多条路径到达时：任一路径无条件 → 无条件；
+    否则取析取 ``(m1) or (m2)``（这是合法的 PEP 508 marker，pip 认）。
+    """
+    seen: dict[str, tuple[str, str | None]] = {}
+    queue: list[tuple[str, str | None]] = [(name, None) for name in direct]
     while queue:
-        name = queue.pop()
+        name, accumulated = queue.pop()
         try:
             dist = md.distribution(name)
         except md.PackageNotFoundError:
@@ -97,19 +116,56 @@ def closure(direct: tuple[str, ...]) -> dict[str, str]:
             continue
         key = dist.metadata["Name"]
         if key in seen:
+            seen[key] = (seen[key][0], _or_markers(seen[key][1], accumulated))
             continue
-        seen[key] = dist.version
+        seen[key] = (dist.version, accumulated)
         for req in dist.requires or ():
             _, _, marker = req.partition(";")
             # 跳过 optional extra（它们不是本项目的直接需要）
             if 'extra ==' in marker or 'extra==' in marker:
                 continue
-            if not _marker_applies(marker.strip() or None):
+            own = marker.strip() or None
+            if not _marker_applies(own):
                 continue
             pkg = _requirement_name(req)
             if pkg and pkg.lower() != "python":
-                queue.append(pkg)
+                queue.append((pkg, _and_markers(accumulated, own)))
     return seen
+
+
+def _and_markers(a: str | None, b: str | None) -> str | None:
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return f"({a}) and ({b})"
+
+
+def _or_markers(a: str | None, b: str | None) -> str | None:
+    if a is None or b is None:
+        return None  # 有一条路径无条件需要 → 这个包就是无条件需要
+    if a == b:
+        return a
+    return f"({a}) or ({b})"
+
+
+def select_for_platform(
+    locked: dict[str, tuple[str, str | None]], environment: dict | None = None
+) -> tuple[dict[str, tuple[str, str | None]], list[str]]:
+    """把锁文件里的包分成「本平台适用」与「本平台不适用」。
+
+    这是 ``--check`` 与"换了平台会不会红"这两件事**共用的唯一判定**。
+    抽成纯函数是为了能测：传一个模拟的 Linux 环境字典，就能在 Windows 上
+    验证"colorama / tzdata 会被正确跳过" —— 而不是等到 CI 上才发现。
+    """
+    applicable: dict[str, tuple[str, str | None]] = {}
+    skipped: list[str] = []
+    for name, (version, marker) in locked.items():
+        if _marker_applies(marker, environment):
+            applicable[name] = (version, marker)
+        else:
+            skipped.append(name)
+    return applicable, sorted(skipped)
 
 
 def main() -> int:
@@ -125,8 +181,9 @@ def main() -> int:
     py = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
 
     if args.check:
+        applicable, skipped = select_for_platform(locked)
         bad: list[str] = []
-        for name, version in sorted(locked.items()):
+        for name, (version, _marker) in sorted(applicable.items()):
             try:
                 actual = md.version(name)
             except md.PackageNotFoundError:
@@ -138,14 +195,27 @@ def main() -> int:
             print("当前环境与 requirements.lock 不一致：")
             for line in bad:
                 print(f"  - {line}")
+            if skipped:
+                print(f"  （另有 {len(skipped)} 个包在当前平台不适用，已跳过："
+                      f"{', '.join(skipped)}）")
             return 1
-        print(f"当前环境与 requirements.lock 一致（{len(locked)} 个包，Python {py}）")
+        note = (
+            f"；{len(skipped)} 个在当前平台不适用已跳过（{', '.join(skipped)}）"
+            if skipped
+            else ""
+        )
+        print(f"当前环境与 requirements.lock 一致（{len(applicable)} 个包，"
+              f"Python {py}{note}）")
         return 0
 
     lines = [
         "# 由 scripts/lock_requirements.py 生成 —— 不要手改。",
         f"# 生成环境：CPython {py} / {sys.platform}",
         "# 内容 = 直接依赖 + 传递闭包，全部钉死版本。",
+        "# 带 `; marker` 的行是**平台条件依赖**：换个平台它可能根本不该被安装",
+        "#   （实测：colorama / tzdata 只在 Windows 上需要），--check 会先判 marker 再查。",
+        "# 注意这份闭包是在**生成平台**上算的：换平台只保证「已锁的都在」，",
+        "#   不保证「该平台需要、而生成平台上不需要」的包也被锁进来。",
         "# 校验：python scripts/lock_requirements.py --check",
         "",
     ]
@@ -156,8 +226,8 @@ def main() -> int:
             lines.append(f"#   {name}=={hit[1] if hit else '???'}")
         lines.append("")
     lines.append("# ---- 传递依赖 ----")
-    for name, version in sorted(locked.items(), key=lambda kv: kv[0].lower()):
-        lines.append(f"{name}=={version}")
+    for name, (version, marker) in sorted(locked.items(), key=lambda kv: kv[0].lower()):
+        lines.append(f"{name}=={version}" + (f" ; {marker}" if marker else ""))
 
     path = Path(args.out)
     # newline="\n" 不是可有可无的：默认（newline=None）在 Windows 上会把 \n 翻成 \r\n，
