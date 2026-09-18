@@ -44,6 +44,20 @@ LAYERS = (
 )
 
 
+def scalar(con, sql: str) -> int:
+    """跑一句"只返回一个数"的 SQL。
+
+    ``fetchone()`` 的静态类型是 ``tuple | None``（查询可能一行都不返回），
+    旧代码直接 ``.fetchone()[0]`` —— 类型检查器说得对。这里把它变成
+    **一句能读懂的报错**：``COUNT(*)`` 永远有一行，所以"没有行"只可能是
+    查询本身写错了，而 ``None[0]`` 的 TypeError 不会告诉你这一点。
+    """
+    row = con.execute(sql).fetchone()
+    if row is None:
+        raise RuntimeError(f"查询没有返回任何行：{' '.join(sql.split())[:70]}")
+    return int(row[0])
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="构建数仓链路并输出实验结论")
     ap.add_argument("--users", type=int, default=20_000, help="合成用户数")
@@ -79,20 +93,22 @@ def main() -> int:
     emit("\n### 1. 各层规模")
     counts: dict[str, int] = {}
     for table, desc in LAYERS:
-        counts[table] = con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        counts[table] = scalar(con, f"SELECT COUNT(*) FROM {table}")
         emit(f"  {table:<34} {counts[table]:>10,}   {desc}")
 
     # ---- 2. 口径验证：首次曝光去重 ---------------------------------------- #
     emit("\n### 2. 口径验证")
     raw = counts["ods_exposure_log"]
-    dedup = con.execute(
-        "SELECT COUNT(*) FROM (SELECT DISTINCT experiment, user_id FROM ods_exposure_log)"
-    ).fetchone()[0]
+    dedup = scalar(
+        con,
+        "SELECT COUNT(*) FROM (SELECT DISTINCT experiment, user_id FROM ods_exposure_log)",
+    )
     dwd = counts["dwd_experiment_user"]
     emit(f"  首次曝光去重: 原始曝光 {raw:,} 条 -> 去重后 {dedup:,} 个 (实验, 用户) 对")
     emit(f"  DWD 行数 = {dwd:,}，与去重结果一致: {dwd == dedup}")
 
-    rolled = con.execute(
+    rolled = scalar(
+        con,
         """
         SELECT COUNT(*) FROM (
             SELECT experiment, variant, SUM(user_cnt) AS n
@@ -100,8 +116,8 @@ def main() -> int:
             GROUP BY experiment, variant
         ) d JOIN ads_experiment_result a USING (experiment, variant)
         WHERE d.n <> a.user_cnt
-        """
-    ).fetchone()[0]
+        """,
+    )
     emit(f"  DWS 可加汇总 vs ADS 人数，不一致行数: {rolled}")
 
     # ---- 3. 实验结论（推断层） -------------------------------------------- #

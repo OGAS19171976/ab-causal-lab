@@ -21,14 +21,36 @@
 做法是**在写出这一处统一过滤**，而不是逐个改 ``say(...)`` 调用。理由是：
 将来有人加一行带耗时的输出时，不需要记得"这条不能进报告"——
 规则已经在那儿了。
+
+这个过滤器的**已知弱点**（实测踩到过）
+----------------------------------------
+它按**措辞**匹配（"耗时/总耗时"），而措辞是开放集合。``run_m6_validation.py``
+里有一行写成 ``（400 个 salt，{t:.0f}s）``，没带"耗时"两个字，于是整行绕过过滤器，
+m6 报告每次重跑都 diff 一行 —— 而且第一次全量实测时它被淹在"36 个文件一致"里。
+
+修法不是把正则加宽到"任何 ``数字+s``"：那会把 ``（400 个 salt，71s）`` 削成
+``（400 个 salt，）``，产出更难看，且**掩盖**了调用点的问题。正确做法是
+* 过滤器只管措辞（它要产出干净正文），
+* 不变量交给 ``tests/test_reporting.py`` 的 ``_DURATION_TOKEN``（按**形状**断言），
+
+一旦那个断言响了，就去改调用点让它带上"耗时"两个字。**宁可报错，不要静默改坏。**
 """
 
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
-__all__ = ["for_report", "report_text", "strip_timings", "relativize_paths"]
+__all__ = [
+    "Comparison",
+    "NumericDiff",
+    "compare_report_texts",
+    "for_report",
+    "relativize_paths",
+    "report_text",
+    "strip_timings",
+]
 
 #: "耗时 61s" / "，耗时 6s" / "总耗时 178s" / "；总耗时 12.3s"
 _TIMING = re.compile(r"[，；、,]?\s*(?:总)?耗时\s*[\d.]+s")
@@ -98,3 +120,152 @@ def for_report(lines, *, root: Path | None = None) -> list[str]:
 
 def report_text(lines, *, root: Path | None = None) -> str:
     return "\n".join(for_report(lines, root=root))
+
+
+# --------------------------------------------------------------------------- #
+# 报告比对的第二个判据：正文不变时，数值末位允许差多少
+# --------------------------------------------------------------------------- #
+#: 一个数：整数、小数、科学计数法都算。故意**不**要求前后是分隔符 ——
+#: 报告里 `effect=27.2482063215`、`(0.0400, 0.0700)`、`1.0e-13` 都得能切出来。
+#:
+#: **这个捕获组是承重的，不是排版。** ``re.split`` 只在模式里出现**显式捕获组**时
+#: 才把匹配到的分隔符留在结果里，否则当成普通分隔符**丢掉**。第一版把整条模式
+#: 写成非捕获组（``(?:...)``），于是 ``"…effect=-3.9243251037\n"`` 被切成
+#: ``['…effect=', '\n']`` —— 数字凭空消失、交替结构塌成"文本、文本"，
+#: 后面就拿着 ``'\n'`` 去 ``float()``。测试当场炸了，这就是它的价值。
+_NUMBER = re.compile(r"([-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?)")
+
+#: 数值比对容差。**和审计自己用的容差同源**（``CrossValidation._close``、
+#: ``SourceEquivalence.agree`` 都是 1e-9）—— 这样"报告没变"和"结论一致"
+#: 在同一个尺度上说话，而不是各定一套。
+DEFAULT_RTOL = 1e-9
+DEFAULT_ATOL = 1e-12
+
+
+@dataclass(frozen=True)
+class NumericDiff:
+    """一处数值差异（同一个位置上的两个数）。"""
+
+    before: str
+    after: str
+    rel_diff: float
+
+
+@dataclass(frozen=True)
+class Comparison:
+    """两份报告正文的比对结果。
+
+    * ``identical``：逐字节相同 —— 最强的结论；
+    * ``text_identical``：**非数值内容**完全一样（措辞、排版、结构、样本量都没动）；
+    * ``worst``：**实测**最大的那处数值差异（用来量化"到底差多少"）；
+    * ``exceeds``：唯一能判失败的东西 —— 超出容差的最大那处差异。
+
+    为什么要分两级：浮点求和的末位**依赖执行环境**（求和顺序、BLAS 选到的
+    内核、有没有 FMA），这是任何"重跑两次"实验都消不掉的。实测到过同一个量
+    在两次独立建仓之间差 1 ulp（``-3.9243251037`` → ``…038``），而它在报告里
+    印到小数点后 6 位，读者根本看不见 —— 也就是说**逐字节判据会把一个
+    纯环境噪声报成失败**，而失败次数多了，这条检查就会被当成"反正它老是红的"。
+    所以判据做成两级：先是"正文一个字都没变"，再把数值差异**量化**出来。
+
+    容差是 ``atol + rtol * max(|before|, |after|)``，两个常数都**照抄审计自己
+    用的尺度**（``CrossValidation._close`` / ``SourceEquivalence.agree`` 都是
+    1e-9），这样"报告没变"和"结论一致"说的是同一个话。``atol`` 那一项是必须的：
+    报告里有一类量**本身就是舍入噪声**（三条路径的"最大偏差"就是两个几乎相等的
+    数相减），它在两次运行间能从 ``2.274e-13`` 变成 ``1.137e-13`` —— 相对差 50%，
+    绝对差 1e-13。只比相对值会把它判失败，而它比任何结论都小十来个数量级。
+    """
+
+    identical: bool
+    text_identical: bool
+    worst: NumericDiff | None
+    exceeds: NumericDiff | None
+    #: 数值位置上的差异处数（含容差内的）
+    n_numeric_diffs: int
+    #: 第一处差异的可读描述，用于定位
+    first_diff: str | None
+
+    @property
+    def within_tolerance(self) -> bool:
+        return self.text_identical and self.exceeds is None
+
+    @property
+    def ok(self) -> bool:
+        """放行条件：逐字节相同，或者"正文没变 + 数值只在容差内"。"""
+        return self.identical or self.within_tolerance
+
+
+def _tokenize(text: str) -> list[str]:
+    """把正文切成"文本 / 数字"交替的 token；数字带标记。"""
+    parts = _NUMBER.split(text)
+    # re.split 带捕获组：偶数下标是文本，奇数下标是数字
+    tokens: list[str] = []
+    for i, part in enumerate(parts):
+        tokens.append(("#" if i % 2 else "T") + part)
+    return tokens
+
+
+def _relative_diff(a: float, b: float) -> float:
+    if a == b:
+        return 0.0
+    scale = max(abs(a), abs(b))
+    return abs(a - b) / scale if scale else abs(a - b)
+
+
+def compare_report_texts(
+    before: str,
+    after: str,
+    *,
+    rtol: float = DEFAULT_RTOL,
+    atol: float = DEFAULT_ATOL,
+) -> Comparison:
+    """比对两份报告正文，允许数值在 ``rtol``/``atol`` 内不同。
+
+    只有当**同样位置的 token 类型也对得上**时才逐位置比较；
+    一旦结构不同（比如一边多出一个数、少了一行），就直接判 ``text_identical=False``，
+    因为那时逐位置比较已经失去意义 —— 与其猜对齐，不如报"正文变了"。
+    """
+    if before == after:
+        return Comparison(True, True, None, None, 0, None)
+
+    tb, ta = _tokenize(before), _tokenize(after)
+    if len(tb) != len(ta):
+        return Comparison(
+            False,
+            False,
+            None,
+            None,
+            0,
+            f"token 数不同（{len(tb)} vs {len(ta)}）—— 结构或行数变了",
+        )
+
+    worst: NumericDiff | None = None
+    exceeds: NumericDiff | None = None
+    n_diffs = 0
+    first: str | None = None
+    for i, (b, a) in enumerate(zip(tb, ta)):
+        if b == a:
+            continue
+        b_num, a_num = b.startswith("#"), a.startswith("#")
+        if not (b_num and a_num):
+            return Comparison(
+                False,
+                False,
+                worst,
+                exceeds,
+                n_diffs,
+                f"token {i} 不是同一类（{b[:40]!r} vs {a[:40]!r}）—— 正文变了",
+            )
+        bv, av = float(b[1:]), float(a[1:])
+        rel = _relative_diff(bv, av)
+        n_diffs += 1
+        diff = NumericDiff(b[1:], a[1:], rel)
+        if first is None:
+            first = f"{b[1:]} -> {a[1:]}（相对偏差 {rel:.3e}）"
+        if worst is None or rel > worst.rel_diff:
+            worst = diff
+        if abs(bv - av) > atol + rtol * max(abs(bv), abs(av)) and (
+            exceeds is None or rel > exceeds.rel_diff
+        ):
+            exceeds = diff
+
+    return Comparison(False, True, worst, exceeds, n_diffs, first)

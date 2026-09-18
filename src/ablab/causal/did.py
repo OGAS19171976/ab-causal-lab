@@ -25,7 +25,7 @@ from typing import Literal, Sequence
 import numpy as np
 from scipy import stats
 
-from ..inference.result import Diagnostic, Estimate
+from ..inference.result import Diagnostic, Estimate, Status
 from ..inference.welch import t_inference, welch_inference
 from .panel import GroundTruth, Panel
 
@@ -214,6 +214,18 @@ class TWFEDecomposition:
     @property
     def post_cells(self) -> np.ndarray:
         return self.treated.astype(bool)
+
+    @property
+    def known_true_effect(self) -> np.ndarray:
+        """``true_effect`` 的"必须存在"版本 —— 只有仿真数据才知道真值。
+
+        真值缺失时，旧代码会在 ``true_effect[post]`` 上抛
+        ``TypeError: 'NoneType' object is not subscriptable``；
+        这里给一句能读懂的报错，而不是让调用处猜。
+        """
+        if self.true_effect is None:
+            raise ValueError("这份分解没有真实效应（只有仿真数据才有），无法按真值分组")
+        return self.true_effect
 
     @property
     def negative_post_weight_share(self) -> float:
@@ -664,7 +676,7 @@ def pretrend_test(
         )
 
     p = float(stats.f.sf(stat / n_leads * (n - n_leads) / n, n_leads, n - n_leads))
-    status = "warn" if p < alpha else "pass"
+    status: Status = "warn" if p < alpha else "pass"
 
     msg = (
         f"处置前 {n_leads} 个 lead 的联合 Wald 检验：chi2({n_leads}) = {stat:.3f}, p={p:.4g}"

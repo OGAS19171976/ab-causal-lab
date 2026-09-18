@@ -264,7 +264,7 @@ def main() -> int:
     say("")
     t0 = time.time()
     h1 = run_monitoring_fwer_audit(n_salts=n_salts, n_units=20_000, n_looks=5, true_lift=0.25)
-    say(f"真实效应 0.25 下（{n_salts} 个 salt，{time.time() - t0:.0f}s）")
+    say(f"真实效应 0.25 下（{n_salts} 个 salt，耗时 {time.time() - t0:.0f}s）")
     say(f"  post-only 检出率 = {h1.post_only_fwer:.4f}")
     say(f"  CUPED     检出率 = {h1.cuped_fwer:.4f}"
         f"   （相对提升 {h1.cuped_advantage:+.1%}）")

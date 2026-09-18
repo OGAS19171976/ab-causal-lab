@@ -26,6 +26,7 @@ from typing import Any
 import numpy as np
 
 from ..hashing import murmur3_32
+from ..inference import Estimate
 from .analysis import PLATFORM_POPULATION, analyse_experiment, analyse_experiment_from_warehouse
 from .registry import ExperimentRecord
 
@@ -115,6 +116,35 @@ class PlatformAAResult:
         )
 
 
+def _require_estimate(estimate: Estimate | None, what: str) -> Estimate:
+    """取一个"必须存在"的估计；缺失就**报错**，而不是让调用处猜。
+
+    ``ExperimentReport`` 的 ``naive`` / ``cuped`` / ``primary`` / ``alt`` 都是
+    ``Estimate | None`` —— 这不是偷懒：比值指标与簇级路径**本来就不产生**
+    CUPED 对照，类型上的 Optional 是真实存在的。
+
+    但审计只跑"均值指标 + 用户级"实验，那几条路径下这些估计一定存在。
+    于是这里有两个选择：让每个调用处写 ``assert x is not None``
+    （会被 ``-O`` 优化掉，而且报错没有上下文），或者在这儿一次性把不变式说清楚。
+    选后者 —— 真出现 None 说明实验配置被改过（比如 metric 被换成 ratio），
+    那时的正确反应是**明说这件事**，而不是让 ``None.absolute_effect``
+    抛一个离原因很远的 ``AttributeError``。
+    """
+    if estimate is None:
+        raise ValueError(
+            f"这次分析没有 {what} 口径的估计（该口径只对均值指标的用户级分析产生）。"
+            "审计跑的就是这类实验，所以走到这里说明实验配置被改过。"
+        )
+    return estimate
+
+
+def _require_number(value: float | None, what: str) -> float:
+    """同上，只是针对 ``float | None`` 的诊断量。"""
+    if value is None:
+        raise ValueError(f"这次分析没有算出「{what}」；审计需要它（检查实验配置是否被改过）")
+    return value
+
+
 def run_platform_aa_audit(
     *,
     n_salts: int = 400,
@@ -138,12 +168,14 @@ def run_platform_aa_audit(
             f"aa_{i}", f"aa_audit_{i}", traffic_ratio=traffic_ratio, metric=metric
         )
         rep = analyse_experiment(rec, n_users=n_units, alpha=alpha)
-        nz.append(rep.naive.absolute_effect / rep.naive.std_error)
-        cz.append(rep.cuped.absolute_effect / rep.cuped.std_error)
-        naive_hits += int(rep.naive.significant)
-        cuped_hits += int(rep.cuped.significant)
+        naive = _require_estimate(rep.naive, "post-only")
+        cuped = _require_estimate(rep.cuped, "CUPED")
+        nz.append(naive.absolute_effect / naive.std_error)
+        cz.append(cuped.absolute_effect / cuped.std_error)
+        naive_hits += int(naive.significant)
+        cuped_hits += int(cuped.significant)
         # 真效应为 0，所以"覆盖"就是区间盖住 0
-        coverage += int(rep.cuped.ci_low <= 0.0 <= rep.cuped.ci_high)
+        coverage += int(cuped.ci_low <= 0.0 <= cuped.ci_high)
         if progress is not None and (i + 1) % max(1, n_salts // 10) == 0:
             progress(i + 1, n_salts)
 
@@ -239,8 +271,8 @@ def run_stream_independence_audit(
             a, b = _pair_z(s_pre, s_eps)
             dx.append(a)
             de.append(b)
-        dx, de = np.array(dx), np.array(de)
-        return float(np.corrcoef(dx, de)[0, 1]), dx, de
+        dx_arr, de_arr = np.array(dx), np.array(de)
+        return float(np.corrcoef(dx_arr, de_arr)[0, 1]), dx_arr, de_arr
 
     adj_corr, adj_dx, adj_de = _run(
         [(base + 7 * k, base + 7 * k + 1) for k in range(n_reps)]
@@ -447,6 +479,10 @@ def run_demo_decomposition(
             true_lift=true_lift, metric=demo.get("primary_metric", "metric"),
         )
         rep = analyse_experiment(rec, n_users=n_users)
+        # 与 A/A 审计同样的道理：这个审计只跑均值指标的用户级实验，
+        # 所以两个口径一定都在；不在就明说，而不是让 None 传到 float() 里。
+        naive = _require_estimate(rep.naive, "post-only")
+        cuped = _require_estimate(rep.cuped, "CUPED")
 
         # 用同一条记录重新生成一次数据，把 β·ΔX 与 Δeps 分开量出来
         base_seed = murmur3_32(salt.encode("utf-8"))
@@ -479,16 +515,16 @@ def run_demo_decomposition(
                 name=demo["name"],
                 true_lift=true_lift,
                 n_users=n_users,
-                naive_effect=rep.naive.absolute_effect,
-                cuped_effect=rep.cuped.absolute_effect,
-                naive_z=rep.naive.absolute_effect / rep.naive.std_error,
-                cuped_z=rep.cuped.absolute_effect / rep.cuped.std_error,
-                naive_significant=rep.naive.significant,
-                cuped_significant=rep.cuped.significant,
-                imbalance_component=float(rep.imbalance_component),
-                residual_component=float(rep.residual_component),
-                balance_statistic=float(balance.statistic),
-                balance_p_value=float(balance.p_value),
+                naive_effect=naive.absolute_effect,
+                cuped_effect=cuped.absolute_effect,
+                naive_z=naive.absolute_effect / naive.std_error,
+                cuped_z=cuped.absolute_effect / cuped.std_error,
+                naive_significant=naive.significant,
+                cuped_significant=cuped.significant,
+                imbalance_component=_require_number(rep.imbalance_component, "效应分解：失衡部分"),
+                residual_component=_require_number(rep.residual_component, "效应分解：残余部分"),
+                balance_statistic=_require_number(balance.statistic, "协变量平衡统计量"),
+                balance_p_value=_require_number(balance.p_value, "协变量平衡 p 值"),
                 pre_difference=d_pre,
                 pre_difference_se=se_pre,
                 noise_difference=d_noise,
@@ -601,7 +637,8 @@ def run_source_equivalence_audit(con, experiment: str, *, n_looks: int = 5) -> S
     # 平台把"头条口径"和"对照口径"分开报，而参照实现是按 (post-only, CUPED) 排的。
     # 这里**按名字取**，不依赖声明顺序 —— 否则把 estimator 改成 post_only 就会静默错位。
     by_name = {rep.primary_estimator_name: rep.primary, rep.alt_estimator_name: rep.alt}
-    post_est, cuped_est = by_name["post_only"], by_name["cuped"]
+    post_est = _require_estimate(by_name.get("post_only"), "post-only")
+    cuped_est = _require_estimate(by_name.get("cuped"), "CUPED")
     from_platform = (
         post_est.absolute_effect,
         post_est.std_error,
@@ -611,6 +648,7 @@ def run_source_equivalence_audit(con, experiment: str, *, n_looks: int = 5) -> S
 
     data = build_warehouse_data(con, experiment, n_looks=n_looks)
     last = rep.monitoring[-1]
+    primary = _require_estimate(rep.primary, "头条（primary）")
     return SourceEquivalence(
         experiment=experiment,
         n_users=rep.n_users,
@@ -619,8 +657,8 @@ def run_source_equivalence_audit(con, experiment: str, *, n_looks: int = 5) -> S
         from_ads=from_ads,
         from_platform=from_platform,
         last_look_matches=(
-            abs(last["effect"] - rep.primary.absolute_effect) < 1e-12
-            and abs(last["std_error"] - rep.primary.std_error) < 1e-12
+            abs(last["effect"] - primary.absolute_effect) < 1e-12
+            and abs(last["std_error"] - primary.std_error) < 1e-12
         ),
         information_fractions=[lk.information_fraction for lk in data.looks],
     )
@@ -719,7 +757,7 @@ def run_monitoring_fwer_audit(
         post_final += int(
             rows[-1]["alt_z"] is not None and abs(rows[-1]["alt_z"]) >= rows[-1]["boundary"]
         )
-        cuped_final += int(rep.primary.significant)
+        cuped_final += int(_require_estimate(rep.primary, "头条（primary）").significant)
         post_z.append(float(rows[-1]["alt_z"]))
         cuped_z.append(float(rows[-1]["z"]))
 
@@ -813,15 +851,19 @@ def run_unit_awareness_audit(
         rec.analysis_unit = "cluster"
         rec.estimator = "post_only"
         rep = analyse_experiment(rec, n_users=n_users, n_looks=n_looks, alpha=alpha)
+        # 这个审计**故意**把同一个实验按两种单元各分析一遍：primary 是簇级、
+        # alt 是单元级（错的那个）。两个都必须存在，否则整条对比没有意义。
+        primary = _require_estimate(rep.primary, "簇级（primary）")
+        alt = _require_estimate(rep.alt, "单元级（alt）")
 
-        unit_hits += int(rep.alt.significant)
-        cluster_hits += int(rep.primary.significant)
+        unit_hits += int(alt.significant)
+        cluster_hits += int(primary.significant)
         unit_seq += int(
             any(m["alt_z"] is not None and abs(m["alt_z"]) >= m["boundary"] for m in rep.monitoring)
         )
         cluster_seq += int(any(m["crossed"] for m in rep.monitoring))
-        se_ratios.append(rep.primary.std_error / rep.alt.std_error)
-        n_clusters_seen = rep.primary.n_treatment + rep.primary.n_control
+        se_ratios.append(primary.std_error / alt.std_error)
+        n_clusters_seen = primary.n_treatment + primary.n_control
 
     ratios = np.array(se_ratios)
     return UnitAwarenessResult(

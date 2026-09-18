@@ -25,6 +25,7 @@ CI 与 `tasks.ps1` 都调它，两边不可能不一致。
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 import time
@@ -32,6 +33,53 @@ from dataclasses import dataclass
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def force_utf8_output() -> None:
+    """固定本进程 stdout / stderr 的编码，让它在**管道和重定向**下也能跑。
+
+    为什么需要：Windows 上 stdout 一旦不是控制台（被管道接走、重定向到文件 ——
+    也就是 CI、``Select-Object``、``> log.txt`` 这些最常见用法），Python 就用 locale
+    编码（简体中文机器上是 GBK），而本脚本的进度标记 ``▶`` 在 GBK 里没有码位，
+    于是**检查一步都没跑就崩在打印标题上**：
+
+        UnicodeEncodeError: 'gbk' codec can't encode character '\\u25b6'
+
+    实测踩到过：``python scripts/run_all_checks.py --only m2 | Select-Object -Last 20``。
+    以前没暴露，是因为 ``tasks.ps1``（``chcp 65001`` + ``PYTHONIOENCODING=utf-8``）
+    和 CI 的 ``env:`` 都替它设好了 —— 也就是说这个脚本**只在有人绕过那两个入口时**坏掉，
+    而 ``scripts/check_report_determinism.py`` 恰好就是绕过它直接调的。
+
+    控制台与管道**分开处理**，这不是洁癖：在 GBK 控制台上强行改成 UTF-8 会让中文
+    全部变乱码，那是拿一个 bug 换另一个。所以控制台只加 ``errors="replace"``
+    （符号降级成 ``?``，中文照旧），管道才换成 UTF-8（父进程按 UTF-8 读它）。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if stream is None:
+            continue
+        # ``reconfigure`` 只存在于 ``io.TextIOWrapper``，而 ``sys.stdout`` 的静态
+        # 类型是 ``TextIO`` —— 用 getattr 取一次，取不到就跳过。
+        # 这不是为了哄类型检查器：被换成 ``StringIO``（测试里常见）时确实没有它。
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            if stream.isatty():
+                reconfigure(errors="replace")
+            else:
+                reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
+
+
+def child_env() -> dict[str, str]:
+    """子进程的环境：强制 UTF-8 输出。
+
+    本脚本用 ``encoding="utf-8"`` 抓子进程的 stdout 并写进 ``build/checks/*.log``，
+    所以子进程也必须**按 UTF-8 写**，否则日志里的中文全是乱码（抓的时候
+    ``errors="replace"`` 不会报错，只会静默变成 ``?`` —— 又是一个"没有信号的降级"）。
+    """
+    return {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
 
 
 @dataclass(frozen=True)
@@ -60,7 +108,7 @@ class Step:
 #: m5/m6 的数仓段落要 ``build/warehouse.duckdb`` 存在，否则会**静默跳过**那一段
 #: （报告里只剩一句"跳过"，汇总却仍然全绿）。这种"因为缺前置条件而少测一段"
 #: 是本项目最该防的行为，所以顺序在这里写死并加了断言。
-_ORDER_HEAD = ("lock", "lint", "warehouse")
+_ORDER_HEAD = ("lock", "lint", "types", "warehouse")
 
 
 def steps() -> list[Step]:
@@ -70,8 +118,11 @@ def steps() -> list[Step]:
              (py, "scripts/lock_requirements.py", "--check")),
         # ruff 走 `python -m ruff` 而不是直接调可执行文件 —— 后者在 Windows 上叫
         # ruff.exe、在 Linux 上叫 ruff，路径拼接容易写错，而 python -m 是跨平台的。
+        # 下面 mypy 同理。
         Step("lint", "ruff 静态检查（配置见 pyproject，刻意只查真问题）",
              (py, "-m", "ruff", "check", "src", "scripts", "tests")),
+        Step("types", "mypy 类型检查（刻意不 --strict，见 pyproject 的说明）",
+             (py, "-m", "mypy")),
         Step("warehouse", "数仓链路（m5/m6 的前提）",
              (py, "scripts/run_warehouse.py")),
         Step("m0", "M0 分流层 + 推断层",
@@ -110,7 +161,13 @@ def run_step(step: Step, *, log_dir: Path, quick: bool) -> tuple[int, float]:
     print(f"  ▶ {step.key:<10} {step.title}", flush=True)
     t0 = time.time()
     proc = subprocess.run(
-        argv, cwd=ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace"
+        argv,
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=child_env(),
     )
     elapsed = time.time() - t0
     log_path.write_text(
@@ -127,6 +184,8 @@ def run_step(step: Step, *, log_dir: Path, quick: bool) -> tuple[int, float]:
 
 
 def main() -> int:
+    # 放在第一行：下面每一句 print 都可能带中文或 ▶，包括 --help 之后的计划列表。
+    force_utf8_output()
     ap = argparse.ArgumentParser(description="跑完整检查集")
     ap.add_argument("--quick", action="store_true", help="快速模式（各脚本的 --quick）")
     ap.add_argument("--list", action="store_true", help="只列计划，不执行")
@@ -172,6 +231,7 @@ def main() -> int:
         proc = subprocess.run(
             [sys.executable, "-m", "pytest", "tests/"],
             cwd=ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            env=child_env(),
         )
         (log_dir / "tests.log").write_text(proc.stdout + proc.stderr, encoding="utf-8")
         elapsed = time.time() - t0

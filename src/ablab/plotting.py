@@ -23,9 +23,10 @@ import matplotlib  # noqa: E402
 matplotlib.use("Agg")  # 无头环境：只出文件，不弹窗
 
 import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
 from matplotlib import font_manager  # noqa: E402
 
-__all__ = ["setup_style", "label", "HAS_CJK", "save", "plt"]
+__all__ = ["setup_style", "label", "HAS_CJK", "save", "plt", "bin_edges"]
 
 _CJK_CANDIDATES = (
     "Microsoft YaHei",
@@ -80,6 +81,19 @@ def setup_style() -> bool:
 def label(zh: str, en: str) -> str:
     """有中文字体就用中文，否则退回英文。"""
     return zh if HAS_CJK else en
+
+
+def bin_edges(values) -> list[float]:
+    """给 ``Axes.hist`` 用的分箱边界（``np.linspace(...)`` 的结果）。
+
+    为什么要在这里转一次 ``list``：matplotlib 的类型桩把 ``bins`` 声明成
+    ``int | Sequence[float] | str | None``，而 numpy 的 ``ndarray`` 在类型系统里
+    **不算 ``Sequence``**（运行时当然完全可以用）。第一版在 6 个调用点各写一个
+    ``# type: ignore`` —— 那等于在 6 个地方重复同一句"这个桩不准"。
+    收在出图这一层，既只说一次，也真的表达了意图：``.tolist()`` 得到的
+    就是"一串边界值"，而这正是 ``bins`` 要的东西。
+    """
+    return np.asarray(values, dtype=float).tolist()
 
 
 def save(fig, path) -> None:

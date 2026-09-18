@@ -47,7 +47,7 @@ import numpy as np
 from scipy import stats
 
 from .aggregates import AggregateStats
-from .result import Diagnostic, Estimate
+from .result import Diagnostic, Estimate, Status
 from .srm import srm_check
 from .welch import welch_inference
 
@@ -170,7 +170,7 @@ def _balance_diagnostic(treatment: AggregateStats, control: AggregateStats) -> D
 
     z = gap / se
     p = float(2 * stats.norm.sf(abs(z)))
-    status = "warn" if p < _IMBALANCE_ALPHA else "pass"
+    status: Status = "warn" if p < _IMBALANCE_ALPHA else "pass"
     msg = (
         f"前置指标组间差 {gap:+.4f}（{z:+.2f} 个标准误），p={p:.4g}"
         + ("；**失衡**——CUPED 收益最大的情形，但也提示分流链路值得复查" if status == "warn" else "")

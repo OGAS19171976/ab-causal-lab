@@ -21,11 +21,14 @@ CI 没加，于是**绿灯的 CI 其实没检查那一步**。所以全部检查
 from __future__ import annotations
 
 import importlib.util
+import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 CI = ROOT / ".github" / "workflows" / "ci.yml"
@@ -82,12 +85,18 @@ class TestCheckPlan:
         assert [s.key for s in runner.steps()][0] == "lock"
 
     def test_fast_checks_run_first(self, runner):
-        """秒级的检查（锁文件、lint）与前置条件（数仓）必须排在最前面。
+        """秒级的检查（锁文件、lint、类型检查）与前置条件（数仓）必须排在最前面。
 
         早失败就早反馈 —— 不用等五分钟的 pytest 跑完才发现少了个导入。
         """
         keys = [s.key for s in runner.steps()]
-        assert keys[:3] == ["lock", "lint", "warehouse"], keys[:3]
+        assert keys[:4] == ["lock", "lint", "types", "warehouse"], keys[:4]
+
+    def test_type_check_step_uses_module_invocation(self, runner):
+        """``python -m mypy``，理由同上条（跨平台，且不拼平台相关的可执行文件名）。"""
+        types_step = next(s for s in runner.steps() if s.key == "types")
+        assert types_step.argv[1] == "-m", types_step.argv
+        assert types_step.argv[2] == "mypy", types_step.argv
 
     def test_lint_step_uses_module_invocation(self, runner):
         """``python -m ruff`` 而不是直接调可执行文件。
@@ -166,13 +175,22 @@ class TestCIContract:
         )
 
     def test_ci_python_version_matches_local(self):
-        """CI 的 Python 版本要与本仓库实测的版本一致（3.14）。"""
+        """CI 的 Python 版本要与本仓库实测的版本一致，而且**只有一个来源**。
+
+        版本写在 ``.python-version`` 里（uv / pyenv / setup-python 都认它），
+        YAML 用 ``python-version-file`` 去读 —— 两处各写一份就会出现
+        "CI 在 3.13 上绿、本机是 3.14"这种漂移，而绿灯的含义就此含糊。
+        """
+        declared = (ROOT / ".python-version").read_text(encoding="utf-8").strip()
+        local = f"{sys.version_info.major}.{sys.version_info.minor}"
+        assert declared == local, f".python-version 写 {declared}，本机是 {local}"
+
         text = CI.read_text(encoding="utf-8")
-        versions = set(re.findall(r'python-version:\s*"([\d.]+)"', text))
-        assert versions, "CI 里没有声明 python-version"
-        assert versions == {f"{sys.version_info.major}.{sys.version_info.minor}"}, (
-            f"CI 用 {versions}，本机是 {sys.version_info.major}.{sys.version_info.minor} —— "
-            "版本不一致时 CI 的绿灯不代表本机验证过的那套"
+        assert "python-version-file: .python-version" in text, "CI 没有从 .python-version 读版本"
+        # 常见的坑：既写了 python-version-file 又留了一个硬编码的 python-version
+        assert not re.search(r"^\s*python-version:\s", text, re.M), (
+            "CI 里同时存在硬编码的 python-version —— 两个来源会打架，"
+            "而 setup-python 取哪个是它的实现细节，不该由我们来赌"
         )
 
     def test_ci_publishes_the_evidence(self):
@@ -191,3 +209,155 @@ class TestCIContract:
         # 不要再让 -q 出现两次（会吞掉汇总行）
         assert "-m pytest tests/" in tasks
         assert "-m pytest tests/ -q" not in tasks
+
+
+class TestLineEndings:
+    """工作区里不该有 CRLF 的文本文件。
+
+    ``.gitattributes`` 声明了 ``* text=auto eol=lf``，所以**仓库里存的一定是 LF**；
+    但工作区是另一回事：Windows 上的 ``Path.write_text()``（文本模式 newline=None）
+    与 PowerShell 的 ``[System.IO.File]::WriteAllLines`` 都会写出 CRLF，而
+    ``core.autocrlf=false`` 不会替你转回来。
+
+    这条测试是**被实测打脸之后**补的：做完"统一换行符"那一轮，复查发现工作区里
+    还有 7 个 .py 是 CRLF（其中 ``platform/datasource.py``、``platform/analysis.py``
+    都是核心模块）—— 也就是说 README 里那句"统一换行符"当时**是不准确的**。
+    ``git ls-files --eol`` 显示 ``i/lf w/crlf``，索引是干净的，所以只查 git 看不出来；
+    要查的是工作区字节。
+    """
+
+    #: `.gitattributes` 里声明为 LF 的后缀。``*.ps1`` 刻意不在其中 —— 它按平台走 CRLF。
+    LF_SUFFIXES = (".py", ".md", ".sql", ".toml", ".yml", ".yaml", ".txt", ".cfg", ".ini")
+    #: 没有后缀但同样是 LF 的文件
+    LF_NAMES = (".gitattributes", ".python-version", "requirements.lock", "Makefile")
+    SKIP_DIRS = {
+        ".git",
+        ".venv",
+        "build",
+        "__pycache__",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".mypy_cache",
+        "node_modules",
+    }
+
+    def test_gitattributes_declares_lf(self):
+        text = (ROOT / ".gitattributes").read_text(encoding="utf-8")
+        assert "eol=lf" in text, ".gitattributes 没有声明 eol=lf"
+
+    def test_no_crlf_in_working_tree(self):
+        offenders: list[str] = []
+        for path in sorted(ROOT.rglob("*")):
+            if not path.is_file():
+                continue
+            if set(path.relative_to(ROOT).parts[:-1]) & self.SKIP_DIRS:
+                continue
+            if not (path.suffix in self.LF_SUFFIXES or path.name in self.LF_NAMES):
+                continue
+            data = path.read_bytes()
+            if b"\r\n" in data:
+                offenders.append(str(path.relative_to(ROOT)).replace("\\", "/"))
+        assert not offenders, (
+            "这些文件在工作区里是 CRLF（仓库里存的是 LF，但工作区没跟上）：\n  - "
+            + "\n  - ".join(offenders)
+            + "\n修法（在仓库根执行）：把文件里的 \\r\\n 换成 \\n，然后 git status 应当没有额外变化"
+        )
+
+
+class TestTypeCheckContract:
+    """类型检查的接入契约（第 (4) 项：ruff + **类型检查**）。
+
+    为什么要有测试盯着"配置"而不只是"跑得通"：``mypy`` 的**档位**决定了
+    "通过"这句话有多少信息量。第一版配置里写了 ``python_version = "3.10"``
+    （照的是 ``requires-python`` 下界），结果 mypy 用 3.10 的语法去读 numpy 的
+    stub，直接报 ``Type statement is only supported in Python 3.12 and greater
+    [syntax]`` **并且中断后续所有检查** —— 于是"mypy 通过"实际是"什么都没查"。
+    那是个**假绿灯**，比红色危险得多。
+    """
+
+    def test_mypy_is_configured(self):
+        cfg = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+        mypy = cfg["tool"]["mypy"]
+        # 只查函数体（签名允许不写注解）：这是刻意的档位，理由写在配置里
+        assert mypy["check_untyped_defs"] is True
+        assert mypy["files"] == ["src/ablab", "scripts"]
+        assert mypy["warn_unused_ignores"] is True, "无用的 type: ignore 必须报出来"
+
+    def test_mypy_config_does_not_hardcode_python_version(self):
+        """Python 版本只有一个来源（``.python-version``）。
+
+        写进 mypy 配置就是第二个来源，而且实测会以"中断检查"的方式造成假绿灯。
+        不写时 mypy 用**正在运行的解释器**，那个版本正是 ``.python-version`` 决定的。
+        """
+        cfg = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+        assert "python_version" not in cfg["tool"]["mypy"], (
+            "mypy 配置里硬编码了 python_version —— 它必须跟着 .python-version 走"
+        )
+
+    def test_mypy_is_a_check_step(self):
+        """类型检查必须是检查集里的一步，而不是"我本地跑过一次"。"""
+        plan = _load_runner().steps()
+        keys = {s.key: s for s in plan}
+        assert "types" in keys, "run_all_checks.py 里没有类型检查这一步"
+        argv = keys["types"].argv
+        assert "mypy" in argv, f"types 步骤跑的不是 mypy：{argv}"
+        assert "src" not in argv and "scripts" not in argv, (
+            "命令行不该再写一遍路径 —— 检查范围由 pyproject 的 [tool.mypy] files 决定，"
+            "否则就会出现两份范围、迟早漂移"
+        )
+
+    def test_mypy_is_declared_and_locked(self):
+        declared = (ROOT / "requirements.txt").read_text(encoding="utf-8")
+        locked = (ROOT / "requirements.lock").read_text(encoding="utf-8")
+        assert "mypy==" in declared
+        assert "mypy==" in locked
+        assert "mypy_extensions==" in locked, "锁文件缺 mypy 的传递依赖"
+
+
+    """检查集在**管道**下也必须能跑 —— 这条是实测崩过一次之后补的。
+
+    现象：``python scripts/run_all_checks.py --only m2 | Select-Object -Last 20``
+    直接 ``UnicodeEncodeError: 'gbk' codec can't encode character '\\u25b6'`` ——
+    一步都没跑，崩在打印进度标记上。以前没暴露是因为 ``tasks.ps1`` 和 CI 都替它设了
+    ``PYTHONIOENCODING=utf-8``，而 ``check_report_determinism.py`` 恰恰绕过了那两个入口。
+
+    这类 bug 的危险在于**它看起来像"检查失败"**：报错发生在子进程里，汇总只会说
+    "预热运行失败，先修好再谈可复现性" —— 读到的人会去查被检查的东西，
+    而真正坏的是检查器自己。
+    """
+
+    def test_runner_survives_a_pipe_without_encoding_env(self):
+        """按路径起一次真进程：stdout 是管道，环境里**没有**任何 PYTHON* 变量。
+
+        端到端复现"有人直接调用"那条路径，而不是断言实现细节。
+        """
+        env = {k: v for k, v in os.environ.items() if not k.startswith("PYTHON")}
+        proc = subprocess.run(
+            [sys.executable, "scripts/run_all_checks.py", "--list"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+        )
+        assert proc.returncode == 0, f"管道下退出了 {proc.returncode}：{proc.stderr[-800:]}"
+        assert "UnicodeEncodeError" not in proc.stderr
+        # 中文必须**完整**地穿过管道。这一条同时证明了两件事：
+        # 子进程没在编码上崩，而且它写的是 UTF-8（若写了 GBK，父进程按 UTF-8 解
+        # 会得到乱码，`errors="replace"` 不会报错，但这里就找不到了）。
+        assert "计划（完整）" in proc.stdout
+        assert "锁文件与当前环境一致" in proc.stdout
+
+    def test_children_are_told_to_write_utf8(self):
+        """子进程的 stdout 是按 UTF-8 抓的，所以它们也必须按 UTF-8 写。
+
+        不设那个环境变量时，Windows 上子进程按 GBK 写中文、父进程按 UTF-8 读，
+        而 ``errors="replace"`` 让这件事**不报错** —— 只是 ``build/checks/*.log``
+        里的中文静默变成乱码。又是一个"没有信号的降级"。
+        """
+        text = (ROOT / "scripts" / "run_all_checks.py").read_text(encoding="utf-8")
+        assert "PYTHONIOENCODING" in text
+        assert re.search(r"subprocess\.run\(\s*[^)]*env=child_env\(\)", text, re.S), (
+            "run_all_checks.py 起子进程时没有传 child_env()，日志编码会依赖调用者环境"
+        )

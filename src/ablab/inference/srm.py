@@ -18,7 +18,7 @@ from typing import Mapping
 
 from scipy import stats
 
-from .result import Diagnostic
+from .result import Diagnostic, Status
 
 __all__ = ["srm_check", "srm_from_weights"]
 
@@ -84,7 +84,7 @@ def srm_check(
     max_dev = max(
         abs(o - e) / e for o, e in zip(observed, expected)
     )
-    status = "fail" if p_value < alpha else "pass"
+    status: Status = "fail" if p_value < alpha else "pass"
     if status == "fail":
         message = (
             f"样本比例失衡：卡方={chi2:.1f}，p={p_value:.3g} < {alpha:g}，"

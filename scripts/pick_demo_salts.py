@@ -16,6 +16,7 @@
 
 import sys
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -25,7 +26,11 @@ from ablab.platform import run_demo_decomposition  # noqa: E402
 N = 20_000
 MAX_K = 40
 
-CONFIGS = [
+#: 注解写 ``Any`` 是**故意**的：每一条都是"手写的实验配置"，值有 str / float / list
+#: 好几种类型（``variants`` 是列表、``traffic_ratio`` 是数）。
+#: 不给注解时 mypy 会把 ``cfg["name"]`` 推成 ``object``，于是它没法当字典的键用 ——
+#: 报错是真的，但根因是"这个结构本来就是异构的"，而不是代码写错了。
+CONFIGS: list[dict[str, Any]] = [
     {
         "name": "exp_rank_v2",
         "hypothesis": "新排序模型提升人均互动次数",

@@ -44,7 +44,7 @@ from ablab.causal import (  # noqa: E402
     twfe,
     twfe_decomposition,
 )
-from ablab.plotting import label, plt, save, setup_style  # noqa: E402
+from ablab.plotting import bin_edges, label, plt, save, setup_style  # noqa: E402
 from ablab.reporting import for_report  # noqa: E402
 from ablab.validation import (  # noqa: E402
     run_pretrend_audit,
@@ -125,7 +125,7 @@ def fig_staggered_estimators(comparison, out: Path) -> None:
     fig, ax = plt.subplots(figsize=(7.8, 4.2))
     lo = min(comparison.twfe_estimates.min(), comparison.truths.min()) - 0.3
     hi = max(comparison.twfe_estimates.max(), comparison.truths.max()) + 0.3
-    bins = np.linspace(lo, hi, 40)
+    bins = bin_edges(np.linspace(lo, hi, 40))
 
     ax.hist(comparison.twfe_estimates, bins=bins, color=RED, alpha=0.65,
             label=label(f"TWFE（符号翻转 {comparison.twfe_sign_flip_rate:.0%}）",
@@ -270,7 +270,7 @@ def main() -> int:
     emit(dec.summary())
 
     post = dec.post_cells
-    eff = dec.true_effect[post]
+    eff = dec.known_true_effect[post]
     w = dec.weight[post]
     emit("")
     emit("按真实效应看平均隐式权重：")
@@ -329,7 +329,7 @@ def main() -> int:
 
     # ---- 结论 -------------------------------------------------------------- #
     checks = {
-        "数据里效应处处为正": bool(dec.true_effect[dec.post_cells].min() > 0),
+        "数据里效应处处为正": bool(dec.known_true_effect[dec.post_cells].min() > 0),
         "TWFE 出现符号翻转": comparison.twfe_sign_flip_rate > 0.5,
         "TWFE 权重与效应负相关": dec.weight_effect_correlation() < -0.3,
         "CS 基本无偏": abs(comparison.cs_bias) < 0.05,

@@ -47,7 +47,10 @@ from ablab.platform import (  # noqa: E402
     run_source_equivalence_audit,
     run_stream_independence_audit,
 )
-from ablab.platform.analysis import analyse_experiment_from_warehouse  # noqa: E402
+from ablab.platform.analysis import (  # noqa: E402
+    ExperimentReport,
+    analyse_experiment_from_warehouse,
+)
 from ablab.platform.api import default_warehouse_path  # noqa: E402
 from ablab.platform.datasource import (  # noqa: E402
     build_warehouse_data,
@@ -150,7 +153,7 @@ def fig_decomposition(decomps, out: Path) -> None:
     save(fig, out / "fig26_effect_decomposition.png")
 
 
-def fig_warehouse_monitoring(paths: list[tuple[str, object]], out: Path) -> None:
+def fig_warehouse_monitoring(paths: list[tuple[str, ExperimentReport]], out: Path) -> None:
     """真实链路上的按日累计监控。
 
     这是数仓路径独有的东西：合成数据的"查看"是按用户进入顺序取前缀，
@@ -406,7 +409,7 @@ def main() -> int:
     say("6. 数仓链路：三条读取路径必须给同一个答案")
     say("=" * 78)
     wh_path = default_warehouse_path()
-    wh_reports: list[tuple[str, object]] = []
+    wh_reports: list[tuple[str, ExperimentReport]] = []
     if not wh_path.exists():
         say(f"跳过：{wh_path} 不存在。先跑 `python scripts/run_warehouse.py` 再执行本脚本。")
     else:
@@ -452,8 +455,11 @@ def main() -> int:
                 f"health={wr.health}")
             say(f"  监控查看（按日累计）："
                 f"{[(m['label'][:10], m['n_per_arm']) for m in wr.monitoring]}")
-            say(f"  末次边界={wr.sequential.final_boundary:.4f} "
-                f"reliable={wr.sequential.reliable}")
+            design = wr.sequential
+            if design is None:
+                raise RuntimeError("数仓路径的报告里应当有序贯设计（n_looks>1）")
+            say(f"  末次边界={design.final_boundary:.4f} "
+                f"reliable={design.reliable}")
             say("")
         data = build_warehouse_data(con, "exp_rank_v2", n_looks=5)
         say(f"数仓路径的查看标签形如 {data.looks[0].label!r} —— "

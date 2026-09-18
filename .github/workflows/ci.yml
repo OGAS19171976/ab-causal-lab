@@ -2,16 +2,20 @@
 # CI：把"这套数字可信"从本机搬到任何人可验证的地方
 # ============================================================================
 # 这个仓库的全部主张都是"可复现、可验证"。在配 CI 之前，
-# "475 个测试通过、七个验证脚本 exit=0"只在一个人的机器上成立 ——
+# "测试通过、验证脚本 exit=0"只在一个人的机器上成立 ——
 # 那不算证据，那算复述。这个工作流把同一件事变成公开、可点开、可重跑的东西。
 #
 # 两个 job 并行：
-#   tests       只跑 pytest（约 5 分钟，反馈最快）
-#   validation  锁文件 + 全部验证脚本（约 10 分钟）
+#   tests       静态检查 + 锁文件校验 + pytest（反馈最快）
+#   validation  全部验证脚本（较慢）
 #
 # 两者的命令定义来自同一处 —— scripts/run_all_checks.py。
 # 这正是那个脚本存在的理由：CI 与本地各写一份命令清单，迟早漂移，
 # 于是"本地绿、CI 没跑那一步"这种假绿灯会一直存在。
+#
+# 这里**刻意不写"多少个测试""几个脚本"**：那是会随每次改动漂移的数字，
+# 而它漂移时没有任何东西会报错。要看当前清单就跑
+# `python scripts/run_all_checks.py --list`。
 #
 # 注意 Ubuntu 上跑图会走 label() 的英文回退分支（容器里没有 CJK 字体），
 # 这是设计好的行为而不是故障 —— 见 ablab/plotting.py。
@@ -38,20 +42,29 @@ env:
 
 jobs:
   tests:
-    name: 测试（475 个）
+    name: 检查 + 测试
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          # 与本仓库实测环境一致。若 setup-python 尚未提供 3.14，
-          # 改成 "3.13" 即可 —— 但要知道那不再是"实测过的那套"。
-          python-version: "3.14"
+          # 版本从 .python-version 读，而不是在 YAML 里再写一遍。
+          # 两处各写一份就会出现"CI 在 3.13 上绿、本机是 3.14"这种漂移；
+          # .python-version 同时被 uv / pyenv / setup-python 认，是单一来源。
+          # 若 setup-python 尚未提供该版本，CI 会在这**一步**明确失败 ——
+          # 那远好过悄悄换一个版本把后面的检查跑绿。
+          python-version-file: .python-version
           cache: pip
           cache-dependency-path: requirements.txt
       - name: 安装依赖
         run: pip install -r requirements.txt
+      - name: 记录环境（排查 CI 失败时先看这一条）
+        run: |
+          python -VV
+          python -c "import numpy, scipy, pandas, duckdb, pyarrow, matplotlib, sklearn, fastapi; print('numpy', numpy.__version__, 'scipy', scipy.__version__)"
+      - name: 静态检查（ruff，配置见 pyproject）
+        run: python -m ruff check src scripts tests
       - name: 依赖声明与锁文件一致
         run: python scripts/lock_requirements.py --check
       - name: pytest
@@ -72,7 +85,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.14"
+          python-version-file: .python-version
           cache: pip
           cache-dependency-path: requirements.txt
       - name: 安装依赖

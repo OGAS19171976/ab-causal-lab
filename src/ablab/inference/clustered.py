@@ -30,9 +30,15 @@ G=200 个簇、每簇 100 人、ICC=0.1 时 deff = 1 + 99×0.1 ≈ 10.9，
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
 
 import numpy as np
+
+#: 这几个入口收的是"数组或序列" —— 调用方既会传 ``list[float]``（测试里好写），
+#: 也会传 ``np.ndarray``（数仓/仿真的路径）。第一版注解写成 ``Sequence``，
+#: 于是所有传 ndarray 的地方都被 mypy 报 **错误**：那不是"类型不匹配"，
+#: 而是**注解写窄了**（ndarray 在运行时完全可用）。``ArrayLike`` 是 numpy 自己的
+#: 惯例，它同时覆盖两者 —— 把注释从"谎"改成"真"。
+from numpy.typing import ArrayLike
 
 from .result import Diagnostic, Estimate
 from .welch import t_inference, welch_inference
@@ -82,7 +88,7 @@ class ClusterDiagnostics:
         )
 
 
-def _encode_clusters(cluster_ids: Sequence) -> np.ndarray:
+def _encode_clusters(cluster_ids: ArrayLike) -> np.ndarray:
     cid = np.asarray(cluster_ids)
     if cid.ndim != 1:
         raise ValueError("cluster_ids 必须是一维")
@@ -90,7 +96,7 @@ def _encode_clusters(cluster_ids: Sequence) -> np.ndarray:
     return codes.astype(np.int64)
 
 
-def estimate_icc(cluster_ids: Sequence, outcome) -> tuple[float, float]:
+def estimate_icc(cluster_ids: ArrayLike, outcome: ArrayLike) -> tuple[float, float]:
     """单因素随机效应的 ANOVA 估计量，返回 ``(ICC, 平均簇大小 m0)``。
 
     ``ICC = (MSB - MSW) / (MSB + (m0 - 1)·MSW)``，其中 m0 是不平衡簇的调整均值
@@ -163,9 +169,9 @@ def _check_cluster_assignment(codes: np.ndarray, treated: np.ndarray) -> None:
 
 
 def cluster_robust_ttest(
-    cluster_ids: Sequence,
-    treated: Sequence[bool],
-    outcome,
+    cluster_ids: ArrayLike,
+    treated: ArrayLike,
+    outcome: ArrayLike,
     *,
     metric: str = "metric",
     variant: str = "treatment",
@@ -260,9 +266,9 @@ def cluster_robust_ttest(
 
 
 def cluster_level_ttest(
-    cluster_ids: Sequence,
-    treated: Sequence[bool],
-    outcome,
+    cluster_ids: ArrayLike,
+    treated: ArrayLike,
+    outcome: ArrayLike,
     *,
     metric: str = "metric",
     variant: str = "treatment",

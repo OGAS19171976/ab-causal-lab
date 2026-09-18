@@ -290,9 +290,12 @@ def main() -> int:
     tau_points = run_tau_sensitivity(n_trials=n_trials, seed=0)
     emit(f"{'tau/SE':>8} {'mSPRT FWER':>12} {'mSPRT 功效':>11} "
          f"{'Bayes FWER':>12} {'Bayes 功效':>11}")
-    for p in tau_points:
-        emit(f"{p.tau_over_se:>8.2f} {p.msprt_fwer:>12.4f} {p.msprt_power:>11.4f} "
-             f"{p.bayes_fwer:>12.4f} {p.bayes_power:>11.4f}")
+    # 循环变量叫 tp 而不是 p：这个函数上面用 `p` 表示 p 值（float），
+    # 复用同一个名字会让"p 到底是个数还是一个 TauPoint"变得要往回翻。
+    # （这也是类型检查顺手抓到的一处可读性问题。）
+    for tp in tau_points:
+        emit(f"{tp.tau_over_se:>8.2f} {tp.msprt_fwer:>12.4f} {tp.msprt_power:>11.4f} "
+             f"{tp.bayes_fwer:>12.4f} {tp.bayes_power:>11.4f}")
 
     # ---- 8. 用户级端到端 --------------------------------------------------- #
     emit("\n### 8. 用户级端到端：真实分流 + 真实抽样")

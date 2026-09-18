@@ -122,7 +122,7 @@ def murmur3_32_str(key: str, seed: int = 0) -> int:
 # --------------------------------------------------------------------------- #
 # 批量编码 + 向量化实现
 # --------------------------------------------------------------------------- #
-def encode_keys(prefix: str, keys: Sequence[str]) -> "object":
+def encode_keys(prefix: str, keys: Sequence[str]) -> "np.ndarray":
     """把 ``prefix + key`` 拼成 (n, L) 的 uint8 矩阵。
 
     只有当所有 key 的 UTF-8 字节长度**完全一致**时才能向量化（矩阵必须等宽）；
@@ -156,6 +156,13 @@ class KeyBatcher:
     要求所有 unit_id 等宽（UTF-8 字节数一致），否则 ``build`` 抛 ``ValueError``。
     """
 
+    #: 前缀 → 该前缀的 UTF-8 字节。声明在**类级**而不是 ``__init__`` 里：
+    #: 对 ``self.x`` 这类"复杂目标"做注解时，注解会在运行时被求值，
+    #: 而 ``np`` 只在 ``TYPE_CHECKING`` 下导入 —— mypy 会直接报
+    #: `Name "np.ndarray" is not defined`。类级注解带 `from __future__ import
+    #: annotations` 就是字符串，两边都满意。
+    _prefix_cache: dict[str, "np.ndarray"]
+
     def __init__(self, unit_ids: Sequence[str]) -> None:
         np = _require_numpy()
 
@@ -174,7 +181,7 @@ class KeyBatcher:
         self._id_matrix = np.frombuffer(
             b"".join(encoded), dtype=np.uint8
         ).reshape(self._n, self._width)
-        self._prefix_cache: dict[str, np.ndarray] = {}
+        self._prefix_cache = {}
 
     @property
     def n_units(self) -> int:
@@ -193,7 +200,7 @@ class KeyBatcher:
                 self._prefix_cache[prefix] = cached
         return cached
 
-    def build(self, prefix: str) -> "object":
+    def build(self, prefix: str) -> "np.ndarray":
         """返回 (n, len(prefix)+width) 的 uint8 矩阵，可直接喂给 ``murmur3_32_matrix``。"""
         np = _require_numpy()
 
@@ -204,7 +211,7 @@ class KeyBatcher:
         return buf
 
 
-def murmur3_32_matrix(block: "object", seed: int = 0) -> "object":
+def murmur3_32_matrix(block: "np.ndarray", seed: int = 0) -> "np.ndarray":
     """对 (n, L) 的 uint8 矩阵按行做 MurmurHash3，返回 (n,) 的 uint64 结果。
 
     与 ``murmur3_32(bytes(row))`` 逐位一致。主体循环按 4 字节分组，

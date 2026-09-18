@@ -128,10 +128,13 @@ class TestCrossValidation:
             assert a.srm_agrees, f"{a.experiment}: SQL={a.sql_chi2} Python={a.python_chi2}"
 
     def test_ads_summary_matches_dwd_detail(self, warehouse):
-        """ADS 汇总路径与 DWD 明细路径必须给出完全相同的效应与标准误。
+        """ADS 汇总路径与 DWD 明细路径必须给出**在容差内一致**的效应与标准误。
 
         post-only 与 CUPED 两条路都要对得上。CUPED 尤其关键 ——
         它的 theta 来自 ADS 的 pre_post_cross_sum，SQL 里写错只有这条能发现。
+
+        措辞是"在容差内"而不是"完全相同"：两侧的求和顺序不同，末位可以差 1 ulp
+        （实测出现过 ``-3.9243251037`` vs ``…038``）。见 ``CrossValidation`` 的 docstring。
         """
         con, _ = warehouse
         analyses = analyse_ads(con)

@@ -24,11 +24,13 @@
 #   httpx==0.28.1
 #   packaging==26.3
 #   ruff==0.16.8
+#   mypy==2.3.1
 
 # ---- 传递依赖 ----
 annotated-doc==0.0.5
 annotated-types==0.8.0
 anyio==4.15.1
+ast_serialize==0.11.2
 certifi==2026.7.22
 click==8.5.0
 cloudpickle==3.1.2
@@ -45,11 +47,15 @@ idna==3.19
 iniconfig==2.3.0
 joblib==1.6.0
 kiwisolver==1.5.1
+librt==0.15.0
 matplotlib==3.11.1
+mypy==2.3.1
+mypy_extensions==1.1.0
 narwhals==2.26.0
 numpy==2.5.3
 packaging==26.3
 pandas==3.0.3
+pathspec==1.1.1
 pillow==12.2.0
 pluggy==1.6.0
 pyarrow==25.0.1

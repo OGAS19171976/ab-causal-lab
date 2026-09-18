@@ -254,12 +254,12 @@ class Randomizer:
 
     def __init__(self, n_buckets: int = N_BUCKETS) -> None:
         self.n_buckets = n_buckets
-        self._lookup_cache: dict[tuple, tuple[list[str | None], np.ndarray, np.ndarray]] = {}
+        self._lookup_cache: dict[tuple, tuple[list[str], np.ndarray, np.ndarray]] = {}
 
     # -- 内部：把权重表编译成"桶 -> 分支"的查表结构 ------------------------ #
     def _compile(
         self, spec: ExperimentSpec
-    ) -> tuple[list[str | None], np.ndarray, np.ndarray]:
+    ) -> tuple[list[str], np.ndarray, np.ndarray]:
         """返回 (桶->分支名 list, 桶->分支下标 ndarray, 分支名 ndarray)。"""
         key = (
             spec.salt_,
@@ -284,8 +284,20 @@ class Randomizer:
             idx[cursor:end] = i
             cursor = end
 
-        self._lookup_cache[key] = (table, idx, names)
-        return table, idx, names
+        # 把"每个桶都有归属"从**分散的隐含假设**变成**一处断言**：
+        # 上面的循环靠"末位分支吸收误差"来保证覆盖，一旦权重表带了洞
+        # （比如权重全为 0），旧代码会在这里给出一张含 None 的表，
+        # 然后 None 一路传到 `counts[None]`、`assign()` 的返回值里 —— 报错点离原因很远。
+        table_names = [name for name in table if name is not None]
+        if len(table_names) != self.n_buckets:
+            holes = self.n_buckets - len(table_names)
+            raise ValueError(
+                f"权重表没有覆盖全部 {self.n_buckets} 个桶（缺 {holes} 个）："
+                f"{[(v.name, v.weight) for v in spec.variants]}"
+            )
+
+        self._lookup_cache[key] = (table_names, idx, names)
+        return table_names, idx, names
 
     # -- 公开 API ---------------------------------------------------------- #
     def is_enrolled(self, unit_id: str, spec: ExperimentSpec) -> bool:

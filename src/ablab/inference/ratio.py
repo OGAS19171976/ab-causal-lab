@@ -37,7 +37,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .aggregates import AggregateStats
-from .result import Diagnostic, Estimate
+from .result import Diagnostic, Estimate, Status
 from .welch import welch_inference_from_components
 
 __all__ = ["ratio_delta_method", "naive_unit_ratio_ttest", "NaiveRatioResult"]
@@ -52,7 +52,7 @@ def _ratio_diagnostic(treatment: AggregateStats, control: AggregateStats) -> Dia
             status="info",
             message="分子或分母无波动，无法评估 delta method 的适用性",
         )
-    status = "pass"
+    status: Status = "pass"
     note = ""
     if abs(corr) < 0.05:
         # 分子分母几乎不相关时 delta method 仍然正确，但说明分母的调整作用有限

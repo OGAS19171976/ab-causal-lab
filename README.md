@@ -695,6 +695,47 @@ M1 的 cluster_level_ttest 直接拒绝：
 
 ---
 
+### 14 · 可复现性：重跑两遍，报告到底会不会变
+
+这个项目全部的"数字可信"都押在一件事上：**别人跑一遍，能得到同样的东西**。
+所以它被当成一条可执行的检查，而不是一句声称 —— 工具是
+`scripts/check_report_determinism.py`：跑两遍全部验证脚本，逐字节比对 `reports/`
+下的 38 个产物（含 PNG，matplotlib 的 PNG 输出本身可复现）。
+
+**实测结果：38 个里 37 个逐字节相同。** 唯一不同的是 `m5_validation.md`，
+而它只差**那两条"最大偏差"**（两轮配对里出现过差 1 处与差 2 处）：
+`1.137e-13 ↔ 2.274e-13`、`4.547e-13 ↔ 3.411e-13`。
+正文、结构、样本量、以及其余每一个数字都一字未变。
+
+那个量本身就是**舍入噪声** —— 它是"两条路径算出的同一个量"相减，两个操作数几乎相等，
+差值的有效位几乎全是舍入误差。实测取过 `1.110e-14`、`1.137e-13`、`2.274e-13`、
+`3.411e-13`、`4.547e-13` 这些值，跨度一个数量级；而判据是 `< 1e-9`，
+比它大 3~4 个数量级，所以**"三条路径一致"这个结论从来没变过**。
+
+追因也照实记：先排除了 `PYTHONHASHSEED`（7 个不同种子下，四条量的值逐位相同），
+再怀疑 DuckDB 的并行聚合；做了单变量对照（只改 `PRAGMA threads`，1 与 4 各重建 8 次），
+**两臂都是 8/8 稳定**，那个差异一次都没复现 —— 对照没有功效，于是**没有**据此改生产配置。
+残留来源未定位，这条边界写在第六节。
+
+这个过程顺带修掉两个真问题（都不是"浮点噪声"，而是实打实的缺陷）：
+
+1. **m6 报告里漏了一处耗时**。写出时的过滤器按**措辞**匹配（"耗时 Ns"），而那一行写的是
+   `真实效应 0.25 下（400 个 salt，{t:.0f}s）` —— 没带"耗时"两个字，整行绕过过滤器。
+   它甚至已经进了版本库（`（400 个 salt，64s）`），只因为它是"每次都不一样"，
+   在 38 个文件里被当成噪声忽略过一轮。
+2. **数仓报告印 10 位小数，却按 `1e-9` 说"一致"**。ADS 侧的 CUPED 效应出现过
+   `-3.9243251037` 与 `-3.9243251038`，而 DWD 侧两次都是 `…037` —— 读者看到末位不同、
+   却被告知"一致"，只会怀疑这句话。改成印 6 位（与 m5 的三路径表一致），
+   并把判据本身写进报告：`判据：|Δ效应|、|Δ标准误| < 1e-09`。
+
+结论是一条**判据设计**上的结论：**逐字节是过强的判据**。它把一个比任何印刷位数都小的
+环境噪声报成失败，而"经常假红的检查"等于没有检查。所以判据分两级 ——
+先问"正文（非数值部分）是不是一个字没变"，再把数值差异**量化**出来
+（打印实测最大相对偏差与容差）。这不是放宽：样本量 `30741 → 30742`、
+耗时 `69s → 71s` 都远超容差，照样判失败。
+
+---
+
 ### 五个阶段，同一条线
 
 M1、M3、M4、M5、M6 各留下一个结论，它们其实是同一件事的五个侧面：
@@ -719,10 +760,12 @@ python -m venv .venv
 .venv/Scripts/activate          # Windows；Linux/macOS 用 source .venv/bin/activate
 pip install -r requirements.txt # 钉死到实测版本；要更严用 requirements.lock
 
-pytest tests                    # 514 个测试，约 6 分钟（别加 -q，会吞掉汇总行）
-python scripts/run_all_checks.py            # **全部检查**：测试 + lint + M0–M6 + 数仓，约 19 分钟
+pytest tests                    # 544 个测试，约 6 分钟（别加 -q，会吞掉汇总行）
+python scripts/run_all_checks.py            # **全部检查**：测试 + lint + 类型 + M0–M6 + 数仓，约 20 分钟
 python scripts/run_all_checks.py --quick    # 快速版
 python scripts/run_all_checks.py --list     # 只列计划
+python scripts/run_all_checks.py --only types   # 单独跑类型检查
+python scripts/check_report_determinism.py  # 报告重跑一致性（两级判据，约 29 分钟）
 
 # 或者用任务脚本（同一份定义，顺带把 UTF-8 环境设好）：
 #   powershell -File tasks.ps1 test | verify | quick | deps | serve
@@ -938,15 +981,16 @@ scripts/                   十三个脚本（含 pick_demo_salts.py / lock_requi
                            run_all_checks.py / check_report_determinism.py ——
                            后三者分别管依赖、全部检查的单一定义、报告重跑一致性）
 tasks.ps1                  常用命令入口（与 CI 共用 run_all_checks.py）
-.github/workflows/ci.yml   测试 + 验证双 job，并把 reports/ 作为产物发布
+.python-version            Python 版本**唯一来源**（CI / uv / pyenv 都读它）
+.github/workflows/ci.yml   静态检查 + 测试 + 验证，并把 reports/ 作为产物发布
 requirements.txt           直接依赖（钉死到实测版本）
-requirements.lock          直接依赖 + 传递闭包，共 42 个包
+requirements.lock          直接依赖 + 传递闭包，共 48 个包
 .gitattributes             统一换行符（这个仓库的行尾曾经是混的）
-tests/                     514 个测试（hashing 25 / assignment 25 / inference 20 /
+tests/                     544 个测试（hashing 25 / assignment 25 / inference 20 /
                            inference_m1 43 / methods 30 / sequential 70 /
                            causal 41 / hte 47 / validation 38 / warehouse 23 /
                            platform 53 / platform_warehouse 31 / platform_m6 28 /
-                           dependencies 7 / ci_contract 16 / reporting 17）
+                           dependencies 8 / ci_contract 25 / reporting 37）
 ```
 
 ### 依赖
@@ -954,7 +998,7 @@ tests/                     514 个测试（hashing 25 / assignment 25 / inferenc
 `numpy` / `scipy` / `pandas` / `duckdb` / `pyarrow` / `matplotlib`，
 外加 M4 的 `scikit-learn`（DML 的 nuisance 学习器需要任意复杂的 ML 模型，
 这正是 DML 的意义所在），以及 M5/M6 的 `fastapi` + `uvicorn` + `pydantic`（接口层）
-和 `httpx`（`TestClient` 的传输层依赖）。
+和 `httpx`（`TestClient` 的传输层依赖）；工具是 `pytest` / `ruff` / `mypy` / `packaging`。
 
 **三个依赖文件的分工，别混：**
 
@@ -962,7 +1006,10 @@ tests/                     514 个测试（hashing 25 / assignment 25 / inferenc
 |---|---|---|
 | `pyproject.toml` | 这个包**支持**哪些版本？ | 下界（`>=`），分 `ml` / `web` / `dev` 三组额外项 |
 | `requirements.txt` | 照 README 装一遍该装什么？ | 直接依赖，**钉死到实测通过的版本** |
-| `requirements.lock` | 怎么**逐位复现**这份报告？ | 直接依赖 + 传递闭包（42 个包）全部钉死 |
+| `requirements.lock` | 怎么**逐位复现**这份报告？ | 直接依赖 + 传递闭包（48 个包）全部钉死 |
+
+> **这三份清单是会被测试对齐的**：`tests/test_dependencies.py` 两个方向都查，
+> 所以不会出现"加了依赖但锁文件里没有"（实测漏过一次 mypy，见第 36 条）。
 
 ```bash
 pip install -r requirements.txt        # 推荐：拿到的就是实测过的那套版本
@@ -970,6 +1017,7 @@ pip install -r requirements.lock       # 更严：连传递依赖也钉死
 pip install -e ".[dev]"                # 开发：可编辑安装 + 全部可选依赖
 python scripts/lock_requirements.py --check   # 校验当前环境是否等于锁文件
 python -m ruff check src scripts tests        # 静态检查（配置见 pyproject）
+python -m mypy                                # 类型检查（范围与档位见 pyproject）
 ```
 
 > **lint 的配置刻意保守。** 未配置时 ruff 0.16 的默认规则集比 `E4/E7/E9/F` 宽得多
@@ -1191,7 +1239,123 @@ python -m ruff check src scripts tests        # 静态检查（配置见 pyproje
     靠人眼发现（这次是靠 ruff 才发现 `__all__` 里有个不存在的导出名）。
     所以取一个中间态：显式 select 真问题类别，并让 `run_all_checks.py` 把它当一步跑 ——
     这样"lint 绿"是被强制执行的，不是"我本地跑过一次"。
-    顺序也有讲究：秒级的检查（lock / lint）排在最前面，早失败早反馈。
+    顺序也有讲究：秒级的检查（lock / lint / 类型检查）排在最前面，早失败早反馈。
+    （类型检查是后来按同一个套路接进去的，见第 35 条。）
+
+31. **"重跑一遍报告该不该逐字节相同"这个问题，要分两级回答**
+    第一版把逐字节当成唯一判据，实测两轮全量跑各失败一次，而失败原因**不是同一类**：
+    ① 一处耗时漏进了 m6 报告（真空洞，已修）；② 浮点末位在两次独立建仓之间差了
+    1 ulp（`-3.9243251037` → `…038`），以及三条路径的"最大偏差"从 `2.274e-13`
+    变成 `1.137e-13`。第 ② 类**不是错误**：它比报告里印出来的任何一位都小
+    （印到小数点后 6 位），读者根本看不见，可逐字节判据会把它报成失败 ——
+    而**一条会经常假红的检查等于没有检查**，久了就被当成"反正它老是红的"。
+
+    所以判据分两级：先问"正文（非数值部分）是不是一个字没变"，再把数值差异
+    **量化**出来（打印实测最大相对偏差、以及容差）。容差不是拍出来的，是照抄审计
+    自己用的尺度（`1e-9`）；`atol=1e-12` 那一项专给"本身就是舍入噪声的量"
+    （两个几乎相等的数相减，相对差能到 50%，绝对差只有 1e-13）。
+    放宽必须是**有量化**的放宽，否则就是把"我不知道"写成"没问题"。
+    真变化照样抓得住：样本量 30741→30742、耗时 69s→71s 都远超容差。
+
+    追因的部分也照实写：先排除了 `PYTHONHASHSEED`（7 个种子下四条路径的值逐位
+    相同），再怀疑 DuckDB 并行聚合；做了**单变量对照**（只改 `PRAGMA threads`，
+    1 与 4 各重跑 8 次）—— **两臂都 8/8 稳定、ADS 与 DWD 逐位相同**，
+    那个差异一次都没复现。对照没有功效，于是**没有**据此改生产配置
+    （单线程在大数据量下是真的会慢）。残留来源未定位，这件事记在"已知边界"里，
+    而不是含糊地声称"已修复"。
+
+32. **检查器自己也会崩，而且看起来像"被检查的东西坏了"**
+    `python scripts/run_all_checks.py --only m2 | Select-Object -Last 20` 直接
+    `UnicodeEncodeError: 'gbk' codec can't encode character '\u25b6'` ——
+    一步都没跑，崩在打印进度标记 `▶` 上。Windows 上 stdout 只要不是控制台
+    （管道、重定向到文件，也就是 CI 与最常见的两种用法），Python 就回落到 locale
+    编码，而 `▶` 在 GBK 里没有码位。
+
+    它藏了很久，因为 `tasks.ps1` 与 CI 都替它设了 `PYTHONIOENCODING=utf-8` ——
+    也就是说**这个脚本只在有人绕过那两个入口时坏掉**，而
+    `scripts/check_report_determinism.py` 恰好就是那样调它的。更糟的是现象：
+    报错发生在子进程里，汇总只会说"预热运行失败，先修好再谈可复现性"，
+    读到的人会去查被检查的对象。
+
+    修法分两层，因为**控制台和管道不能用同一套**：管道换 UTF-8（父进程按 UTF-8 读它），
+    控制台只加 `errors="replace"`（在 GBK 控制台上强行改成 UTF-8 会让中文全变乱码，
+    那是拿一个 bug 换另一个）。另外子进程也要显式给 `PYTHONIOENCODING` ——
+    否则 `build/checks/*.log` 里的中文会静默变成乱码（`errors="replace"` 不报错），
+    又是一个"没有信号的降级"。
+
+33. **对标准库行为的记忆，也要用断言过一遍**
+    数值比对要把正文切成"文本 / 数字"交替的 token，我按记忆写成
+    `re.split(非捕获组, text)` 并假设数字会留在结果里。实测：**不会**——
+    `re.split` 只在模式里出现**显式捕获组**时才保留分隔符，于是
+    `"…effect=-3.9243251037\n"` 被切成 `['…effect=', '\n']`，数字凭空消失、
+    交替结构塌掉，后面拿着 `'\n'` 去 `float()` 直接抛 `ValueError`。
+    是刚写的测试当场炸出来的，不是上线后算错。差别就在这儿：
+    **一个错的解析在测试里炸，和一个错的解析静默给出一个"看起来正常"的数，
+    成本差好几个数量级。**
+
+34. **"声明了"不等于"做到了"：行尾这件事被自己的 README 骗过一次**
+    `.gitattributes` 里写着 `* text=auto eol=lf`，README 里也写了"统一换行符"，
+    `git ls-files --eol` 显示 `i/lf` —— 三条都是真的，但**工作区里还有 8 个文本文件是
+    CRLF**（`platform/datasource.py`、`platform/analysis.py`、`requirements.lock`
+    这些都在里面）。原因是 `core.autocrlf=false`：索引里存 LF，工作区不会被转回来，
+    而 Windows 上 `Path.write_text()`（文本模式 newline=None）与 PowerShell 的
+    `WriteAllLines` 都写 CRLF。
+
+    三处"看起来验证过"的地方全都漏了它，因为**它们查的是 git，不是字节**。
+    修法分两步，一步都不少：
+    ① 补齐写出侧 —— `lock_requirements.py` 是唯一漏了 `newline="\n"` 的写出口
+    （报告那几个早就带了，所以报告一直是 LF）；
+    ② 加一条**按字节读工作区**的测试（`TestLineEndings`），它一次就列出了那 8 个文件。
+    这也是"把声明变成可执行检查"的又一个实例：
+    **没有被执行的声明，迟早会变成不准确的声明。**
+
+35. **类型检查的"档位"本身就是一句主张，选错档位等于假绿灯**
+    接入 mypy 时选的**不是 `--strict`**，理由要写在配置里，否则
+    "mypy 通过"这句话没有信息量：`--strict` 要求每个函数都有完整注解，
+    而这套代码大量操作 numpy / pandas，注解会退化成
+    `np.ndarray[Any, np.dtype[np.float64]]` 这种噪音 —— 那不是"发现了问题"，
+    而是"还没给数值代码写注解"。一次产出几百条这类报错，结果只会是
+    加个 `# type: ignore` 全关掉，比不接还糟。
+
+    所以取中间档：**签名可以不写注解，但函数体要查**（`check_untyped_defs`）。
+    初次接入报出 108 条，其中相当一部分是真缺陷，例如：
+
+    * `hashing.py` 里 `build()` / `murmur3_32_matrix()` 的返回类型被写成了
+      `"object"`（当初为了不让 numpy 在运行时被导入而撒的谎），
+      于是所有调用方都拿着 `object` 去索引 —— 改成 `TYPE_CHECKING` 下的
+      `"np.ndarray"` 之后，一串下游报错同时消失。**注解是谎，下游就全是噪音。**
+    * `audit.py` 里 24 处直接访问 `rep.naive.absolute_effect`，而字段类型是
+      `Estimate | None`；`datasource.py` 里 8 处直接索引 `cluster_treatment`，
+      而它是 `tuple | None`。这些**不是**类型检查器的洁癖：真走到 None 时
+      抛的是离原因很远的 `AttributeError`，所以改成"必须存在"的取值入口
+      （`_require_estimate` / `clusters` 属性），缺了就报一句能读懂的话。
+    * `scripts/run_m2_validation.py` 用同一个 `p` 先当 p 值（float）
+      又当 `TauPoint` 循环变量 —— 纯可读性问题，但也确实该改。
+    * `boundaries.py` 的 `crossed(z_statistics: Sequence[float])` 被传 ndarray
+      报了 6 处错。**那不是"类型不匹配"，是注解写窄了**（ndarray 运行时完全可用），
+      于是把形参改成 numpy 自己的惯例 `ArrayLike`。改注解，不是改调用处。
+
+    另外有一条**配置级的坑**，值得单独记：第一版在 mypy 配置里写了
+    `python_version = "3.10"`（照的是 `requires-python` 下界），结果 mypy 用 3.10 的
+    语法去读 numpy 的 stub，直接报 `Type statement is only supported in Python 3.12
+    and greater [syntax]`，**并且中断后续所有检查** —— "通过"其实是"什么都没查"。
+    现在不写它（mypy 用正在运行的解释器，而那个版本由 `.python-version` 决定），
+    并且有一条测试盯着"不许再写进去"。
+    同理，`scipy` / `pandas` / `sklearn` 不带类型信息，处理方式是
+    **按模块显式 `ignore_missing_imports`**（写在 `[[tool.mypy.overrides]]` 里，
+    谁都能一眼看到退让了什么），而不是全局关掉检查。
+
+36. **依赖清单有三份，而最容易忘的是第三份**
+    "直接依赖"在这个仓库里有**三**个地方：`requirements.txt`（照它装）、
+    `pyproject.toml`（声明支持范围）与 `scripts/lock_requirements.py` 里的 `DIRECT`
+    （生成锁文件的起点）。实测被第三份坑了：给前两份加了 `mypy`，重新生成
+    `requirements.lock` —— 锁里**没有 mypy**，因为生成器根本不知道它。
+
+    而 `lock_requirements.py --check` 抓不到这件事：它比对的是"锁文件 vs 当前环境"，
+    对"两边都没有 mypy"是瞎的。抓住它的是那条早就存在的
+    `test_lock_covers_everything_required`（锁必须覆盖 requirements.txt 的每一项）；
+    这次又补了**反方向**的一条（`DIRECT` 的每一项都要在 requirements.txt 里）。
+    两个方向都在，三份清单就只能**同时**正确，不能各自漂移。
 
 ---
 
@@ -1281,21 +1445,49 @@ M6 生产口径自身的边界：
 
 工程外壳自身的边界（这一节存在是因为"能跑"与"别人能跑"是两件事）：
 
-* **CI 还没有在 GitHub 上真跑过一次。** 我校验了 YAML 能解析、每个 job 引用的命令
-  在本机都能通过（`run_all_checks.py` 10 项全绿，1070 秒），
-  但"工作流在 GitHub 的 runner 上跑起来"这件事本身没验证过。
-  最可能出问题的两点：`actions/setup-python` 是否已提供 3.14（不提供就改成 `3.13`），
-  以及 Ubuntu 上没有 CJK 字体（那会让图走英文回退分支，是设计好的行为而不是故障）。
+* **CI 还没有在 GitHub 上真跑过一次。** 能本地验证的部分我都验了：
+  YAML 能解析、工作流引用的每个文件都存在、它引用的每条命令在本机都通过
+  （ruff / 锁文件校验 / 类型检查 / 全部验证脚本 **12 项，实测 1158 秒**，
+  其中测试 **544 个 / 317 秒**），
+  且 `.python-version` 与本机一致、是**唯一**的版本来源（YAML 里不再硬编码）。
+  但有两件事只能真跑才知道：① `actions/setup-python` 是否已提供 `3.14`；
+  ② Ubuntu runner 上 `pip install -r requirements.txt` 能否装齐（wheel 可用性）。
   **在 CI 真的绿一次之前，不要把那个徽章当成证据。**
+* **类型检查不是 `--strict`，而且 `tests/` 不在检查范围内。** 检查范围是
+  `src/ablab` + `scripts`（共 63 个文件，0 错误），档位说明见第 35 条。
+  明确**没有**做的：不给每个函数强制注解（数值代码里那会退化成
+  `np.ndarray[Any, ...]` 噪音）、不检查测试代码（测试里大量刻意的类型宽松写法，
+  收益低）。所以"mypy 通过"应读作"**我们写的接口没有互相骗人**"，
+  而不是"这个仓库是类型安全的"。
+* **`scipy` / `pandas` / `sklearn` 的调用没有类型保证。** 它们不带 `py.typed`，
+  配置里按模块 `ignore_missing_imports` 显式放过 —— 也就是说传给 scipy 的参数
+  写错了，mypy 抓不到（抓得到的是我们自己函数之间的签名不匹配）。
+  装 `scipy-stubs` 能补上，但那等于把一个我们没验证过的类型定义当成事实。
 * **git 身份是仓库级占位值**（`ab-causal-lab <dev@example.com>`），
   因为这台机器的全局 `user.name` / `user.email` 是空的。
   改成你自己的：`git config user.name "..."` 与 `git config user.email "..."`。
   首次提交是一个**基线提交**（128 个文件），不是七个按里程碑分的提交 ——
   那样编造历史不如老实说"M0–M6 是一路做下来的，版本控制与 CI 是最后才补齐的"。
-* **报告的重跑一致性只在单个脚本上验过。** `reports/` 现在不含耗时与绝对路径，
-  实测 `run_m2_validation.py` 连跑两次报告 SHA256 相同；
-  但**七个脚本各跑两遍的完整对照没有做**（那要 ~25 分钟），
-  所以"整份 reports/ 重跑后逐字节不变"这句话目前是**推断**，不是实测。
+* **报告的重跑一致性：38 个产物里 37 个逐字节相同，1 个只差那两个舍入噪声量**（详见 14 节）。
+  `reports/` 不含耗时与绝对路径，两次独立的全量运行逐字节比对，
+  只有 `m5_validation.md` 里"三路径最大偏差"那一两个数会变
+  （`1.137e-13 ↔ 2.274e-13`、`4.547e-13 ↔ 3.411e-13`，量级 1e-13，
+  比判据 `1e-9` 小 3~4 个数量级，**任何结论都不受影响**）。
+  * **残留来源未定位。** 已排除 `PYTHONHASHSEED`（7 个种子下逐位相同）；
+    对 DuckDB 并行聚合做了单变量对照（`threads` 1 与 4 各重建 8 次），
+    两臂都稳定、差异一次都没复现 —— 对照没有功效，所以**没有**据此改配置。
+    同一类现象在数仓 ADS/DWD 两侧也出现过（`-3.9243251037` vs `…038`，1 ulp）。
+  * 因此判据是**两级**的：正文逐字 + 数值在容差内，并打印实测最大偏差。
+    `--strict` 可以要求逐字节 —— 但要知道它**经常**会红，
+    而"经常假红的检查"等于没有检查。
+  * 想要更强的主张（真·逐字节），得让数值本身可复现：固定求和顺序，
+    或者对聚合用补偿求和（Kahan/定点）。那是另一个量级的改动，这里没做。
+* **单跑某个 `run_*.py` 时，输出的编码由调用者决定。** `run_all_checks.py` 是顶层入口
+  （没人给它设环境），所以它自己把管道下的编码固定成 UTF-8；而各 `run_*.py` 由它调用、
+  继承那份环境，`tasks.ps1` 与 CI 也各自设了 `PYTHONIOENCODING=utf-8`。
+  代价是：**测试或工具直接抓这些脚本的 stdout 时，必须自己指定 UTF-8** ——
+  否则中文在 Windows 上会变成 GBK，按 UTF-8 解就是 `UnicodeDecodeError`
+  （`test_dependencies.py` 里踩过一次，注释写在那个测试上）。
 * **`tasks.ps1` 是 Windows 专用**（`chcp`、`.venv\Scripts\`）。Linux/macOS 上直接用
   `python scripts/run_all_checks.py` —— 那一份是跨平台的，而且它才是定义的所在。
 
@@ -1312,14 +1504,26 @@ M6 生产口径自身的边界：
 | M5.1 | 平台接真实数仓：充分统计量抽象 + 三路径等价性 | 已完成 |
 | M6 | 生产口径：监控/判定同口径、分析单元、MDE/功效 | 已完成 |
 
-七个阶段到这里走完。再往下最值得做的两件事：
+七个阶段到这里走完。按"先还欠账、再开新篇"的顺序，接下来是：
 
-1. **补 M3 的第二种交错处置估计量**（Sun-Abraham 或 BJS），做交叉验证而不是单点结论；
-2. **CATE 的置信区间**（GRF 的渐近正态性），让 M4 从"排序可用"走到"水平也可用"。
+**先补治理缺口（都是已知边界里写过的，不是新想法）**
 
-工程上还有一条明确的欠账：**簇级/比值指标的"数仓侧"**。合成路径已经跑通，
-差的是一次 `GROUP BY`（簇粒度 DWS）和 ADS 里的一列分母；
-但**做完必须重跑 13.2 那一轮审计** —— 换了数据源，校准主张就不再自动成立。
+1. **操作审计（append-only）**。现在"谁把实验设成 stopped、谁把判定口径从 CUPED 改成 post-only、
+   谁删了实验"都没有留痕。而 M6 特意允许改 `estimator`（口径是策略不是数据），
+   于是"改口径"这件事**必须留下痕迹**才站得住 —— 否则它就是一个事后挑口径的通道。
+2. **护栏指标可见化**。`guardrails` 字段存了、界面上显示了，而引擎从头到尾没读过它 ——
+   用户会以为护栏被看着。当前数据模型只有一个指标，所以真正的解法不是"假装分析"，
+   而是**在报告里明说"已声明 N 个护栏，本平台尚不分析它们"**，
+   把静默变成显式。（Kohavi 那本书里护栏触发是**停实验**的理由，不是参考信息。）
+
+**再开新篇（方法层）**
+
+3. **M3 的第二种交错处置估计量**（Sun-Abraham 或 BJS），做交叉验证而不是单点结论；
+4. **CATE 的置信区间**（GRF 的渐近正态性），让 M4 从"排序可用"走到"水平也可用"。
+
+工程上还剩一条欠账：**比值指标的"数仓侧"**。簇粒度已经做完（见 13.4），
+比值还差 ADS 里的一列分母 —— 语义与现有的 `x`（前置指标）不同，不能混用，
+要新增一张比值 ADS。**做完必须重跑 13.2 那一轮审计**：换了数据源，校准主张就不再自动成立。
 
 ## 八、参考
 

@@ -29,7 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 
-from ablab.plotting import label, plt, save, setup_style  # noqa: E402
+from ablab.plotting import bin_edges, label, plt, save, setup_style  # noqa: E402
 from ablab.reporting import for_report  # noqa: E402
 from ablab.sim import PopulationConfig, generate_population, two_arm_spec  # noqa: E402
 from ablab.validation import (  # noqa: E402
@@ -100,7 +100,7 @@ def fig_effect_distribution(rand, cond, pop_cfg, out: Path) -> None:
     eps_sd = pop_cfg.post_sd * np.sqrt(1 - pop_cfg.corr_pre_post**2)
     theory_noise = np.sqrt(2 * eps_sd**2 / cond.mean_n_per_arm)
 
-    bins = np.linspace(-1.3, 1.3, 60)
+    bins = bin_edges(np.linspace(-1.3, 1.3, 60))
     ax.hist(rand.effects, bins=bins, density=True, color=BLUE, alpha=0.65,
             label=label(f"随机化模式  sd={rand.sd_effect:.3f}",
                         f"Randomized  sd={rand.sd_effect:.3f}"))

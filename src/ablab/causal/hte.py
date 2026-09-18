@@ -455,6 +455,9 @@ def x_learner(
     tau1 = clone(learner).fit(X[t_mask], d1)
     tau0 = clone(learner).fit(X[~t_mask], d0)
 
+    # ``g`` 既可能是标量（默认的边际处置概率）也可能是数组（逐样本倾向得分），
+    # 下面的 ``cate`` 就是这么用的。注解写出来，读的人不用去猜。
+    g: float | np.ndarray
     if propensity is None:
         g = float(n1) / (n1 + n0)
     else:

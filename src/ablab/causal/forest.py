@@ -46,6 +46,23 @@ class _Node:
     def is_leaf(self) -> bool:
         return self.feature < 0
 
+    #: 「非叶节点一定有左右子节点」这条不变式，收在这里说一次。
+    #:
+    #: 字段本身是 ``_Node | None``（叶节点没有子节点），而下面所有递归函数都在
+    #: ``not is_leaf`` 之后直接用 ``node.left`` —— 类型检查器当然看不到这条推理，
+    #: 于是 12 处报错。与其在 12 个地方写 ``assert node.left is not None``
+    #: （``-O`` 下会被删掉，报错也没有上下文），不如把不变式讲一次：
+    #: 真缺了子节点说明**树的构造坏了**，那时需要的是一句能读懂的话。
+    @property
+    def children(self) -> tuple["_Node", "_Node"]:
+        """``(左, 右)``；非叶节点一定有。"""
+        if self.left is None or self.right is None:
+            raise ValueError(
+                f"内部节点缺少子节点（feature={self.feature}, threshold={self.threshold}）——"
+                "树构造有问题，不该走到这里"
+            )
+        return self.left, self.right
+
 
 @dataclass(frozen=True)
 class ForestConfig:
@@ -209,10 +226,11 @@ def _assign_leaves(node: _Node, X: np.ndarray, idx: np.ndarray, out: np.ndarray)
         out[idx] = id(node)
         return
     mask = X[idx, node.feature] <= node.threshold
+    left, right = node.children
     if mask.any():
-        _assign_leaves(node.left, X, idx[mask], out)
+        _assign_leaves(left, X, idx[mask], out)
     if (~mask).any():
-        _assign_leaves(node.right, X, idx[~mask], out)
+        _assign_leaves(right, X, idx[~mask], out)
 
 
 def _fill_leaf_effects(
@@ -225,10 +243,11 @@ def _fill_leaf_effects(
         node.n_est = n1 + n0
         return
     mask = X[idx, node.feature] <= node.threshold
+    left, right = node.children
     if mask.any():
-        _fill_leaf_effects(node.left, X, D, Y, idx[mask])
+        _fill_leaf_effects(left, X, D, Y, idx[mask])
     if (~mask).any():
-        _fill_leaf_effects(node.right, X, D, Y, idx[~mask])
+        _fill_leaf_effects(right, X, D, Y, idx[~mask])
 
 
 def _predict_tree(node: _Node, X: np.ndarray, out: np.ndarray, idx: np.ndarray) -> None:
@@ -236,10 +255,11 @@ def _predict_tree(node: _Node, X: np.ndarray, out: np.ndarray, idx: np.ndarray) 
         out[idx] = node.tau
         return
     mask = X[idx, node.feature] <= node.threshold
+    left, right = node.children
     if mask.any():
-        _predict_tree(node.left, X, out, idx[mask])
+        _predict_tree(left, X, out, idx[mask])
     if (~mask).any():
-        _predict_tree(node.right, X, out, idx[~mask])
+        _predict_tree(right, X, out, idx[~mask])
 
 
 class CausalTree:
@@ -323,11 +343,13 @@ class CausalForest:
                 w = node.n_est / (node.n_est + k) if node.n_est + k > 0 else 0.0
                 node.tau = w * node.tau + (1.0 - w) * global_tau
                 return
-            walk(node.left)
-            walk(node.right)
+            left, right = node.children
+            walk(left)
+            walk(right)
 
         for t in self.trees:
-            walk(t.root)
+            if t.root is not None:
+                walk(t.root)
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         if not self._fitted:
@@ -348,11 +370,13 @@ class CausalForest:
             if node.is_leaf:
                 return
             counts[node.feature] = counts.get(node.feature, 0) + 1
-            walk(node.left)
-            walk(node.right)
+            left, right = node.children
+            walk(left)
+            walk(right)
 
         for t in self.trees:
-            walk(t.root)
+            if t.root is not None:
+                walk(t.root)
 
         p = max(counts) + 1 if counts else 0
         out = np.zeros(p)

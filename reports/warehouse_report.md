@@ -55,12 +55,14 @@ exp_rec_emb  [recall 层]
 
 ### 4. 交叉验证：汇总路径 vs 明细路径
   exp_rank_v2
-    post-only  ADS汇总 effect=27.2482063215 se=2.9752404528 | DWD明细 effect=27.2482063215 se=2.9752404528 | 一致
-    CUPED      ADS汇总 effect=23.3429046332 se=1.7997280026 | DWD明细 effect=23.3429046332 se=1.7997280026 | 一致
+    post-only  ADS汇总 effect=   27.248206 se=  2.975240 | DWD明细 effect=   27.248206 se=  2.975240 | 一致
+    CUPED      ADS汇总 effect=   23.342905 se=  1.799728 | DWD明细 effect=   23.342905 se=  1.799728 | 一致
+    判据：|Δ效应|、|Δ标准误| < 1e-09（上面只印到小数点后 6 位，比判据粗 3 个数量级）
     passed=True；SQL/Python SRM 卡方一致: True
   exp_rec_emb
-    post-only  ADS汇总 effect=-9.9417304734 se=3.4551098275 | DWD明细 effect=-9.9417304734 se=3.4551098275 | 一致
-    CUPED      ADS汇总 effect=-3.9243251037 se=2.0940114043 | DWD明细 effect=-3.9243251037 se=2.0940114043 | 一致
+    post-only  ADS汇总 effect=   -9.941730 se=  3.455110 | DWD明细 effect=   -9.941730 se=  3.455110 | 一致
+    CUPED      ADS汇总 effect=   -3.924325 se=  2.094011 | DWD明细 effect=   -3.924325 se=  2.094011 | 一致
+    判据：|Δ效应|、|Δ标准误| < 1e-09（上面只印到小数点后 6 位，比判据粗 3 个数量级）
     passed=True；SQL/Python SRM 卡方一致: True
 
 ### 5. 负对照诊断 —— 为什么必须做前置协变量校正

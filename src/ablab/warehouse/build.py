@@ -141,6 +141,21 @@ def build_warehouse(
                 print(f"  [源数据] {name:<20} {cnt:>10,} 行")
 
     con = duckdb.connect(str(db_path))
+    # threads=4 沿用原值 —— **曾经想改它，但对照实验不支持**。
+    #
+    # 起因：同一份代码、同一份 Parquet 重跑两次，ADS 侧的 CUPED 效应出现过
+    # -3.9243251037 -> -3.9243251038（1 ulp），而 DWD 明细侧（numpy 按行算的同一个量）
+    # 一位没变。DuckDB 的并行聚合是"各线程先算部分和、再合并"，合并顺序随调度变化，
+    # 浮点加法又不满足结合律 —— 看起来很像是它。
+    #
+    # 于是做了单变量对照：只把这一行改成 threads=1 / 改回 threads=4，各重跑 8 次，
+    # 比较报告里 4 个量的全精度值。**两臂都是 8/8 逐位稳定、ADS 与 DWD 逐位相同** ——
+    # 那个差异在 16 次重跑里一次都没复现，对照**没有功效**，证不出任何因果。
+    # 观测到的频率是"两次全量跑里出现过一次"，8 次一臂本来就抓不到。
+    #
+    # 所以这里保持原值：一个没被证实的原因，不值得为它改生产配置（单线程在大数据量下
+    # 是真的会慢）。可复现性改在**比对那一侧**解决：允许末位在容差内、但把差异量化
+    # 出来（见 ablab/reporting.py 的 Comparison 与 scripts/check_report_determinism.py）。
     con.execute("PRAGMA threads=4")
 
     run_sql_files(
@@ -334,8 +349,15 @@ def analyse_ads(
 class CrossValidation:
     """ADS 汇总路径 vs DWD 明细路径的交叉验证结果。
 
-    两条路径给出的效应与标准误必须**完全一致**。不一致就说明有一层的口径写错了，
-    而线上只会跑其中一条 —— 这正是数仓分层最需要守住的东西。
+    两条路径算的是同一个量，判据是**效应与标准误的绝对差 < 1e-9**。
+    不一致就说明有一层的口径写错了，而线上只会跑其中一条 ——
+    这正是数仓分层最需要守住的东西。
+
+    这里原本写的是"必须**完全一致**"，实测把它改掉了：同一份代码、同一份 Parquet，
+    ADS 侧的 CUPED 效应出现过 ``-3.9243251037`` 与 ``-3.9243251038`` 两种值
+    （DWD 侧两次都是 ``…037``）—— 差 1 ulp，来自两侧求和顺序不同，不是口径差异。
+    所以判据是"在容差内一致"而不是"逐位相同"，报告也**只印到小数点后 6 位**：
+    印 10 位、再按 1e-9 说"一致"，会让读者以为这句话自相矛盾。
     """
 
     experiment: str
@@ -343,6 +365,10 @@ class CrossValidation:
     naive_detail: Estimate
     cuped_summary: Estimate
     cuped_detail: Estimate
+
+    #: 判据的容差。**故意印进报告**（见 ``summary()`` 最后一行）：报告要能被独立读懂，
+    #: 读者不该为了知道"一致"是什么意思而回来翻源码。
+    TOLERANCE = 1e-9
 
     @property
     def naive_matches(self) -> bool:
@@ -355,8 +381,8 @@ class CrossValidation:
     @staticmethod
     def _close(a: Estimate, b: Estimate) -> bool:
         return (
-            abs(a.absolute_effect - b.absolute_effect) < 1e-9
-            and abs(a.std_error - b.std_error) < 1e-9
+            abs(a.absolute_effect - b.absolute_effect) < CrossValidation.TOLERANCE
+            and abs(a.std_error - b.std_error) < CrossValidation.TOLERANCE
             and abs(a.p_value - b.p_value) < 1e-12
         )
 
@@ -367,9 +393,9 @@ class CrossValidation:
     def summary(self) -> str:
         def row(name: str, s: Estimate, d: Estimate) -> str:
             return (
-                f"    {name:<10} ADS汇总 effect={s.absolute_effect:.10f} "
-                f"se={s.std_error:.10f} | DWD明细 effect={d.absolute_effect:.10f} "
-                f"se={d.std_error:.10f} | {'一致' if self._close(s, d) else '不一致 <<<'}"
+                f"    {name:<10} ADS汇总 effect={s.absolute_effect:>12.6f} "
+                f"se={s.std_error:>10.6f} | DWD明细 effect={d.absolute_effect:>12.6f} "
+                f"se={d.std_error:>10.6f} | {'一致' if self._close(s, d) else '不一致 <<<'}"
             )
 
         return "\n".join(
@@ -377,6 +403,8 @@ class CrossValidation:
                 f"  {self.experiment}",
                 row("post-only", self.naive_summary, self.naive_detail),
                 row("CUPED", self.cuped_summary, self.cuped_detail),
+                f"    判据：|Δ效应|、|Δ标准误| < {self.TOLERANCE:g}"
+                f"（上面只印到小数点后 6 位，比判据粗 3 个数量级）",
             ]
         )
 
@@ -388,8 +416,8 @@ def verify_against_detail(
 ) -> CrossValidation:
     """交叉验证：ADS 汇总路径 vs DWD 明细路径。
 
-    post-only 与 CUPED 两条路都要对得上。CUPED 尤其关键 ——
-    它的 theta 来自 ADS 里的 ``pre_post_cross_sum``，
+    post-only 与 CUPED 两条路都要对得上（判据与理由见 ``CrossValidation``）。
+    CUPED 尤其关键 —— 它的 theta 来自 ADS 里的 ``pre_post_cross_sum``，
     如果那一列在 SQL 里写错，只有这条交叉验证能发现。
     """
     detail = con.execute(

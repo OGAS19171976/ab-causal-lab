@@ -29,7 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 
-from ablab.plotting import label, plt, save, setup_style  # noqa: E402
+from ablab.plotting import bin_edges, label, plt, save, setup_style  # noqa: E402
 from ablab.reporting import for_report  # noqa: E402
 from ablab.sim import PopulationConfig, generate_population, two_arm_spec  # noqa: E402
 from ablab.sim.scenarios import ClusterScenarioConfig, RatioScenarioConfig  # noqa: E402
@@ -116,7 +116,7 @@ def fig_cuped_variance(randomized, out: Path) -> None:
     fig, ax = plt.subplots(figsize=(7.6, 4.2))
     lo = min(naive.effects.min(), cuped.effects.min())
     hi = max(naive.effects.max(), cuped.effects.max())
-    bins = np.linspace(lo, hi, 60)
+    bins = bin_edges(np.linspace(lo, hi, 60))
     ax.hist(naive.effects, bins=bins, color=ORANGE, alpha=0.55, density=True,
             label=label(f"post-only  SD={naive.sd_effect:.3f}",
                         f"post-only  SD={naive.sd_effect:.3f}"))

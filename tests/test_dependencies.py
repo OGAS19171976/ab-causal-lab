@@ -14,6 +14,7 @@ M5/M6 的依赖（scikit-learn / fastapi / uvicorn / httpx / pydantic）
 from __future__ import annotations
 
 import ast
+import importlib.util
 import re
 import sys
 from pathlib import Path
@@ -134,13 +135,60 @@ class TestDependencyDeclarations:
         for transitive in ("starlette", "pydantic_core", "h11", "joblib"):
             assert transitive in locked, f"锁文件缺传递依赖 {transitive}"
 
+    def test_lock_generator_agrees_with_requirements(self):
+        """锁生成器的 ``DIRECT`` 不能漏掉 requirements.txt 里的任何一项。
+
+        这是"直接依赖"的**第三份清单**（另两份是 requirements.txt 与 pyproject），
+        而它是最容易被忘掉的一份：实测给 requirements.txt 加了 mypy 之后重新生成
+        锁文件，锁里**没有 mypy** —— 生成器根本不知道它。``--check`` 抓不到
+        （它比对的是"锁 vs 当前环境"，对"两边都没有"是瞎的），
+        上一条 ``test_lock_covers_everything_required`` 抓到了；
+        这一条补的是反方向：DIRECT 里有、requirements.txt 里没有的也会漂移。
+        """
+        spec = importlib.util.spec_from_file_location(
+            "lock_requirements_under_test", ROOT / "scripts" / "lock_requirements.py"
+        )
+        assert spec and spec.loader
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+
+        in_generator = {name.lower() for group in module.DIRECT.values() for name in group}
+        in_requirements = {
+            _dist_name(line).lower()
+            for line in (ROOT / "requirements.txt").read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        }
+        assert in_generator == in_requirements, (
+            "锁生成器的 DIRECT 与 requirements.txt 不一致：\n"
+            f"  只在生成器里：{sorted(in_generator - in_requirements)}\n"
+            f"  只在 requirements.txt 里：{sorted(in_requirements - in_generator)}"
+        )
+
     def test_lock_check_passes(self):
-        """锁文件与当前环境必须逐项一致（这把"可复现"变成可执行的检查）。"""
+        """锁文件与当前环境必须逐项一致（这把"可复现"变成可执行的检查）。
+
+        **必须显式告诉子进程按 UTF-8 写。** 这一条是实测踩出来的：脚本的 stdout 一旦
+        不是控制台（被 pytest 抓走就是管道），Python 就用 locale 编码 —— 简体中文
+        机器上是 GBK；而这里按 UTF-8 解，于是 ``UnicodeDecodeError: 'utf-8' codec
+        can't decode byte 0xb5``，``proc.stdout`` 直接是 ``None``，报错还长成
+        ``TypeError: argument of type 'NoneType'``，完全看不出真正的原因。
+
+        它藏在"每次全量检查都过"后面：``run_all_checks.py`` 会给 pytest 传
+        ``PYTHONIOENCODING=utf-8``，子进程一路继承 —— 于是**只有单独跑
+        ``pytest tests`` 的人**才会撞上。这就是"测试依赖了调用者的环境"：
+        测试必须自己把输入条件写死，而不是碰运气继承。
+        """
+        import os
         import subprocess
 
+        env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
         proc = subprocess.run(
             [sys.executable, str(ROOT / "scripts" / "lock_requirements.py"), "--check"],
-            capture_output=True, text=True, encoding="utf-8",
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            env=env,
         )
         assert proc.returncode == 0, proc.stdout + proc.stderr
         assert "一致" in proc.stdout

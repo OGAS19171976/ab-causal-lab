@@ -36,7 +36,9 @@ pydantic==2.13.5
 # httpx 是 fastapi.testclient 的传输层依赖，不装就跑不了接口测试。
 # packaging 给 scripts/lock_requirements.py 解析 Requires-Dist 用。
 # ruff 是 lint：配置刻意保守（只查真问题），见 pyproject 的 [tool.ruff]
+# mypy 是类型检查：配置刻意不 --strict（理由写在 pyproject 的 [tool.mypy]）
 pytest==9.1.1
 httpx==0.28.1
 packaging==26.3
 ruff==0.16.8
+mypy==2.3.1

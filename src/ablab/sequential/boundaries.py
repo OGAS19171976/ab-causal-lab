@@ -44,9 +44,9 @@ Pocock 的两种定义差别很小（本模块结果 ≈ 2.41 常数，与文献
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
 
 import numpy as np
+from numpy.typing import ArrayLike
 from scipy import stats
 
 from .spending import SpendingFunction, get_spending
@@ -71,7 +71,7 @@ class BoundarySolver:
 
     def __init__(
         self,
-        information_fractions: Sequence[float],
+        information_fractions: ArrayLike,
         *,
         n_grid: int = 801,
         grid_max: float = 8.0,
@@ -248,7 +248,7 @@ class SequentialDesign:
             raise IndexError(f"look 必须在 1~{self.n_looks}")
         return float(self.boundaries[look - 1])
 
-    def crossed(self, z_statistics: Sequence[float]) -> np.ndarray:
+    def crossed(self, z_statistics: ArrayLike) -> np.ndarray:
         """判断是否越界，返回布尔数组。
 
         支持两种输入：
@@ -269,11 +269,11 @@ class SequentialDesign:
             return np.abs(z) >= self.boundaries[None, :]
         raise ValueError(f"z_statistics 必须是一维或二维，收到 {z.ndim} 维")
 
-    def reject(self, z_statistics: Sequence[float]) -> bool:
+    def reject(self, z_statistics: ArrayLike) -> bool:
         """整个序贯检验是否在任一时刻拒绝原假设。"""
         return bool(self.crossed(z_statistics).any())
 
-    def first_crossing_look(self, z_statistics: Sequence[float]) -> int | None:
+    def first_crossing_look(self, z_statistics: ArrayLike) -> int | None:
         """首次越界发生在第几次查看；从未越界返回 ``None``。"""
         hits = np.flatnonzero(self.crossed(z_statistics))
         return int(hits[0]) + 1 if hits.size else None
@@ -308,7 +308,7 @@ def build_design(
     alpha: float = 0.05,
     n_looks: int = 5,
     spending: str | SpendingFunction = "obf",
-    information_fractions: Sequence[float] | None = None,
+    information_fractions: ArrayLike | None = None,
     n_grid: int | None = None,
     solver: BoundarySolver | None = None,
     check_refinement: bool = True,
@@ -381,9 +381,9 @@ def repeated_ci(
 
 
 def adjusted_p_value(
-    z_statistics: Sequence[float],
+    z_statistics: ArrayLike,
     *,
-    information_fractions: Sequence[float] | None = None,
+    information_fractions: ArrayLike | None = None,
     spending: str | SpendingFunction = "obf",
     solver: BoundarySolver | None = None,
     tol: float = 1e-10,

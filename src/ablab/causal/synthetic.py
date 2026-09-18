@@ -264,13 +264,16 @@ def placebo_inference(data: SCMData, *, treated_index: int | None = None) -> Pla
         ratios.append(r.rmse_ratio)
         atts.append(r.att)
 
-    ratios = np.asarray(ratios)
+    # 名字要分开：``ratios`` 是构造用的 list，``ratios_arr`` 才是要进结果的数组。
+    # 第一版写成 ``ratios = np.asarray(ratios)`` —— 变量先被推断成 ``list[float]``，
+    # 后面那行就变成"给 list 赋一个 ndarray"，类型检查器说的没错，是代码在骗人。
+    ratios_arr = np.asarray(ratios)
     # 排名 p 值：真实单元的比值在（真实 + 安慰剂）里的排名比例
-    p = float((1 + np.sum(ratios >= main.rmse_ratio)) / (1 + ratios.size))
+    p = float((1 + np.sum(ratios_arr >= main.rmse_ratio)) / (1 + ratios_arr.size))
 
     return PlaceboResult(
         treated_ratio=main.rmse_ratio,
-        placebo_ratios=ratios,
+        placebo_ratios=ratios_arr,
         p_value=p,
         treated_att=main.att,
         placebo_atts=np.asarray(atts),

@@ -9,13 +9,27 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
 
-from ablab.reporting import for_report, relativize_paths, report_text, strip_timings
+from ablab.reporting import (
+    compare_report_texts,
+    for_report,
+    relativize_paths,
+    report_text,
+    strip_timings,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
+
+#: 耗时的**形状**：数字（可带小数点、后可跟一个空格）紧跟一个 s，且两侧不能再粘字母/点。
+#: 用 ``(?<![\w.])`` / ``(?![\w])`` 卡住边界，避免把 ``1.5e-3``、
+#: ``5 samples``、``fig28_...`` 这类真数字判成耗时。
+#: 允许一个空格是因为 ``71 s`` 这种写法同样会进报告 —— 它误报的概率极低
+#: （要恰好是"数字 空格 s"且后面接边界），漏掉它的代价却是每次重跑 diff 一行。
+_DURATION_TOKEN = re.compile(r"(?<![\w.])\d+(?:\.\d+)?\s?s(?![\w])")
 
 
 class TestStripTimings:
@@ -116,8 +130,148 @@ class TestForReport:
             for lineno, line in enumerate(text.splitlines(), 1):
                 if "耗时" in line:
                     offenders.append(f"{path.name}:{lineno} 有耗时：{line.strip()[:60]}")
+                if _DURATION_TOKEN.search(line):
+                    offenders.append(
+                        f"{path.name}:{lineno} 有裸耗时（数字+秒）：{line.strip()[:60]}"
+                    )
                 if relativize_paths(line, root=ROOT) != line:
                     offenders.append(f"{path.name}:{lineno} 有绝对路径：{line.strip()[:60]}")
         assert not offenders, "报告里混进了机器相关信息（重跑就会变成 diff 噪声）：\n" + "\n".join(
             f"  - {o}" for o in offenders[:10]
         )
+
+
+class TestCompareReportTexts:
+    """第二级判据：正文不变时，数值末位允许差多少。
+
+    为什么需要它，以及为什么不能只有它 —— 都在 ``Comparison`` 的 docstring 里。
+    这组测试要守住的是**两侧**：
+    * 末位浮点差不能被报成失败（否则真失败会被噪声淹掉）；
+    * 真变化不能被放过（耗时从 69s 变 71s 就是真变化，哪怕它也是"数字变了"）。
+    """
+
+    def test_byte_identical(self):
+        text = "effect=27.2482063215\n"
+        c = compare_report_texts(text, text)
+        assert c.identical and c.ok and c.worst is None
+
+    def test_last_digit_float_change_is_tolerated_but_quantified(self):
+        """实测到的那一次：-3.9243251037 -> -3.9243251038（1 ulp）。"""
+        c = compare_report_texts(
+            "CUPED ADS汇总 effect=-3.9243251037\n", "CUPED ADS汇总 effect=-3.9243251038\n"
+        )
+        assert not c.identical
+        assert c.text_identical
+        assert c.ok, "1 ulp 的差不该判失败"
+        assert c.exceeds is None
+        assert c.n_numeric_diffs == 1
+        # worst 是"实测最大偏差"，不区分是否超容差 —— 它的用途是**量化**，
+        # 判断用途的是 exceeds。这两个字段混在一起，报告就没法既说"通过"
+        # 又说"最大偏差 2.5e-11"，而后者恰恰是这条检查真正想产出的信息。
+        assert c.worst is not None and c.worst.rel_diff < 1e-9
+        assert "1037" in (c.first_diff or "")
+
+    def test_scientific_notation_deviation_is_tolerated(self):
+        """本身就是舍入噪声的量：相对差 50%，绝对差 1e-13 —— 必须放过。
+
+        三条路径的"最大偏差"就是这类量（两个几乎相等的数相减）。
+        只比相对值会把它判失败；``atol=1e-12`` 那一项就是为它准备的。
+        worst 仍然要把这 50% 记下来 —— 因为**看的人有权知道**它不稳定。
+        """
+        c = compare_report_texts("最大偏差 2.274e-13\n", "最大偏差 1.137e-13\n")
+        assert not c.identical and c.ok
+        assert c.exceeds is None
+        assert c.worst is not None and c.worst.rel_diff > 0.4
+
+    def test_timing_leak_still_fails(self):
+        """耗时从 69s 变 71s：同样是"数字变了"，但**必须失败**。
+
+        这正是第一版逐字节判据抓到的那个漏网 —— 换成带容差的判据之后，
+        它不能因为"只是数字"就被放过：相对差 2.8e-2 远大于容差 1e-9。
+        """
+        c = compare_report_texts(
+            "真实效应 0.25 下（400 个 salt，69s）\n", "真实效应 0.25 下（400 个 salt，71s）\n"
+        )
+        assert not c.identical
+        assert not c.ok, "耗时变化必须判失败"
+        assert c.worst is not None and c.worst.rel_diff > 1e-2
+
+    def test_sample_count_change_fails(self):
+        """样本量 30,741 -> 30,742 必须失败：这不是浮点噪声，是数据变了。"""
+        c = compare_report_texts("ODS 行数 = 30741\n", "ODS 行数 = 30742\n")
+        assert not c.ok
+        assert c.worst is not None and c.worst.rel_diff > 1e-5
+
+    def test_wording_change_is_text_difference(self):
+        c = compare_report_texts("结论：守住 5%\n", "结论：守不住 5%\n")
+        assert not c.ok
+        assert not c.text_identical
+
+    def test_extra_line_is_text_difference(self):
+        c = compare_report_texts("a\nFPR 0.0625\n", "a\nFPR 0.0625\nb\n")
+        assert not c.ok and not c.text_identical
+
+    def test_number_in_a_filename_is_not_a_false_alarm(self):
+        c = compare_report_texts(
+            "图：fig28_monitoring_estimator.png\n", "图：fig28_monitoring_estimator.png\n"
+        )
+        assert c.identical
+
+    def test_integers_are_not_compared_with_float_tolerance(self):
+        """整数不能被"相对 1e-9"放过 —— 1 和 2 的相对差是 0.5，本来就过得去；
+        但这里更想钉住的是：**不能因为都是数字就按同一套宽松规则比**。"""
+        c = compare_report_texts("n=1000000\n", "n=1000001\n")
+        assert not c.ok, "整数差 1 也必须失败"
+        assert c.worst is not None and c.worst.rel_diff > 1e-9
+
+    def test_format_only_change_is_recorded_with_zero_deviation(self):
+        """只改印刷位数（1.0 -> 1.000）不改变数值。
+
+        这时它**不是**逐字节相同，但相对偏差是 0 —— 所以放行，同时把
+        ``1.0 -> 1.000`` 原样打印出来。把它算成"失败"会让格式调整寸步难行；
+        把它算成"逐字节相同"又是撒谎。当前行为是第三条：记为数值差异、偏差 0。
+        """
+        c = compare_report_texts("effect=1.0\n", "effect=1.000\n")
+        assert not c.identical
+        assert c.ok
+        assert c.worst is not None and c.worst.rel_diff == 0.0
+        assert c.worst.before == "1.0" and c.worst.after == "1.000"
+
+
+class TestDurationShapeRule:
+    """耗时未必带"耗时"两个字 —— 这条规则是靠实测的漏网换来的。
+
+    过滤器只认措辞（``耗时 71s``），于是 ``run_m6_validation.py`` 里
+    ``真实效应 0.25 下（400 个 salt，{t:.0f}s）`` 这种写法整行绕过它，
+    m6 报告每次重跑都 diff 一行。措辞是**开放集合**（还能写成"用时 71s"
+    "花了 71 秒"），形状才是封闭的：**数字紧跟秒**。
+    所以断言按形状写，``_DURATION_TOKEN`` 就是那个形状。
+    """
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "真实效应 0.25 下（400 个 salt，71s）",
+            "用时 71s",
+            "花了 71 秒".replace("秒", "s"),
+            "3.5s 完成",
+        ],
+    )
+    def test_shape_is_caught(self, line):
+        assert _DURATION_TOKEN.search(line)
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "naive FPR = 0.0400",  # 数字后面跟的不是 s
+            "n=40 个簇",  # 有空格
+            "5 samples",  # s 后面还跟着字母
+            "eff=1.5e-3",  # 科学计数法
+            "fig28_monitoring_estimator.png",  # 像但不以数字开头
+            "覆盖率 0.9480，SE 之比 0.1590",
+        ],
+    )
+    def test_statistical_values_are_not_false_positives(self, line):
+        """误报比漏报更糟：一个会把真数字判成耗时的规则没人会留着。"""
+        assert not _DURATION_TOKEN.search(line)
+

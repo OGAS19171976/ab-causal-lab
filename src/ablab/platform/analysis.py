@@ -380,6 +380,10 @@ def analyse_data(data: ExperimentData, *, alpha: float = 0.05) -> ExperimentRepo
     primary, primary_name, alt, alt_name = _headline_path(data, total)
     if unit_mean:
         # 单元 + 人均路径下，把带名称/诊断的版本换回来（_headline_path 走的是无标签版本）
+        # 这条路只有均值指标 + 用户级才会进来，所以 naive 与 CUPED 一定都在；
+        # 不在就明说 —— 类型上的 Optional 是真实的（比值/簇级路径确实没有 CUPED）。
+        if naive is None or cuped is None:
+            raise ValueError("均值指标的用户级分析必须同时给出 post-only 与 CUPED 两个口径")
         primary = cuped if primary_name == "cuped" else naive
         alt = naive if primary_name == "cuped" else cuped
 

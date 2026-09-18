@@ -28,11 +28,20 @@ ROOT = Path(__file__).resolve().parents[1]
 
 #: 直接依赖 —— 与 pyproject.toml 的 dependencies / optional-dependencies 对应。
 #: 分组只是给人看的；``requirements.lock`` 里是扁平的传递闭包。
+#:
+#: **这里是第三份"直接依赖"清单**（另两份是 requirements.txt 与 pyproject）。
+#: 实测被它坑过一次：给 requirements.txt 加了 mypy 之后重新生成锁文件，
+#: 锁里**没有 mypy** —— 因为生成器不知道它。而 ``--check`` 只比对
+#: "锁文件 vs 当前环境"，对"两边都没有 mypy"这件事是瞎的。
+#: 抓住它的是 ``tests/test_dependencies.py`` 里的
+#: ``test_lock_covers_everything_required``（锁必须覆盖 requirements.txt 的每一项）；
+#: 这里再加一条反方向的（DIRECT 里的每一项都要在 requirements.txt 里），
+#: 这样三份清单就只能**同时**正确，不能各自漂移。
 DIRECT: dict[str, tuple[str, ...]] = {
     "运行时": ("numpy", "scipy", "pandas", "duckdb", "pyarrow", "matplotlib"),
     "M4 机器学习": ("scikit-learn",),
     "M5/M6 接口": ("fastapi", "uvicorn", "pydantic"),
-    "测试 / 工具": ("pytest", "httpx", "packaging", "ruff"),
+    "测试 / 工具": ("pytest", "httpx", "packaging", "ruff", "mypy"),
 }
 
 
@@ -151,7 +160,13 @@ def main() -> int:
         lines.append(f"{name}=={version}")
 
     path = Path(args.out)
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    # newline="\n" 不是可有可无的：默认（newline=None）在 Windows 上会把 \n 翻成 \r\n，
+    # 于是**同一个脚本在 Windows 与 Linux 上写出不同的字节** —— 而 requirements.lock
+    # 是被提交的文件，这种平台差异会变成别人 diff 里的整文件重写。
+    # 实测到过：工作区里 requirements.lock 是 CRLF，而索引里是 LF
+    # （`.gitattributes` 声明了 eol=lf，所以 git 侧看不出来）。
+    # 报告那几个写出口早就带了 newline="\n"，这里是漏掉的一个。
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
     print(f"已写入 {path}（{len(locked)} 个包，Python {py}）")
     return 0
 

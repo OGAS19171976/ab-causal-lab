@@ -11,6 +11,10 @@ build/
 .pytest_cache/
 pytest-cache-files-*/
 .mplcache/
+# 静态检查器的缓存：几 MB 的中间结果，跟源码无关。
+# 写在这里而不是靠开发者本地的全局 ignore —— 别人 clone 下来不该看见它们。
+.mypy_cache/
+.ruff_cache/
 
 # 环境
 .env

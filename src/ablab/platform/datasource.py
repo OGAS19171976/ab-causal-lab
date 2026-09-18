@@ -140,6 +140,19 @@ class LookData:
     def has_clusters(self) -> bool:
         return self.cluster_treatment is not None and self.cluster_control is not None
 
+    @property
+    def clusters(self) -> tuple[tuple[AggregateStats, ...], tuple[AggregateStats, ...]]:
+        """``(处理组各簇, 对照组各簇)``；没有簇级统计量就报错。
+
+        为什么要有这个属性，而不是让调用处各自 ``if x is None: raise``：
+        那两个字段是 Optional（只有 ``analysis_unit == "cluster"`` 的读取才填），
+        而**"有簇"这件事必须同时成立**（两臂都不能缺）。把它收在一个地方，
+        调用处就不必各自复述一遍"检查两个字段"，也就不会有人只检查了一个。
+        """
+        if self.cluster_treatment is None or self.cluster_control is None:
+            raise ValueError("这次查看没有簇级统计量（只有整簇随机化的分析单元才有）")
+        return self.cluster_treatment, self.cluster_control
+
     def clusters_consistent(self, tol: float = 1e-6) -> bool:
         """簇级统计量合并回去，必须等于臂级统计量。
 
@@ -148,8 +161,9 @@ class LookData:
         """
         if not self.has_clusters:
             return False
-        merged_t = self.cluster_treatment[0].merge(*self.cluster_treatment[1:])
-        merged_c = self.cluster_control[0].merge(*self.cluster_control[1:])
+        cluster_treatment, cluster_control = self.clusters
+        merged_t = cluster_treatment[0].merge(*cluster_treatment[1:])
+        merged_c = cluster_control[0].merge(*cluster_control[1:])
         return (
             _close(merged_t.n, self.treatment.n)
             and _close(merged_t.sum_y, self.treatment.sum_y, tol * max(1.0, abs(self.treatment.sum_y)))
@@ -174,7 +188,8 @@ class LookData:
             means = np.array([c.mean_y for c in clusters], dtype=float)
             return AggregateStats.from_outcomes(means)
 
-        t_clusters, c_clusters = arm(self.cluster_treatment), arm(self.cluster_control)
+        treatment_clusters, control_clusters = self.clusters
+        t_clusters, c_clusters = arm(treatment_clusters), arm(control_clusters)
         return welch_ttest_from_stats(
             n_treatment=t_clusters.n,
             mean_treatment=t_clusters.mean_y,
@@ -188,7 +203,8 @@ class LookData:
     def n_clusters(self) -> tuple[int, int]:
         if not self.has_clusters:
             return (0, 0)
-        return (len(self.cluster_treatment), len(self.cluster_control))
+        treatment_clusters, control_clusters = self.clusters
+        return (len(treatment_clusters), len(control_clusters))
 
 
 @dataclass(frozen=True)
@@ -822,13 +838,14 @@ def _warehouse_cluster_data(
     )
 
     c_row, t_row = variants[control_name], variants[treated_name]
+    last_treatment, last_control = looks[-1].clusters
     # 兜底校验：簇粒度 DWS 里数出来的簇数必须与 looks 的一致
-    if cluster_counts != {treated_name: len(looks[-1].cluster_treatment),
-                          control_name: len(looks[-1].cluster_control)}:
+    if cluster_counts != {treated_name: len(last_treatment),
+                          control_name: len(last_control)}:
         raise ValueError(
             f"实验 {experiment!r} 的簇数对不上：DWS 直接数 {cluster_counts}，"
-            f"按日累计得到 {len(looks[-1].cluster_treatment)}/"
-            f"{len(looks[-1].cluster_control)}"
+            f"按日累计得到 {len(last_treatment)}/"
+            f"{len(last_control)}"
         )
 
     data = ExperimentData(
@@ -1107,17 +1124,24 @@ def _warehouse_looks(
     }
 
     cumulative: dict[str, list[dict[str, float]]] = {}
+    #: 与 cumulative 逐日对齐的日期标签。**为什么不塞进那个 dict**：那样它就成了
+    #: ``dict[str, float | str]``，而下游要做 ``float(...)`` 的地方全得再判一次类型。
+    #: 数值归数值、标签归标签，读的人也不用先想"这个键是数还是串"。
+    day_labels: dict[str, list[str]] = {}
     for variant in (control_name, treated_name):
         rows = daily[daily["variant"] == variant]
         if rows.empty:
             raise ValueError(f"DWS 里 {experiment!r}/{variant!r} 没有日汇总")
         acc = {k: 0.0 for k in ("user_cnt", "pre_sum", "post_sum", "pre_sq_sum", "post_sq_sum", "pre_post_cross_sum")}
         series: list[dict[str, float]] = []
+        labels: list[str] = []
         for _, r in rows.iterrows():
             for k in acc:
                 acc[k] += float(r[k])
-            series.append(dict(acc, ds=str(r["ds"])))
+            series.append(dict(acc))
+            labels.append(str(r["ds"]))
         cumulative[variant] = series
+        day_labels[variant] = labels
 
     # 目标信息比例 = 等距，但**落到实际某一天的累计值**上
     n_t, n_c = totals[treated_name], totals[control_name]
@@ -1153,7 +1177,7 @@ def _warehouse_looks(
         looks.append(
             LookData(
                 # DuckDB 的 DATE 经 pandas 会变成 Timestamp，只取日期部分
-                label=f"{str(ct['ds'])[:10]}（累计）",
+                label=f"{day_labels[treated_name][d][:10]}（累计）",
                 information_fraction=frac,
                 treatment=AggregateStats.from_sums(
                     n=int(ct["user_cnt"]), sum_x=ct["pre_sum"], sum_y=ct["post_sum"],
