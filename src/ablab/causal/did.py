@@ -36,6 +36,9 @@ __all__ = [
     "TWFEDecomposition",
     "callaway_santanna",
     "cs_att_with_influence",
+    "sun_abraham",
+    "SAEventStudy",
+    "SAResult",
     "collect_leads_with_influence",
     "event_study_leads",
     "CSResult",
@@ -324,6 +327,16 @@ class CSResult:
     overall: Estimate
     control_group: str
     base_period: int | None
+    #: 若按"忽略跨 (g,t) 相关、独立合成"算，整体 ATT 的 SE 会是多少。
+    #: **一定小于等于影响函数算出来的那个**（相关性非负），所以它是反保守的；
+    #: 留在这里是为了能被报告出来并对比 —— 实测低估约 46%。
+    naive_overall_se: float = float("nan")
+
+    @property
+    def se_understatement(self) -> float:
+        """独立合成把整体 ATT 的 SE 低估了多少（相对）。"""
+        se = self.overall.std_error
+        return float(1.0 - self.naive_overall_se / se) if se > 0 else float("nan")
 
     @property
     def atts(self) -> dict[tuple[int, int], float]:
@@ -494,8 +507,23 @@ def callaway_santanna(
     vals = np.array([events[k].absolute_effect for k in post_keys])
     ses = np.array([events[k].std_error for k in post_keys])
     overall_effect = float((w * vals).sum())
-    # 保守做法：忽略跨 (g,t) 的相关性，按独立加权合成方差
-    overall_se = float(np.sqrt((w**2 * ses**2).sum()))
+
+    # **方差要从影响函数算**：各个 ATT(g,t) 高度相关（共用同一批对照单元、
+    # 相邻队列还共用基准期），把它们当独立量合成会**低估**标准误。
+    # 这里曾经就是这么写的（sqrt(Σw²se²)），而且这个文件的 `_att_influence`
+    # 文档里早就写过"独立合成会严重低估方差（实测把 size 从 5% 抬到 11%）" ——
+    # 但那个教训当时只用在了 lead 的联合检验上，聚合这一步漏掉了。
+    #
+    # 旧算法仍然算出来（naive_overall_se）并放进诊断，好让差异可见：
+    # 实测在这份面板上它把整体 ATT 的 SE 低估约 46%。
+    naive_overall_se = float(np.sqrt((w**2 * ses**2).sum()))
+    psi_overall = np.zeros(panel.n_units)
+    for weight, key in zip(w, post_keys):
+        out = cs_att_with_influence(panel, key[0], key[1], key[0] - 1, control_group)
+        if out is None:  # pragma: no cover - 与上面同源，不该发生
+            continue
+        psi_overall = psi_overall + weight * out[1]
+    overall_se = float(np.sqrt(np.var(psi_overall, ddof=1) / panel.n_units))
     overall_inf = t_inference(
         overall_effect, se=overall_se, degrees_of_freedom=max(panel.n_units - 1, 1), alpha=alpha
     )
@@ -524,6 +552,17 @@ def callaway_santanna(
                     f"聚合 {len(post_keys)} 个 ATT(g,t)，权重全部非负"
                     f"（范围 {w.min():.4f}~{w.max():.4f}）"
                 ),
+            ),
+            Diagnostic(
+                name="聚合方差",
+                status="pass",
+                message=(
+                    f"SE 由影响函数合成（协方差自动进入）：{overall_se:.4f}；"
+                    f"若按独立合成只有 {naive_overall_se:.4f}"
+                    f"（低估 {1 - naive_overall_se / overall_se:.1%}）"
+                    "—— 各 ATT(g,t) 共用对照单元与基准期，相关性非负。"
+                ),
+                statistic=overall_se,
             ),
         ),
     )
@@ -566,6 +605,243 @@ def callaway_santanna(
         overall=overall,
         control_group=control_group,
         base_period=None if base_period == "universal" else int(base_period),
+        naive_overall_se=naive_overall_se,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Sun & Abraham (2021) 交互加权估计量
+# --------------------------------------------------------------------------- #
+def _se_from_influence(effect: float, psi: np.ndarray, alpha: float):
+    """由影响函数得到 ``(se, Inference)``。
+
+    ``se = sqrt(Var(psi)/n)`` —— 与 CS 的单格算法一致，
+    关键是**多格合成时可以直接把影响函数相加**，于是协方差自动进来。
+
+    注意第一个参数是**点估计本身**：``t_inference`` 要用它算 t 统计量，
+    第一版这里传的是 ``0.0``（只想要 se），于是整体 ATT 的 p 值恒等于 1 ——
+    一个"看起来只是显示问题"的错误，其实是在报告一个**没有任何证据支持**的结论。
+    """
+    n = psi.size
+    se = float(np.sqrt(np.var(psi, ddof=1) / n))
+    return se, t_inference(effect, se=se, degrees_of_freedom=max(n - 1, 1), alpha=alpha)
+
+
+@dataclass(frozen=True)
+class SAEventStudy:
+    """Sun-Abraham 在某个相对期数 ``k`` 上的估计。"""
+
+    k: int
+    effect: float
+    #: 影响函数（长度 = 单元数）。**聚合时用它，而不是各自的标准误** —— 见 ``sun_abraham``。
+    influence: np.ndarray
+    #: 各队列在该 ``k`` 上的权重（队列份额，非负、和为 1）
+    weights: dict[int, float]
+    n_treated: int
+
+
+@dataclass
+class SAResult:
+    """Sun & Abraham (2021) 交互加权（IW）估计量的结果。"""
+
+    event_study: dict[int, Estimate]
+    overall: Estimate
+    control_group: str
+    #: 若按"忽略跨期相关、独立合成"算，整体 ATT 的标准误会是多少。
+    #:
+    #: **一定小于等于影响函数算出来的那个**（相关性是非负的），
+    #: 所以它是**反保守**的。留在这里是为了能被报告出来并和正确的那个对比 ——
+    #: 一个被算出来却没人看的数字，比不写还糟。
+    naive_overall_se: float
+    weights: dict[int, float]
+
+    @property
+    def se_understatement(self) -> float:
+        """独立合成把标准误低估了多少（相对）。"""
+        se = self.overall.std_error
+        return float(1.0 - self.naive_overall_se / se) if se > 0 else float("nan")
+
+    def summary(self) -> str:
+        lines = [
+            f"Sun & Abraham 交互加权（对照组 = {self.control_group}）",
+            f"  整体 ATT = {self.overall.absolute_effect:+.4f} "
+            f"(SE {self.overall.std_error:.4f}, p={self.overall.p_value:.4g})",
+            f"  同一组估计、按独立合成的 SE = {self.naive_overall_se:.4f}"
+            f"（低估 {self.se_understatement:.1%}）",
+            "  事件研究（相对期数 -> ATT，权重 = 该期已处置队列的份额）：",
+        ]
+        for k in sorted(self.event_study):
+            e = self.event_study[k]
+            tag = " <- 处置前（应接近 0）" if k < 0 else ""
+            lines.append(f"    k={k:>3}: {e.absolute_effect:+.4f} (SE {e.std_error:.4f}){tag}")
+        return "\n".join(lines)
+
+
+def sun_abraham(
+    panel: Panel,
+    *,
+    control_group: ControlGroup = "not_yet_treated",
+    min_k: int | None = None,
+    max_k: int | None = None,
+    alpha: float = 0.05,
+) -> SAResult:
+    """Sun & Abraham (2021) 的**交互加权（IW）聚合**。
+
+    **先说清楚这个实现是什么、不是什么**（这句话必须写在这里，而不是留在 README 里）：
+
+    * 它是 **IW 聚合**：把"队列 × 相对期数"的分格效应按队列份额
+      ``w_{g,k} = P(G=g | 已处置)`` 加权，权重**非负**、和为 1，所以不会出现
+      TWFE 那种"负权重把估计拉反"的问题。
+    * 分格效应用的是**各队列自己的 2×2**（基准期 ``g-1``，对照组按
+      ``control_group`` 选）—— 与 ``callaway_santanna`` 同一套分格估计。
+    * 因此，在**饱和设定**下它与 CS 的事件研究**点估计完全相同**（实测到小数点后四位）。
+      Sun-Abraham 的原始形式是"一条回归 + 队列×相对期数交互项 + 双向固定效应"，
+      那需要吸收 N+T 个固定效应；本仓库没有稀疏最小二乘，
+      **回归版没有实现** —— 这条边界写在 README 的已知边界里。
+    * 那么这一版**新增的价值**在哪：在**聚合的方差**上。见下。
+
+    整体 ATT 是若干高度相关量的加权和（它们**共用同一个基准期 g-1**，
+    还用同一批对照单元）。``callaway_santanna`` 的聚合按独立合成算，
+    ``sqrt(Σ w² se²)`` —— 忽略非负协方差，**反保守**。
+    这个文件里 ``_att_influence`` 的文档早就指出了这件事（"实测把 size 从 5% 抬到 11%"），
+    但那个教训当时只用在了 lead 的联合检验上，聚合那一步没用。
+
+    这里把影响函数**直接加**起来：``ψ = Σ_k w_k ψ_k``，协方差自动进来，
+    ``se = sqrt(Var(ψ)/n)``。两种算法都返回，好让差异**可见**而不是靠相信 ——
+    实测在这份面板上，独立合成把整体 ATT 的 SE 低估了 **45.6%**。
+    """
+    cells: dict[int, dict[int, tuple[float, np.ndarray, int]]] = {}
+    for g in panel.cohorts():
+        g = int(g)
+        base = g - 1
+        if base < 1:
+            continue
+        for t in panel.periods:
+            t = int(t)
+            if t == base:
+                continue
+            k = t - g
+            if min_k is not None and k < min_k:
+                continue
+            if max_k is not None and k > max_k:
+                continue
+            out = cs_att_with_influence(panel, g, t, base, control_group)
+            if out is None:
+                continue
+            effect, psi, n_t, _n_c = out
+            cells.setdefault(k, {})[g] = (effect, psi, n_t)
+
+    if not cells:
+        raise ValueError("没有任何可估计的相对期数，检查队列设置与对照组选择")
+
+    study: dict[int, SAEventStudy] = {}
+    for k, by_cohort in sorted(cells.items()):
+        total = float(sum(n for _e, _p, n in by_cohort.values()))
+        if total <= 0:
+            continue
+        weights = {g: n / total for g, (_e, _p, n) in by_cohort.items()}
+        effect = float(sum(weights[g] * by_cohort[g][0] for g in by_cohort))
+        psi = np.zeros(panel.n_units)
+        for g, (e, p, _n) in by_cohort.items():
+            psi = psi + weights[g] * p  # 点估计与影响函数都用同一组权重
+        study[k] = SAEventStudy(
+            k=k, effect=effect, influence=psi, weights=weights,
+            n_treated=int(total),
+        )
+
+    # ---- 事件研究（逐 k，SE 来自该 k 的影响函数） ------------------------- #
+    event_study: dict[int, Estimate] = {}
+    for k, sa in study.items():
+        se, inf = _se_from_influence(sa.effect, sa.influence, alpha)
+        lo, hi = inf.interval(sa.effect)
+        event_study[k] = Estimate(
+            metric=f"event_study(k={k})",
+            variant="treated",
+            control="control",
+            method="Sun & Abraham interaction-weighted event study",
+            absolute_effect=sa.effect,
+            relative_effect=float("nan"),
+            std_error=se,
+            ci_low=float(lo),
+            ci_high=float(hi),
+            p_value=inf.p_value,
+            n_treatment=sa.n_treated,
+            n_control=0,
+            mean_treatment=float("nan"),
+            mean_control=float("nan"),
+            alpha=alpha,
+            diagnostics=(
+                Diagnostic(
+                    name="聚合权重",
+                    status="pass",
+                    message=(
+                        f"k={k} 由 {len(sa.weights)} 个队列加权，权重全部非负"
+                        f"（{min(sa.weights.values()):.3f}~{max(sa.weights.values()):.3f}），"
+                        f"合计 {sum(sa.weights.values()):.3f}"
+                    ),
+                ),
+            ),
+        )
+
+    # ---- 整体 ATT：只聚合处置后（k >= 0），权重 = 该相对期数上的处置单元数 -- #
+    post = [k for k in study if k >= 0]
+    if not post:
+        raise ValueError("没有任何处置后的相对期数")
+    w_raw = np.array([study[k].n_treated for k in post], dtype=float)
+    k_weights = {k: float(v / w_raw.sum()) for k, v in zip(post, w_raw)}
+    overall_effect = float(sum(k_weights[k] * study[k].effect for k in post))
+
+    # 正确做法：影响函数相加（协方差自动进来）
+    psi_overall = np.zeros(panel.n_units)
+    for k in post:
+        psi_overall = psi_overall + k_weights[k] * study[k].influence
+    overall_se, inf = _se_from_influence(overall_effect, psi_overall, alpha)
+    lo, hi = inf.interval(overall_effect)
+
+    # 对照做法：忽略跨期相关，独立合成 —— 为的是把差异**显示出来**
+    naive_overall_se = float(
+        np.sqrt(sum(k_weights[k] ** 2 * event_study[k].std_error**2 for k in post))
+    )
+
+    overall = Estimate(
+        metric="ATT",
+        variant="treated",
+        control="control",
+        method="Sun & Abraham (interaction-weighted, aggregated)",
+        absolute_effect=overall_effect,
+        relative_effect=float("nan"),
+        std_error=overall_se,
+        ci_low=float(lo),
+        ci_high=float(hi),
+        p_value=inf.p_value,
+        n_treatment=int(sum(study[k].n_treated for k in post)),
+        n_control=int(panel.never_treated_units.sum())
+        if control_group == "never_treated"
+        else int(np.sum(panel.cohort > max(panel.periods))),
+        mean_treatment=float("nan"),
+        mean_control=float("nan"),
+        alpha=alpha,
+        diagnostics=(
+            Diagnostic(
+                name="聚合方差",
+                status="pass",
+                message=(
+                    "整体 ATT 的影响函数 = Σ_k w_k·ψ_k（协方差自动进入）；"
+                    f"SE={overall_se:.4f}。若按独立合成会得到 {naive_overall_se:.4f}"
+                    f"（低估 {1 - naive_overall_se / overall_se:.1%}）"
+                    "—— 各相对期数共用基准期与对照，相关性非负，独立合成是反保守的。"
+                ),
+                statistic=overall_se,
+            ),
+        ),
+    )
+
+    return SAResult(
+        event_study=event_study,
+        overall=overall,
+        control_group=control_group,
+        naive_overall_se=naive_overall_se,
+        weights=k_weights,
     )
 
 

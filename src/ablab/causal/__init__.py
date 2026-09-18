@@ -8,10 +8,12 @@ M0–M2 的结论靠**随机化**站住；M3 第一次没有这个靠山，
 
 from .did import (
     CSResult,
+    SAResult,
     TWFEDecomposition,
     callaway_santanna,
     event_study_leads,
     pretrend_test,
+    sun_abraham,
     twfe,
     twfe_decomposition,
     two_by_two_did,
@@ -58,6 +60,8 @@ from .uplift import (
 
 __all__ = [
     "CSResult",
+    "SAResult",
+    "sun_abraham",
     "TWFEDecomposition",
     "callaway_santanna",
     "event_study_leads",

@@ -784,6 +784,55 @@ M1 的 cluster_level_ttest 直接拒绝：
 
 ---
 
+### 16 · 交错的点估计算对了，聚合的方差却算错了
+
+M3 早就做过一件事：用"分格 2×2 + 显式非负权重"的 Callaway-Sant'Anna（CS）
+把 TWFE 在异质处置下的符号翻转修掉。这一轮补的是它的两个缺口。
+
+**1. 第二种交错处置估计量：IW 聚合（Sun-Abraham 的聚合步骤）。**
+新增 `sun_abraham()`：把"队列 × 相对期数"的分格效应按队列份额
+`w_{g,k} = P(G=g | 已处置)` 加权，权重非负、和为 1。
+
+**但必须说清楚它是什么、不是什么**：分格估计用的是与 CS 同一套 2×2，
+所以**在饱和设定下它与 CS 的事件研究点估计完全相同**（实测 `+2.1033` vs `+2.1033`）。
+Sun-Abraham 的原始形式是"一条回归 + 队列×相对期数交互项 + 双向固定效应"，
+那需要吸收 N+T 个固定效应；本仓库没有稀疏最小二乘，**回归版没有实现**。
+有测试专门钉住这个等价，免得后来人把它当成两个独立的验证。
+
+**2. 真正查出来的问题在方差上 —— 而且它是个真 bug。**
+整体 ATT 是若干 `ATT(g,t)` 的加权和，而它们**共用同一批对照单元、
+相邻队列还共用基准期**，相关性非负。CS 的聚合当时是这么写的：
+
+```python
+overall_se = float(np.sqrt((w**2 * ses**2).sum()))   # 独立合成
+```
+
+忽略非负协方差 → **低估**标准误。而 `_att_influence` 的文档里早就写着
+"独立合成会严重低估方差（实测把 size 从 5% 抬到 11%）"——
+**那条教训当时只用在了 lead 的联合检验上，聚合这一步漏掉了。**
+
+H0（真实效应处处为零）下 200 次仿真的实测：
+
+| 聚合方差算法 | 越界率（α=0.05） | 95% 区间覆盖率 | 平均 SE |
+|---|---|---|---|
+| 影响函数合成（修好后） | **0.065** | 93.5% | 0.0850 |
+| 独立合成（修之前） | **0.220** | **78.0%** | 0.0477（低估 43.9%） |
+
+也就是说：**一个名义 5% 的检验，在 H0 下拒绝了 22%；报出来的 95% 区间只覆盖 78%。**
+这比"点估计偏一点"严重得多 —— 它会让一个**完全无效**的处置看起来显著。
+
+修法：两条路径都改成把影响函数**相加**（`ψ = Σ w_k ψ_k`，协方差自动进入），
+同时把"旧算法会是多少"作为诊断一并报出（`naive_overall_se`）——
+**差异要可见，而不是靠相信**。新增 `run_aggregation_variance_audit`
+把这组对比做成可复跑的审计，进了 `reports/m3_validation.md` 的 2.5 节。
+
+顺带修掉一个我自己在新代码里犯的错：`_se_from_influence` 第一版把 effect
+传成 `0.0` 去算 p 值，于是**整体 ATT 的 p 值恒等于 1**。
+它看起来只是显示问题，其实是在报告一个没有任何证据支持的结论 ——
+现在有一条回归测试专门盯着它。
+
+---
+
 ### 五个阶段，同一条线
 
 M1、M3、M4、M5、M6 各留下一个结论，它们其实是同一件事的五个侧面：
@@ -808,7 +857,7 @@ python -m venv .venv
 .venv/Scripts/activate          # Windows；Linux/macOS 用 source .venv/bin/activate
 pip install -r requirements.txt # 钉死到实测版本；要更严用 requirements.lock
 
-pytest tests                    # 571 个测试，约 6 分钟（别加 -q，会吞掉汇总行）
+pytest tests                    # 579 个测试，约 6 分钟（别加 -q，会吞掉汇总行）
 python scripts/run_all_checks.py            # **全部检查**：测试 + lint + 类型 + M0–M6 + 数仓，约 20 分钟
 python scripts/run_all_checks.py --quick    # 快速版
 python scripts/run_all_checks.py --list     # 只列计划
@@ -1037,9 +1086,9 @@ tasks.ps1                  常用命令入口（与 CI 共用 run_all_checks.py�
 requirements.txt           直接依赖（钉死到实测版本）
 requirements.lock          直接依赖 + 传递闭包，共 48 个包（带 marker 的平台条件依赖）
 .gitattributes             统一换行符（这个仓库的行尾曾经是混的）
-tests/                     571 个测试（hashing 25 / assignment 25 / inference 20 /
+tests/                     579 个测试（hashing 25 / assignment 25 / inference 20 /
                            inference_m1 43 / methods 30 / sequential 70 /
-                           causal 41 / hte 47 / validation 38 / warehouse 23 /
+                           causal 49 / hte 47 / validation 38 / warehouse 23 /
                            platform 53 / platform_warehouse 31 / platform_m6 28 /
                            governance 14 / dependencies 18 / ci_contract 26 /
                            reporting 39）
@@ -1491,6 +1540,16 @@ python -m mypy                                # 类型检查（范围与档位�
     而"永远亮的告警等于没有告警"（与第 31 条同一教训）——
     信息要显式，但不能污染"这次运行有问题"这个信号。详见 15 节。
 
+41. **点估计对了，方差可能还是错的 —— 而"独立合成"看起来非常合理**
+    整体 ATT 是若干 `ATT(g,t)` 的加权和。写成 `sqrt(Σ w² se²)` 时它像一条
+    标准的"加权平均的方差"公式，很容易被认为没问题 —— 但它假设各分量独立，
+    而它们**共用对照单元、相邻队列还共用基准期**，相关性非负。
+    实测（H0 下 200 次仿真）：独立合成让 5% 的检验拒绝 22%、95% 区间只覆盖 78%。
+    更讽刺的是：这个文件的 `_att_influence` 文档里**早就写着**这件事，
+    那条教训当时只用在了 lead 的联合检验上，聚合那一步漏了 ——
+    **一个写下来的教训，不等于一个被应用到所有相关处的教训。**
+    现在两边都用影响函数合成，并把旧算法的结果作为诊断一并报出。详见 16 节。
+
 ---
 
 ## 六、已知边界
@@ -1508,9 +1567,16 @@ python -m mypy                                # 类型检查（范围与档位�
   但那需要更完整的实现；目前只报了 MSE 与秩相关。
 * **没有实现 R-learner / DR-learner / Causal Forest 之外的策略学习**。
   最优策略（policy learning）与 Qini 的取舍也没有展开。
-* **交错处置只实现了 Callaway-Sant'Anna**。Sun-Abraham 交互加权、
-  Borusyak-Jaravel-Spiess 插补、de Chaisemartin-D'Haultfœuille 都没有实现 ——
-  它们针对同一问题、取舍不同，值得作为交叉验证补上。
+* **交错处置实现了 CS 与"SA 的聚合步骤"，但没有 SA 的回归版**。
+  `sun_abraham()` 是**交互加权聚合** + 分格 2×2（与 CS 同一套分格），
+  所以在饱和设定下它的点估计与 CS **完全相同**（有测试钉着这个等价）。
+  Sun-Abraham 原始形式的"一条回归 + 队列×相对期数交互项 + 双向固定效应"
+  需要吸收 N+T 个固定效应 —— 本仓库没有稀疏最小二乘，**没有实现**。
+  Borusyak-Jaravel-Spiess 插补、de Chaisemartin-D'Haultfœuille 也都没有。
+  这一轮在 SA 上真正拿到的是一条**方差**结论（见 16 节），不是一个新的点估计量。
+* **把"独立合成方差"这件事只修在了 CS 与 SA 的聚合上**。同一个坑在别处还有没有，
+  没有系统排查：只要某处把"彼此相关的估计量"按独立量合成，就会低估方差。
+  目前已知被检查过的只有这两处。
 * **敏感性分析只做了线性违背**（Rambachan-Roth 的简化版）。
   他们的相对幅度/平滑约束版本更强，但需要更多机制。
 * **合成控制只做了空间安慰剂**。时间安慰剂、留一法、以及

@@ -16,6 +16,7 @@ from ablab.causal import (
     generate_staggered_panel,
     placebo_inference,
     pretrend_test,
+    sun_abraham,
     synthetic_control,
     trend_sensitivity,
     twfe,
@@ -250,6 +251,92 @@ class TestCallawaySantanna:
         cs = callaway_santanna(panel)
         assert any(k >= 0 for k in cs.event_study)
         assert any(k < 0 for k in cs.event_study)
+
+
+class TestSunAbraham:
+    """IW 聚合 + **聚合方差**。
+
+    这一组测试里最要紧的不是"SA 能不能算对"（在饱和设定下它的点估计与 CS
+    **完全相同**，见 ``sun_abraham`` 的 docstring —— 我们不假装它是回归版），
+    而是"聚合方差该用哪种算法"，以及那条被它抓出来的真 bug。
+    """
+
+    def test_point_estimates_match_callaway_santanna(self):
+        """饱和设定下 IW 聚合与 CS 事件研究点估计相同 —— 这是**已知的等价**，
+        不是巧合；把它钉住是为了让"我们实现的到底是哪个估计量"这件事可核对。"""
+        panel, _ = generate_staggered_panel(HEADLINE)
+        cs = callaway_santanna(panel)
+        sa = sun_abraham(panel)
+        assert sa.overall.absolute_effect == pytest.approx(
+            cs.overall.absolute_effect, abs=1e-9
+        )
+
+    def test_weights_are_non_negative_and_sum_to_one(self):
+        panel, _ = generate_staggered_panel(HEADLINE)
+        sa = sun_abraham(panel)
+        assert all(w >= 0 for w in sa.weights.values())
+        assert sum(sa.weights.values()) == pytest.approx(1.0)
+
+    def test_influence_based_se_exceeds_independent_combination(self):
+        """独立合成（sqrt(Σw²se²)）必然**低估**：各相对期数共用基准期与对照，
+        相关性非负。低估幅度在这份面板上是几十个百分点。"""
+        panel, _ = generate_staggered_panel(HEADLINE)
+        sa = sun_abraham(panel)
+        assert sa.naive_overall_se < sa.overall.std_error
+        assert sa.se_understatement > 0.2, sa.se_understatement
+
+    def test_cs_also_uses_influence_based_aggregation(self):
+        """CS 那边曾经用独立合成 —— 这个 bug 已经修掉，且旧算法仍被报出来对比。"""
+        panel, _ = generate_staggered_panel(HEADLINE)
+        cs = callaway_santanna(panel)
+        assert cs.naive_overall_se < cs.overall.std_error
+        assert cs.se_understatement > 0.2
+        diag = cs.overall.diagnostics_of("聚合方差")
+        assert diag is not None and "独立合成" in diag.message
+
+    def test_overall_p_value_is_not_stuck_at_one(self):
+        """回归测试：修之前 ``_se_from_influence`` 把 effect 传成 0 去算 p 值，
+        于是**整体 ATT 的 p 值恒等于 1** —— 一个"看起来只是显示问题"的错误，
+        实际是在报告一个没有任何证据支持的结论。"""
+        panel, _ = generate_staggered_panel(HEADLINE)
+        sa = sun_abraham(panel)
+        assert sa.overall.absolute_effect > 0
+        assert sa.overall.p_value < 1e-6, sa.overall.p_value
+
+    def test_pre_periods_are_near_zero(self):
+        cfg = StaggeredPanelConfig(
+            n_units=2000, n_periods=9, cohorts=(4, 7), cohort_weights=(0.5, 0.5),
+            never_treated_share=0.3, effects=(2.0,), noise_sd=0.5, seed=11,
+        )
+        panel, _ = generate_staggered_panel(cfg)
+        sa = sun_abraham(panel)
+        pre = {k: e for k, e in sa.event_study.items() if k < 0}
+        assert pre
+        for k, est in pre.items():
+            assert abs(est.absolute_effect) < 5 * est.std_error, (k, est.absolute_effect)
+
+    def test_min_max_k_filters_periods(self):
+        panel, _ = generate_staggered_panel(HEADLINE)
+        sa = sun_abraham(panel, min_k=-2, max_k=2)
+        assert set(sa.event_study) <= {-2, -1, 0, 1, 2}
+        assert set(sa.weights) <= {0, 1, 2}  # 整体 ATT 只聚合 k>=0
+
+    def test_aggregation_variance_audit_separates_the_two(self):
+        """审计本身要能分辨两种算法：H0 下独立合成的越界率明显更高。
+
+        用**小规模**跑（25 次、300 单元）—— 它测的是"能不能分辨"，
+        不是精确的 size；完整版在 ``run_m3_validation.py`` 里。
+        """
+        from ablab.validation import run_aggregation_variance_audit
+
+        cfg = StaggeredPanelConfig(
+            n_units=300, n_periods=6, cohorts=(2, 4), cohort_weights=(0.5, 0.5),
+            never_treated_share=0.2, effects=(0.0,), noise_sd=1.0,
+        )
+        audit = run_aggregation_variance_audit(cfg, n_trials=25, seed=3)
+        assert audit.naive_reject_rate > audit.influence_reject_rate
+        assert audit.mean_se_understatement > 0.2
+        assert audit.naive_coverage < audit.influence_coverage
 
 
 class TestPretrendTest:

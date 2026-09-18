@@ -29,10 +29,12 @@ from ..causal.synthetic import SCMConfig, generate_scm_scenario, placebo_inferen
 from .aa import wilson_interval
 
 __all__ = [
+    "AggregationVarianceAudit",
     "EstimatorComparison",
     "PretrendAudit",
     "SCMAudit",
     "SensitivityAudit",
+    "run_aggregation_variance_audit",
     "run_staggered_estimator_comparison",
     "run_pretrend_audit",
     "run_scm_audit",
@@ -135,6 +137,108 @@ def run_staggered_estimator_comparison(
         cs_estimates=np.asarray(cs),
         twfe_negative_weight_share=float(np.mean(neg_share)) if neg_share else float("nan"),
         twfe_weight_effect_corr=float(np.mean(corr)) if corr else float("nan"),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 一之二、聚合方差：独立合成会让 size 膨胀多少
+# --------------------------------------------------------------------------- #
+@dataclass
+class AggregationVarianceAudit:
+    """在 H0（真实效应处处为零）下，两种聚合方差算法给出的 I 类错误率。
+
+    为什么值得单独审：整体 ATT 是若干 ``ATT(g,t)`` 的加权和，而它们
+    **共用同一批对照单元、相邻队列还共用基准期** —— 相关性非负。
+    把标准误按 ``sqrt(Σw²se²)`` 独立合成，会**低估** SE，
+    于是"5% 的检验"实际上拒绝得更多。这件事在 ``_att_influence`` 的文档里
+    早就写过（"实测把 size 从 5% 抬到 11%"），但当时只用在了 lead 的联合检验上。
+
+    这里把差别量出来：同一批仿真、同一个点估计，只换方差算法。
+    """
+
+    n_trials: int
+    n_units: int
+    alpha: float
+    #: 用**影响函数**合成（正确）：越界率应当 ≈ alpha
+    influence_reject_rate: float
+    #: 用**独立合成**（旧写法）：越界率会明显高于 alpha
+    naive_reject_rate: float
+    mean_se_influence: float
+    mean_se_naive: float
+    #: 独立合成把 SE 低估的相对幅度（按每个面板取比值再平均）
+    mean_se_understatement: float
+    #: 两种算法下 95% 区间覆盖 0 的比例（H0 下应当 ≈ 95%）
+    influence_coverage: float
+    naive_coverage: float
+
+    def summary(self) -> str:
+        return "\n".join(
+            [
+                f"H0 下两种聚合方差（{self.n_trials} 次仿真，每次 {self.n_units:,} 单元）",
+                f"  影响函数合成：越界率 {self.influence_reject_rate:.4f}"
+                f"（α={self.alpha}），覆盖率 {self.influence_coverage:.4f}",
+                f"  独立合成　　：越界率 {self.naive_reject_rate:.4f}，"
+                f"覆盖率 {self.naive_coverage:.4f}",
+                f"  平均 SE：{self.mean_se_influence:.4f} vs {self.mean_se_naive:.4f}"
+                f"（低估 {self.mean_se_understatement:.1%}）",
+            ]
+        )
+
+
+def run_aggregation_variance_audit(
+    config: StaggeredPanelConfig | None = None,
+    *,
+    n_trials: int = 200,
+    alpha: float = 0.05,
+    seed: int = 0,
+) -> AggregationVarianceAudit:
+    """H0 下比较两种聚合方差的越界率与覆盖率。"""
+    from ..causal.did import callaway_santanna
+
+    cfg = config or StaggeredPanelConfig(
+        n_units=600,
+        n_periods=7,
+        cohorts=(2, 4),
+        cohort_weights=(0.5, 0.5),
+        never_treated_share=0.2,
+        effects=(0.0,),  # 真实效应处处为零
+        noise_sd=1.0,
+    )
+
+    inf_reject = naive_reject = inf_cov = naive_cov = 0
+    ses_inf: list[float] = []
+    ses_naive: list[float] = []
+    for i in range(n_trials):
+        trial_cfg = StaggeredPanelConfig(**{**cfg.__dict__, "seed": seed + i})
+        panel, _truth = generate_staggered_panel(trial_cfg)
+        cs = callaway_santanna(panel, alpha=alpha)
+        effect = cs.overall.absolute_effect
+        se = cs.overall.std_error
+        se_naive = cs.naive_overall_se
+        ses_inf.append(se)
+        ses_naive.append(se_naive)
+
+        z = 1.959963984540054  # 正态 97.5% 分位；大样本下与 t 分位几乎一致
+        inf_reject += int(abs(effect) > z * se)
+        naive_reject += int(abs(effect) > z * se_naive)
+        inf_cov += int(abs(effect) <= z * se)
+        naive_cov += int(abs(effect) <= z * se_naive)
+
+    se_inf = float(np.mean(ses_inf))
+    se_naive = float(np.mean(ses_naive))
+    return AggregationVarianceAudit(
+        n_trials=n_trials,
+        n_units=cfg.n_units,
+        alpha=alpha,
+        influence_reject_rate=inf_reject / n_trials,
+        naive_reject_rate=naive_reject / n_trials,
+        mean_se_influence=se_inf,
+        mean_se_naive=se_naive,
+        mean_se_understatement=float(
+            1.0 - np.mean([n / i for n, i in zip(ses_naive, ses_inf)])
+        ),
+        influence_coverage=inf_cov / n_trials,
+        naive_coverage=naive_cov / n_trials,
     )
 
 

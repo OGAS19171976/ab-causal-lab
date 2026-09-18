@@ -39,6 +39,7 @@ from ablab.causal import (  # noqa: E402
     generate_staggered_panel,
     placebo_inference,
     pretrend_test,
+    sun_abraham,
     synthetic_control,
     trend_sensitivity,
     twfe,
@@ -47,6 +48,7 @@ from ablab.causal import (  # noqa: E402
 from ablab.plotting import bin_edges, label, plt, save, setup_style  # noqa: E402
 from ablab.reporting import for_report  # noqa: E402
 from ablab.validation import (  # noqa: E402
+    run_aggregation_variance_audit,
     run_pretrend_audit,
     run_scm_audit,
     run_sensitivity_audit,
@@ -241,6 +243,9 @@ def main() -> int:
     n_pre = 80 if args.quick else 300
     n_scm = 30 if args.quick else 100
     n_sens = 40 if args.quick else 150
+    # 聚合方差审计比别的贵（每次仿真都要算全部 ATT(g,t) 及其影响函数），
+    # 但它是这一节唯一的证据来源，所以不放进 --quick 里省掉。
+    n_aggvar = 40 if args.quick else 200
 
     setup_style()
     log: list[str] = []
@@ -290,6 +295,28 @@ def main() -> int:
     emit(f"\n### 2. 批量仿真：TWFE vs Callaway-Sant'Anna（{n_est} 次）")
     comparison = run_staggered_estimator_comparison(n_trials=n_est, seed=0)
     emit(comparison.summary())
+
+    # ---- 2.5 交互加权（Sun-Abraham 的聚合）+ 聚合方差 ----------------------- #
+    emit("\n### 2.5 交互加权聚合，以及**聚合方差**用哪种算法")
+    sa = sun_abraham(panel)
+    emit(sa.summary())
+    emit("")
+    emit("  与 CS 的关系：在饱和设定下，IW 聚合与 CS 的事件研究**点估计相同**"
+         "（因为分格估计用的是同一套 2×2）。")
+    emit(f"    实测：CS 整体 ATT = {cs.overall.absolute_effect:+.4f}，"
+         f"IW = {sa.overall.absolute_effect:+.4f}")
+    emit("  真正的差别在**方差的聚合方式**上，下面这组 H0 仿真把它量出来：")
+    emit("")
+    agg_var = run_aggregation_variance_audit(n_trials=n_aggvar, seed=0)
+    emit(agg_var.summary())
+    emit("")
+    emit("  这条差别的意义：整体 ATT 是若干 ATT(g,t) 的加权和，而它们共用对照单元、")
+    emit("  相邻队列还共用基准期 —— 相关性非负。按独立合成算 SE 会低估它，")
+    emit("  于是「名义 5% 的检验」在 H0 下拒绝得远多于 5%。")
+    emit("  **这个 bug 曾经真的在库里**：CS 的整体 SE 就是这么算的，")
+    emit("  而 `_att_influence` 的文档里早就写着「独立合成会严重低估方差」——")
+    emit("  那条教训当时只用在了 lead 的联合检验上，聚合这一步漏掉了。")
+    emit("  现在两条路径都改用影响函数合成，并把「旧算法会是多少」作为诊断一并报出。")
 
     # ---- 3. 平行趋势检验的盲区 --------------------------------------------- #
     emit(f"\n### 3. 平行趋势检验：能发现什么、发现不了什么（{n_pre} 次/场景）")
