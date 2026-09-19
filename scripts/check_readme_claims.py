@@ -67,6 +67,9 @@ CLAIMS: list[tuple[str, str, str]] = [
     ("M4·组级校准：验收结论", "cate_interval_report.md", "对象不同，结论不同"),
     ("M4·组级校准：瓶颈是信号重尾", "cate_interval_report.md", "重尾到不实用"),
     ("M4·组级校准：下一步换 AIPW 信号", "cate_interval_report.md", "AIPW 信号"),
+    ("M4·信号选择：裁剪与 AIPW 的分工", "cate_interval_report.md", "裁剪管尾巴"),
+    ("M4·信号选择：这是一次自我纠正", "cate_interval_report.md", "自我纠正"),
+    ("M4·信号选择：四版本对照表的列", "cate_interval_report.md", "信号 sd"),
     ("数仓：CUPED 与 DWD 明细一致", "warehouse_report.md", "一致"),
     ("数仓：ADS 判据写在报告里", "warehouse_report.md", "判据"),
     # 比值链路（06/07）的数字 —— 它们是"接通了"这件事唯一的实测证据

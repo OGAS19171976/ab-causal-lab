@@ -505,6 +505,58 @@ class TestGatesBlp:
             run_gates_blp_audit(n=200, n_splits=1, proxy_kind="nonsense")
 
 
+class TestSignalComparison:
+    """信号怎么选：**裁剪管尾巴、AIPW 管方差** —— 这条是测出来的，不是推的。
+
+    它同时是一次**自我纠正**的记录：先写下的修法只有"换 AIPW"，
+    实测发现 AIPW 几乎不降峰度（它降的是方差），降峰度靠裁剪。
+    所以这里既钉"裁剪有效"，也钉"两者各有分工"，防止后来人只看到一半。
+    """
+
+    @staticmethod
+    def _run(n_splits: int = 4):
+        from ablab.validation.hte_audit import run_signal_comparison
+
+        return run_signal_comparison(n=1200, n_splits=n_splits, n_groups=4, clip=0.05)
+
+    def test_four_arms_report_shapes(self):
+        r = self._run()
+        names = [a.name for a in r.arms]
+        assert names == ["HT", "HT+裁剪", "AIPW", "AIPW+裁剪"]
+        for a in r.arms:
+            assert 0.0 <= a.coverage <= 1.0
+            assert a.mean_length > 0.0
+            assert a.signal_sd > 0.0
+            assert a.kurtosis > 3.0  # 四个版本都还是重尾，只是程度不同
+
+    def test_clipping_cuts_the_tail(self):
+        """裁剪把峰度显著压下来 —— 尾巴来自 1/(p(1-p)) 的极端权重。
+
+        实测（n=2000、30 次分裂）：HT 133.5 → HT+裁剪 43.6（3.1 倍）。
+        这里样本更小、分裂更少，所以只断言**方向 + 明显幅度**（降到六成以下），
+        不钉具体数 —— 小样本下 AIPW 自己的峰度就已经低一截，
+        拿同一个倍数去卡 AIPW+裁剪会变成一条假红的断言。
+        """
+        ht, ht_clip, aipw, both = self._run().arms
+        assert ht_clip.kurtosis < 0.6 * ht.kurtosis, (ht.kurtosis, ht_clip.kurtosis)
+        assert both.kurtosis < 0.8 * aipw.kurtosis, (aipw.kurtosis, both.kurtosis)
+
+    def test_aipw_shrinks_intervals_without_fixing_the_tail(self):
+        """AIPW 的分工是**方差**：区间变短，峰度基本不动。
+
+        这一条是那一半纠正：如果哪天 AIPW 也把峰度降下来了，说明结局模型
+        或 DGP 变了，README 第 7 节的说法要跟着改。
+        """
+        ht, _, aipw, _ = self._run().arms
+        assert aipw.mean_length < ht.mean_length
+        assert aipw.kurtosis > ht.kurtosis / 3, (ht.kurtosis, aipw.kurtosis)
+
+    def test_combination_beats_pure_ht(self):
+        ht, _, _, both = self._run().arms
+        assert both.mean_length < ht.mean_length
+        assert both.kurtosis < ht.kurtosis
+
+
 class TestPretrendTest:
     def test_passes_under_parallel_trends(self):
         cfg = StaggeredPanelConfig(

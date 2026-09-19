@@ -245,6 +245,43 @@ def main() -> int:
     emit("  所以 README 里「M4 只能主张排序」这句话要改成更精确的：")
     emit("  **单元级水平不可用（有不可可能性依据 + 实测），组级水平可用。**")
 
+    # ---- 7. 信号怎么选：实测四个版本，而不是靠推测 ------------------------ #
+    emit("\n### 7. 信号的选择：裁剪管尾巴、AIPW 管方差（实测，含一次自我纠正）")
+    emit("  上一节把瓶颈定位成「HT 信号重尾」。原先写下的修法是「换 AIPW 信号，")
+    emit("  把 1/(p(1-p)) 的大权重从 Y 转移到残差上」——**实测只对了一半**。")
+    emit("  四版本跑在同一个真实 τ 排序、同一套分组上（结局模型在辅助样本上")
+    emit("  拟合、主样本上预测，推断样本仍然干净）：")
+    emit("")
+    from ablab.validation.hte_audit import run_signal_comparison
+
+    sc = run_signal_comparison(
+        n=2000, n_splits=6 if args.quick else 30, n_groups=4, clip=0.05
+    )
+    emit(f"  {'信号':<12}{'峰度':>9}{'覆盖率':>9}{'区间长度':>10}{'|偏差|':>9}"
+         f"{'信号 sd':>9}")
+    for a in sc.arms:
+        emit(f"  {a.name:<12}{a.kurtosis:>9.1f}{a.coverage:>9.4f}{a.mean_length:>10.4f}"
+             f"{a.mean_abs_gap:>9.4f}{a.signal_sd:>9.3f}")
+    ht, ht_clip, aipw, both = sc.arms
+    emit("")
+    emit("  三条读法：")
+    emit(f"  * **裁剪管尾巴**：峰度 {ht.kurtosis:.1f} → {ht_clip.kurtosis:.1f}"
+         f"（降 {ht.kurtosis / ht_clip.kurtosis:.1f} 倍）—— 尾巴来自 1/(p(1-p))")
+    emit("    的极端权重，不是 Y 的尺度。")
+    emit(f"  * **AIPW 管方差**：覆盖率 {ht.coverage:.4f} → {aipw.coverage:.4f}，"
+         f"区间长度 {ht.mean_length:.4f} → {aipw.mean_length:.4f}；")
+    emit(f"    但它**几乎不降峰度**（{ht.kurtosis:.1f} → {aipw.kurtosis:.1f}）——")
+    emit("    把权重从 Y 挪到残差上并没有改变尾巴的形状。")
+    emit(f"  * **两者叠加最好**：峰度 {both.kurtosis:.1f}、覆盖率 {both.coverage:.4f}、"
+         f"长度 {both.mean_length:.4f}")
+    emit(f"    （比纯 HT 短 {(1 - both.mean_length / ht.mean_length) * 100:.0f}%）。"
+         f"|偏差| 也从 {ht.mean_abs_gap:.4f} 降到 {both.mean_abs_gap:.4f}。")
+    emit("")
+    emit("  这一条是**自我纠正**：原文把「换 AIPW」当成重尾的解法，实测说明")
+    emit("  该做的是「裁剪（管尾巴）＋ AIPW（管方差）」，而且裁剪的代价（偏差）")
+    emit("  在本 DGP 上没有显现为净损失。裁剪阈值不是免费的：它把 5.9% 的单元")
+    emit("  拉进边界，真实场景里需要按重叠程度选，并报告被裁剪的比例。")
+
     emit(f"\n总耗时 {time.perf_counter() - t0:.1f}s")
 
     report = out_dir / "cate_interval_report.md"

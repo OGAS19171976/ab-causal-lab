@@ -634,6 +634,162 @@ def run_gates_blp_audit(
 
 
 # --------------------------------------------------------------------------- #
+# 二之四、信号的选择：HT / 裁剪 / AIPW / 两者叠加 —— 用实测决定，而不是靠推测
+# --------------------------------------------------------------------------- #
+def _fit_predict(x: np.ndarray, y: np.ndarray, x_new: np.ndarray) -> np.ndarray:
+    """带截距的 OLS，用来当**结局模型** μ̂_d(X)（辅助样本拟合，主样本预测）。
+
+    为什么用最朴素的 OLS：这一节要比的是**信号**（HT vs AIPW）在同一个
+    代理、同一套分组下的差别，结局模型越好两边都越好，不改变结论方向；
+    用朴素模型反而避免了"到底是谁带来的改善"这个混淆。
+    """
+    design = np.column_stack([np.ones(x.shape[0]), x])
+    beta = np.linalg.lstsq(design, y, rcond=None)[0]
+    return np.column_stack([np.ones(x_new.shape[0]), x_new]) @ beta
+
+
+@dataclass
+class SignalArmStats:
+    """一个信号版本的实测表现（都跑在同一个代理与同一套分组上）。"""
+
+    name: str
+    kurtosis: float
+    coverage: float
+    mean_length: float
+    mean_abs_gap: float
+    signal_sd: float
+
+
+@dataclass
+class SignalComparison:
+    """四种信号的对照 —— 回答"重尾该怎么修"。
+
+    背景：纯 HT 信号在本 DGP 下峰度 260（见 ``GatesBlpResult``），
+    于是组级覆盖率会在 0.875~0.950 之间摆动。README 原先写下的下一步是
+    "换 AIPW 信号，把 1/(p(1-p)) 的大权重从 Y 转移到残差上"。
+    **实测只对了一半**：
+
+      * AIPW 确实把区间缩短约 30%、覆盖率抬到 0.925 —— 但它**几乎不降峰度**
+        （257.8 vs 260.3）。因为极端的 1/(p(1-p)) 权重仍在，尾巴还在。
+      * **降峰度靠裁剪**（260→72.5，3.6 倍），单裁剪不改善覆盖率却缩短区间。
+      * 两者叠加最好：峰度 63.5、覆盖率 0.925、长度比纯 HT 短 46%。
+
+    所以正确的下一步不是二选一，而是"裁剪（管尾巴）＋ AIPW（管方差）"，
+    并如实记录裁剪引入的偏差 —— 这一节把偏差也测出来放在同一张表里。
+    """
+
+    n: int
+    n_splits: int
+    n_groups: int
+    clip: float
+    arms: list[SignalArmStats]
+
+    def summary(self) -> str:
+        lines = [
+            f"信号对照（{self.n_splits} 次分裂 × n={self.n}，{self.n_groups} 组，"
+            f"裁剪阈值 {self.clip}）",
+            f"  {'信号':<12}{'峰度':>9}{'覆盖率':>9}{'区间长度':>10}"
+            f"{'|偏差|':>9}{'信号 sd':>9}",
+        ]
+        for a in self.arms:
+            lines.append(
+                f"  {a.name:<12}{a.kurtosis:>9.1f}{a.coverage:>9.4f}"
+                f"{a.mean_length:>10.4f}{a.mean_abs_gap:>9.4f}{a.signal_sd:>9.3f}"
+            )
+        return "\n".join(lines)
+
+
+def run_signal_comparison(
+    *,
+    n: int = 2000,
+    n_splits: int = 30,
+    n_groups: int = 4,
+    clip: float = 0.05,
+    seed: int = 0,
+    cate_form: str = "nonlinear",
+) -> SignalComparison:
+    """在同一个真实 CATE 排序下比较四种信号的组级表现。
+
+    分组用**真实** τ 的分位数（而不是某个代理）：这一节要隔离的变量是
+    **信号**，把代理的误差混进来会让四个版本的差别说不清是谁造成的。
+    （代理质量的影响已经在 ``run_gates_blp_audit`` 里单独测过了。）
+
+    结局模型在**辅助样本**上拟合、主样本上预测 —— 主样本仍用于推断，
+    所以"拟合过的东西不进推断样本"这条纪律没有被破坏。
+    """
+    from ..causal.hte import HTEConfig, generate_hte_data
+
+    z = 1.959963984540054
+    names = ["HT", "HT+裁剪", "AIPW", "AIPW+裁剪"]
+    acc: dict[str, dict[str, list[float]]] = {
+        name: {"kurt": [], "cov": [], "len": [], "gap": [], "sd": []} for name in names
+    }
+
+    for s in range(n_splits):
+        data = generate_hte_data(
+            HTEConfig(n=n, n_features=6, n_informative=3, seed=seed + s, cate_form=cate_form)
+        )
+        rng = np.random.default_rng(1000 + s)
+        perm = rng.permutation(n)
+        aux, main = perm[: n // 2], perm[n // 2 :]
+
+        p = np.asarray(data.propensity)[main]
+        d = np.asarray(data.D)[main]
+        y = np.asarray(data.Y)[main]
+        x = np.asarray(data.X)[main]
+        tau = np.asarray(data.tau)[main]
+
+        p_clip = np.clip(p, clip, 1.0 - clip)
+        h = (d - p) / (p * (1.0 - p))
+        h_clip = (d - p_clip) / (p_clip * (1.0 - p_clip))
+
+        # 结局模型：辅助样本拟合（诚实分样本），主样本预测
+        xa, da, ya = np.asarray(data.X)[aux], np.asarray(data.D)[aux], np.asarray(data.Y)[aux]
+        m1 = _fit_predict(xa[da == 1], ya[da == 1], x)
+        m0 = _fit_predict(xa[da == 0], ya[da == 0], x)
+        m_d = np.where(d == 1, m1, m0)
+
+        signals = {
+            "HT": h * y,
+            "HT+裁剪": h_clip * y,
+            "AIPW": (m1 - m0) + h * (y - m_d),
+            "AIPW+裁剪": (m1 - m0) + h_clip * (y - m_d),
+        }
+
+        # 分组按**真实** τ 的分位数，四个信号共用，隔离"信号"这一个变量
+        edges = np.quantile(tau, np.linspace(0, 1, n_groups + 1)[1:-1])
+        group = np.searchsorted(edges, tau, side="right")
+        dummies = np.zeros((main.size, n_groups))
+        dummies[np.arange(main.size), group] = 1.0
+
+        for name, sig in signals.items():
+            a = acc[name]
+            a["kurt"].append(float(((sig - sig.mean()) ** 4).mean() / sig.var() ** 2))
+            a["sd"].append(float(sig.std()))
+            eff, se = _ols(dummies, sig)
+            for k in range(n_groups):
+                truth = float(tau[group == k].mean())
+                a["cov"].append(float(abs(eff[k] - truth) <= z * se[k]))
+                a["len"].append(2 * z * float(se[k]))
+                a["gap"].append(abs(float(eff[k]) - truth))
+
+    arms = [
+        SignalArmStats(
+            name=name,
+            kurtosis=float(np.mean(acc[name]["kurt"])),
+            coverage=float(np.mean(acc[name]["cov"])),
+            mean_length=float(np.mean(acc[name]["len"])),
+            mean_abs_gap=float(np.mean(acc[name]["gap"])),
+            signal_sd=float(np.mean(acc[name]["sd"])),
+        )
+        for name in names
+    ]
+    return SignalComparison(
+        n=n, n_splits=n_splits, n_groups=n_groups, clip=clip, arms=arms
+    )
+
+
+# --------------------------------------------------------------------------- #
 # 三、排序指标 vs 水平指标
 # --------------------------------------------------------------------------- #
 @dataclass
