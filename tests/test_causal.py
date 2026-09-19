@@ -556,6 +556,34 @@ class TestSignalComparison:
         assert both.mean_length < ht.mean_length
         assert both.kurtosis < ht.kurtosis
 
+    def test_aggressive_clipping_alone_breaks_coverage_but_aipw_survives(self):
+        """裁剪阈值选大了会翻车，**但只有单靠裁剪时才翻车**。
+
+        实测（报告第 7b 节，n=2000、20 次分裂）：HT+裁剪的覆盖率从阈值 0.10
+        起就掉（0.8875 → 0.8125 → 0.5375），而 AIPW+裁剪在 0.05~0.20
+        稳在 0.94~0.96。原因是裁剪把极端权重的单元拉进边界、改变了实际
+        覆盖的目标，而结局模型能把那部分偏差补回来。
+
+        这条断言钉的是**交互**，不是某个具体阈值 —— 阈值本身依赖 DGP 的重叠
+        程度，换个场景就该重测，但"裁剪必须先有结局模型兜着"这个结论不变。
+        """
+        small = self._run_with_clip(0.05)
+        large = self._run_with_clip(0.30)
+        _, ht_small, _, _ = small.arms
+        _, ht_large, _, aipw_large = large.arms
+        assert ht_large.coverage < ht_small.coverage, (
+            ht_small.coverage, ht_large.coverage
+        )
+        assert aipw_large.coverage > ht_large.coverage, (
+            ht_large.coverage, aipw_large.coverage
+        )
+
+    @staticmethod
+    def _run_with_clip(clip: float):
+        from ablab.validation.hte_audit import run_signal_comparison
+
+        return run_signal_comparison(n=1200, n_splits=4, n_groups=4, clip=clip)
+
 
 class TestPretrendTest:
     def test_passes_under_parallel_trends(self):
