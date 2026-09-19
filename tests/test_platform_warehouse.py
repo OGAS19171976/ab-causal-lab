@@ -13,6 +13,7 @@
 import sqlite3
 
 import duckdb
+import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
@@ -91,6 +92,167 @@ def registry(work_dir):
     reg = ExperimentRegistry(work_dir / "reg.db")
     yield reg
     reg.close()
+
+
+@pytest.fixture(scope="session")
+def replicate_warehouse_path(project_root):
+    """再建一条**含复制实验**的小数仓（8 个 A/A 复制实验）。
+
+    与 ``warehouse_path`` 一样的规模（``n_users=3000``），这样"复制实验对
+    已有数字零影响"这条声明可以直接把两张 ADS 表逐行比对 —— 声明要有测试。
+    """
+    from ablab.warehouse import (
+        DEFAULT_EXPERIMENTS,
+        WarehouseConfig,
+        build_warehouse,
+        ratio_replicate_experiments,
+    )
+
+    base = project_root / "build" / "_test_tmp" / "warehouse_replicates"
+    base.mkdir(parents=True, exist_ok=True)
+    path = base / "wh_rep.duckdb"
+    config = WarehouseConfig(
+        n_users=3000,
+        experiments=DEFAULT_EXPERIMENTS + ratio_replicate_experiments(8),
+    )
+    con = build_warehouse(
+        path, base / "source", project_root / "sql", config=config,
+        force_data=True, verbose=False,
+    )
+    con.close()
+    return path
+
+
+class TestRatioReplicateCalibration:
+    """比值链路的**序贯校准**：重复实现才是校准，一致性不是。
+
+    6 节那条链路只被证明过"两份实现算得一样"。这一组钉住补上的那一半：
+    100 个（测试里 8 个）真实效应为 0 的复制实验，走完整条真实链路，
+    然后数 FWER / 覆盖 / z 的分布。
+    """
+
+    @staticmethod
+    def _replicates(n: int = 8):
+        from ablab.warehouse import ratio_replicate_experiments
+
+        return ratio_replicate_experiments(n)
+
+    def test_replicate_definitions_are_orthogonal_and_null(self):
+        """复制实验的定义：真实效应为 0、各自独占一层、层与 salt 都不重名。"""
+        reps = self._replicates(8)
+        assert len({e.name for e in reps}) == 8
+        assert len({e.layer for e in reps}) == 8, "每个复制实验必须独占一层"
+        assert len({e.layer_salt for e in reps}) == 8
+        assert all(e.true_lift == 0.0 for e in reps), "A/A 复制实验的真实效应必须是 0"
+        assert all(0 <= e.bucket_start < e.bucket_end <= 10_000 for e in reps)
+
+    def test_replicates_do_not_move_existing_numbers(self, warehouse_path, replicate_warehouse_path):
+        """**零影响声明要有测试**：加了 8 个复制实验，已有实验的 ADS 一行都不能变。
+
+        这条声明有两个支柱（``true_lift=0`` 与"每个复制实验独占一层"），
+        任何一个塌了都会改掉 README 里引用过的数仓数字。所以这里直接
+        逐行比对两边的 ADS 结果表。
+        """
+        import duckdb
+
+        def ads(path):
+            con = duckdb.connect(str(path), read_only=True)
+            try:
+                return con.execute(
+                    "SELECT * FROM ads_experiment_result ORDER BY experiment, variant"
+                ).df()
+            finally:
+                con.close()
+
+        base = ads(warehouse_path)
+        with_rep = ads(replicate_warehouse_path)
+        with_rep = with_rep[~with_rep["experiment"].str.startswith("exp_ratio_rep")]
+        assert list(base.columns) == list(with_rep.columns)
+        base = base.reset_index(drop=True)
+        with_rep = with_rep.reset_index(drop=True)
+
+        # 结构列与计数必须**逐字**相同：它们变了一点，就说明复制实验真的动了别人。
+        for col in ("experiment", "variant", "layer", "hypothesis"):
+            assert (base[col].astype(str) == with_rep[col].astype(str)).all(), col
+        for col in ("user_cnt", "true_lift", "design_weight"):
+            assert np.array_equal(
+                base[col].to_numpy(dtype=float), with_rep[col].to_numpy(dtype=float)
+            ), f"{col} 变了 —— 复制实验影响了已有实验"
+
+        # 可加量的**数值**允许末位差：两份库的表的行数不同，
+        # DuckDB 的并行聚合（threads=4）合并顺序随之不同，而浮点加法不满足结合律。
+        # 这是已知现象（见 build.py 里 threads 那段注释），实测最大相对差 ~5.5e-15。
+        # 卡在 1e-12 上：真出了问题（比如复制实验的曝光混进了别人）差的是**量级**，
+        # 不是末位。**不允许**因此放宽结构列与计数那一半。
+        for col in ("pre_sum", "post_sum", "pre_sq_sum", "post_sq_sum",
+                    "pre_post_cross_sum", "post_mean", "pre_mean", "post_var",
+                    "pre_var", "pre_post_cov"):
+            a = base[col].to_numpy(dtype=float)
+            b = with_rep[col].to_numpy(dtype=float)
+            rel = np.abs(a - b) / np.maximum(np.abs(a), 1e-12)
+            assert rel.max() < 1e-12, f"{col} 相对差 {rel.max():.3e} 超过浮点噪声量级"
+
+    def test_calibration_on_the_real_chain(self, replicate_warehouse_path):
+        """走完整条真实链路跑 8 个 A/A 复制实验，数三个承诺。"""
+        import duckdb
+
+        from ablab.warehouse.ratio_calibration import run_ratio_link_calibration
+
+        con = duckdb.connect(str(replicate_warehouse_path), read_only=True)
+        try:
+            res = run_ratio_link_calibration(con, n_replicates=8, n_looks=5, alpha=0.05)
+        finally:
+            con.close()
+
+        assert res.n_replicates == 8
+        assert 0.0 <= res.fwer <= 1.0
+        assert res.fwer_interval[0] <= res.fwer <= res.fwer_interval[1]
+        assert res.coverage == pytest.approx(1.0 - res.final_rate)
+        assert len(res.final_z) == 8 and len(res.per_look_rate) == 5
+
+        # 信息分数是累计信息量之比：必须单调、末次为 1
+        info = res.information_fractions
+        assert info[-1] == pytest.approx(1.0)
+        assert all(b > a for a, b in zip(info, info[1:])), info
+
+        # **M6.1 的不变量**：末次查看 = 主结论，逐位相同，一个复制实验都不能漏
+        assert res.last_look_matches_primary == 1.0
+
+        # z 的诊断要有意义（8 个点量不出 1.0，但必须有限且不是常数）
+        assert 0.0 < res.z_sd_final < 5.0
+        assert abs(res.salt_agreement - 0.5) < 0.05, res.salt_agreement
+        assert res.salt_pairs == 28, "8 个复制实验应有 C(8,2)=28 对"
+        assert res.arm_share_chi2 > 0
+
+    def test_calibration_rejects_degenerate_inputs(self, replicate_warehouse_path):
+        import duckdb
+        import pytest as _pytest
+
+        from ablab.warehouse.ratio_calibration import run_ratio_link_calibration
+
+        con = duckdb.connect(str(replicate_warehouse_path), read_only=True)
+        try:
+            with _pytest.raises(ValueError, match="至少"):
+                run_ratio_link_calibration(con, n_replicates=1)
+        finally:
+            con.close()
+
+    def test_replicate_prefix_is_what_the_loader_looks_for(self, replicate_warehouse_path):
+        """校准按前缀认人 —— 前缀写错就会**静默**只看一个实验。"""
+        import duckdb
+
+        from ablab.warehouse import RATIO_REPLICATE_PREFIX
+
+        con = duckdb.connect(str(replicate_warehouse_path), read_only=True)
+        try:
+            n = con.execute(
+                "SELECT COUNT(DISTINCT experiment) FROM ads_experiment_result"
+                " WHERE experiment LIKE ?",
+                [f"{RATIO_REPLICATE_PREFIX}%"],
+            ).fetchone()[0]
+        finally:
+            con.close()
+        assert n == 8
 
 
 # --------------------------------------------------------------------------- #

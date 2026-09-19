@@ -117,6 +117,21 @@ ITEMS: tuple[UnimplementedItem, ...] = (
         when_done="README 要补相对幅度/平滑约束版本的实测",
     ),
     UnimplementedItem(
+        id="ratio_replicates_with_lift",
+        readme_phrase="数仓的比值复制实验只能校准零效应",
+        kind="symbol_absent",
+        target="ablab.warehouse.generate.ratio_replicate_experiments_with_lift",
+        anchor_present="ablab.warehouse.generate.ratio_replicate_experiments",
+        when_done=(
+            "README 要改成「复制实验也能校准真实效应」，"
+            "并给出功效/覆盖的实测（那时复制实验走的是自己的事件名与自己的 DWD 链路）"
+        ),
+        notes=[
+            "只钉「没有带真实效应的复制实验生成器」，"
+            "不声称「比值链路没有被校准」—— 零效应那一半是量过的（6b 节）",
+        ],
+    ),
+    UnimplementedItem(
         id="no_real_traffic_code",
         readme_phrase="全部数据都是合成数据",
         kind="text_absent",

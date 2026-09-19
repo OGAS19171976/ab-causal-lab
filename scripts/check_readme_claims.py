@@ -61,6 +61,20 @@ CLAIMS: list[tuple[str, str, str]] = [
     # 把数字写进清单就会让检查器在快速模式下随机变红（第 31 条那个坑）。
     ("M4·CATE 区间：结论是「校准不了」", "cate_interval_report.md", "但它校准不了"),
     ("M4·CATE 区间：结论并进了 M4 报告", "m4_validation.md", "CATE 的区间：两条路线的覆盖率"),
+    # 数仓比值链路的**序贯校准**（100 个 A/A 复制实验走真实链路）。
+    # 这一份报告不带 --quick 以外的开关，数字稳定，所以可以直接钉数值。
+    ("数仓·比值链路：序贯 FWER（100 个 A/A 复制实验）",
+     "warehouse_report.md", "序贯 FWER = 0.0400"),
+    ("数仓·比值链路：末次区间覆盖 0",
+     "warehouse_report.md", "末次区间覆盖 0 的比例 0.9600"),
+    ("数仓·比值链路：末次 z 的 sd（SE 诚实的证据）",
+     "warehouse_report.md", "sd 1.0487"),
+    ("数仓·比值链路：salt 独立性（同臂一致率）",
+     "warehouse_report.md", "同臂一致率 0.500004"),
+    ("数仓·比值链路：100 个 salt 的过度离散检验",
+     "warehouse_report.md", "chi2 = 105.36"),
+    ("数仓·比值链路：零效应的校准边界（真实效应未做）",
+     "warehouse_report.md", "所以它只能校准零效应"),
     ("M4·CATE 区间：主因是点估计有偏（方差另有一处，见下）",
      "cate_interval_report.md", "而是**点估计有偏**"),
     # 森林的跨树方差（第 19 节）。同样只加文本类声明：8c 节的数值随
@@ -126,7 +140,7 @@ CLAIMS: list[tuple[str, str, str]] = [
     ("治理·决策层：护栏能停实验", "governance_report.md", "决策层：护栏触发"),
     ("治理·决策层：服务端复核", "governance_report.md", "服务端自己复核"),
     ("治理·没做清单：检查器会抓过时声明", "governance_report.md", "没做」的清单"),
-    ("治理·没做清单：8 条机检", "governance_report.md", "机检 8 条"),
+    ("治理·没做清单：9 条机检", "governance_report.md", "机检 9 条"),
     # 数仓护栏链路：两臂均值与"事件名过滤"是稳定的
     ("数仓·护栏：长表链路", "warehouse_report.md", "护栏链路"),
     ("数仓·护栏：注入的伤害可见", "warehouse_report.md", "latency_p99"),

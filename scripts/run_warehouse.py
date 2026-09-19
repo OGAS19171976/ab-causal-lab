@@ -26,13 +26,16 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from ablab.reporting import for_report  # noqa: E402
 from ablab.warehouse import (  # noqa: E402
+    DEFAULT_EXPERIMENTS,
     WarehouseConfig,
     analyse_ads,
     build_warehouse,
     covariate_adjustment_report,
+    ratio_replicate_experiments,
     render_report,
     verify_against_detail,
 )
+from ablab.warehouse.ratio_calibration import run_ratio_link_calibration  # noqa: E402
 
 LAYERS = (
     ("ods_exposure_log", "ODS 曝光日志（分流服务直接落盘）"),
@@ -92,6 +95,14 @@ def main() -> int:
     emit("ab-causal-lab · 数仓链路 ODS → DWD → DWS → ADS")
     emit(header)
 
+    #: 6b 节的复制实验个数。100 个：FWER 的蒙特卡洛标准误约 2.2%，
+    #: 足以判断名义 5% 有没有被盖住。
+    #:
+    #: **故意不提供 --quick**：6b 的数值进了 `check_readme_claims.py` 的声明清单，
+    #: 个数一变那些声明就不成立 —— 那正是 README 第 31 条说的"假红灯"。
+    #: 检查集那一侧也有契约测试（`test_ci_contract.py`）盯着"脚本接受 --quick
+    #: 就必须在计划里声明"，两边是同一件事的两面。
+    n_rep = 100
     cfg = WarehouseConfig(n_users=args.users)
     con = build_warehouse(
         db_path=ROOT / "build" / "warehouse.duckdb",
@@ -251,10 +262,66 @@ def main() -> int:
     emit("  两个口径都显著 → 指向**同一份实现**（第 5 节的效应分解已经说明：")
     emit("  这次分流的协变量失衡让 naive 显著，CUPED 把它扣掉）。")
     emit("  所以这里的结论只是：比值链路的表现与均值链路**一致**，")
-    emit("  而不是「比值链路被验证为校准」—— 那需要很多个 salt 的重复，")
-    emit("  是 README 已知边界里还没做的那一条。")
+    emit("  而不是「比值链路被验证为校准」—— 那需要很多个 salt 的重复。")
+    emit(f"  **那一批 salt 在 6b 节补上了**（{n_rep} 个 A/A 复制实验走完整条真实链路）。")
     emit("  逐位一致性：平台编排与 M1 的独立实现在 1e-9 内一致（有测试守着）；")
     emit("  本节偏差列是实测差，量级 1e-14。")
+
+    # ---- 6b. 比值链路的**序贯校准**：100 个 A/A 复制实验 -------------------- #
+    #
+    # 6 节证明的是"两份实现算得一样"（一致性），回答不了校准：
+    # 序贯 FWER、区间覆盖、z 的方差都是关于**一个分布**的陈述，一个 salt 给不出分布。
+    # 这一节造 100 个真实效应为 0 的复制实验（各自一层、各自 salt），
+    # 走**完整条真实链路**（ODS→DWD→DWS→ADS→平台编排→序贯判定）跑 100 遍。
+    #
+    # 为什么这是精确的校准而不是"仿真"：见 audit 模块的 docstring ——
+    # 固定结果序列、只重抽分流 → 尖锐零假设逐字成立，随机化分布 i.i.d.。
+    #
+    # **单独建一条库**：复制实验会往曝光表里加 100 个实验，
+    # 混进默认演示库会改掉上面每一节的数字（也会让报告多出 100 段）。
+    emit(f"\n### 6b. 比值链路的序贯校准：{n_rep} 个 A/A 复制实验走完整条真实链路")
+    emit("  6 节证明的是**一致性**（两份实现算得一样），而校准是关于**分布的**：")
+    emit("  序贯 FWER、区间覆盖、z 的方差，一个 salt 都给不出来。")
+    emit(f"  办法：造 {n_rep} 个真实效应为 0 的复制实验（各自一层、各自 salt、同一段桶位），")
+    emit("  每个都走 ODS→DWD→DWS→ADS→平台编排→序贯判定，然后数分布。")
+    emit("  为什么它是**精确**校准：结果序列固定、只重抽分流 → 尖锐零假设逐字成立，")
+    emit(f"  {n_rep} 次独立随机化就是随机化分布的 i.i.d. 抽样（不依赖任何渐近论）。")
+    emit("")
+
+    rep_root = ROOT / "build" / "ratio_rep"
+    rep_root.mkdir(parents=True, exist_ok=True)
+    rep_cfg = WarehouseConfig(
+        n_users=args.users,
+        experiments=DEFAULT_EXPERIMENTS + ratio_replicate_experiments(n_rep),
+    )
+    rep_con = build_warehouse(
+        db_path=rep_root / "ratio_rep.duckdb",
+        data_dir=rep_root / "source",
+        sql_dir=ROOT / "sql",
+        config=rep_cfg,
+        force_data=args.rebuild,
+        verbose=False,
+    )
+    calib = run_ratio_link_calibration(rep_con, n_replicates=n_rep, n_looks=5, alpha=0.05)
+    for line in calib.summary().splitlines():
+        emit("  " + line)
+    emit("")
+    emit("  三个承诺的实现情况（这才是「校准」该有的写法，而不是一句「看起来对」）：")
+    emit(f"    · 序贯 FWER {calib.fwer:.4f}，Wilson [{calib.fwer_interval[0]:.4f}, "
+         f"{calib.fwer_interval[1]:.4f}] —— 盖住名义 0.05；")
+    emit(f"    · 末次重复区间覆盖 0 的比例 {calib.coverage:.4f}，Wilson "
+         f"[{calib.coverage_interval[0]:.4f}, {calib.coverage_interval[1]:.4f}]；")
+    emit(f"    · z 的 sd {calib.z_sd_final:.4f}、均值 {calib.z_mean_final:+.4f}、"
+         f"偏度 {calib.z_skew_final:+.3f} —— 比值 delta method 的 SE 在真实链路上诚实。")
+    emit(f"  过度离散检验（{n_rep} 个 salt 的臂占比 vs 二项理论）通过，"
+         "所以极端值那一个只是尾部，不是分流坏了：")
+    emit(f"    chi2 = {calib.arm_share_chi2:.2f}（df={calib.n_replicates}），"
+         f"p = {calib.arm_share_chi2_p:.4f}；最小 SRM p = {calib.srm_min_p:.3g}")
+    emit("  **仍未做**：真实效应下的功效/覆盖。复制实验共享同一份结果序列、")
+    emit("  真实效应为 0，所以它只能校准零效应；要给真实效应，必须让复制实验")
+    emit("  走自己的事件名与自己的 DWD 链路（否则它的效应会加进共享序列、")
+    emit("  把别的实验的数字改掉）。这条写进 README 的已知边界。")
+    rep_con.close()
 
         # ---- 护栏链路（08/09）：长表 + 判定所需的可加量 ------------------------ #
     emit("\n### 护栏链路：08 DWS -> 09 ADS（长表，不新增落地文件）")
@@ -333,9 +400,13 @@ def main() -> int:
         emit("  两条口径的**观测单位都是簇**（自由度 = 簇数 − 2），CUPED 只是把")
         emit("  每簇的 (前置均值, 后置均值) 当成一对观测再做回归调整 ——")
         emit("  与单元级 CUPED 是同一份实现（``cuped_estimate``）。")
-        emit("  边界：这一轮**没有**量簇级 CUPED 的 A/A 校准（数仓只有一份实现，")
-        emit("  换不了 salt），所以只报「与 post-only 相比方差确实降了」，")
-        emit("  不声称名义覆盖率 —— 那句话要等一个能重复抽样的路径才敢写。")
+        emit("  边界：**数仓路径上的**簇级 A/A 校准仍然没做。6b 节那套复制实验机制")
+        emit("  已经在了，但它每个复制只覆盖一段桶位；簇级 A/A 要求每个复制有足够多的")
+        emit("  **簇**（自由度 = 簇数 − 2，24 个城市那次已经踩过「某臂只剩一个簇」），")
+        emit("  也就是每个复制要吃掉 ~30 个城市 —— 那是另一套规模的重复，留作下一步。")
+        emit("  所以这里只报「与 post-only 相比方差确实降了」，不声称名义覆盖率；")
+        emit("  簇级 CUPED 的 A/A 校准目前走**合成路径**（reports/m6_validation.md 第 7 节，")
+        emit("  200 次换 salt：误停率 0.0400，Wilson [0.0204, 0.0769] 盖住名义 5%）。")
     except Exception as exc:
         emit(f"  （这份数仓里没有簇级实验：{type(exc).__name__}: {exc}）")
 

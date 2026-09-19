@@ -156,9 +156,10 @@ ab-causal-lab · 治理验证：操作审计（append-only）+ 护栏指标显�
   [OK  ] msprt_tau_choice: 符号 ablab.inference.tests.choose_tau 仍不存在 ✓
   [OK  ] scm_time_placebo: 符号 ablab.causal.synthetic.time_placebo 仍不存在 ✓
   [OK  ] sensitivity_smoothness: 符号 ablab.causal.sensitivity.rambachan_roth_smoothness 仍不存在 ✓
+  [OK  ] ratio_replicates_with_lift: 符号 ablab.warehouse.generate.ratio_replicate_experiments_with_lift 仍不存在 ✓
   [OK  ] no_real_traffic_code: src/ 下没有「load_real_traffic」✓
 
-  机检 8 条『没做』：8 条仍成立，0 条已经过时。
+  机检 9 条『没做』：9 条仍成立，0 条已经过时。
   另有 3 条**无法机检**、只能人读 ——清单不假装覆盖它们。
   退出码：0（0 = 清单与事实一致）
 

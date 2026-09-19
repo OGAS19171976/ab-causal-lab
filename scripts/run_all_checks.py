@@ -132,6 +132,9 @@ def steps() -> list[Step]:
         ),
         Step("claims", "README 里的关键数字能否在 reports/ 里找到",
              (py, "scripts/check_readme_claims.py")),
+        # 数仓这一步**故意不接受 --quick**：6b 节的比值链路校准（100 个 A/A
+        # 复制实验）有数值进了声明清单，快速模式下个数变少、那些数就不成立了
+        # —— 那正是第 31 条说的"假红灯"。脚本自己留了 --quick 供人工冒烟。
         Step("warehouse", "数仓链路（m5/m6 的前提）",
              (py, "scripts/run_warehouse.py")),
         Step("gov", "治理：操作审计（append-only）+ 护栏指标显式化",

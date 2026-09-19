@@ -374,3 +374,44 @@ class TestIdempotency:
         second = con.execute("SELECT COUNT(*) FROM dwd_experiment_user").fetchone()[0]
         con.close()
         assert first == second
+
+    def test_cache_marker_carries_the_config_fingerprint(self, work_dir):
+        """**换配置就必须重建**，不能沿用上一份配置的落地文件。
+
+        这一条是踩出来的：先用 ``--quick``（12 个复制实验）建了一次，
+        再跑默认（100 个）时缓存被复用，SQL 链只建出 12 个复制实验，
+        直到平台去读第 13 个才报 ``数仓 ADS 里找不到实验``。
+        报错直白算是运气好 —— 把 ``--users 50000`` 写成复用 20,000 的数据，
+        就只会得到一个"看起来正常"的数字。
+
+        同时钉住反面：**只改假设文字不该触发重建**（否则改文案会白跑一遍，
+        而"为什么又重算了"本身也是噪音）。
+        """
+        from dataclasses import replace
+
+        from ablab.warehouse.generate import (
+            DEFAULT_EXPERIMENTS,
+            config_fingerprint,
+            generate_source_data,
+        )
+
+        small = WarehouseConfig(n_users=400, seed=7)
+        big = WarehouseConfig(n_users=900, seed=7)
+        assert config_fingerprint(small) != config_fingerprint(big)
+
+        data_dir = work_dir / "src"
+        first = generate_source_data(data_dir, small)
+        assert first["user_profile"] == 400
+        assert generate_source_data(data_dir, small) == {"__cached__": 1}
+
+        second = generate_source_data(data_dir, big)
+        assert second["user_profile"] == 900, "换了配置却复用了缓存"
+
+        # 只改 hypothesis（不影响数据）→ 仍然复用
+        renamed = replace(
+            big,
+            experiments=tuple(
+                replace(e, hypothesis=e.hypothesis + "（说法变了）") for e in DEFAULT_EXPERIMENTS
+            ),
+        )
+        assert generate_source_data(data_dir, renamed) == {"__cached__": 1}

@@ -20,9 +20,11 @@ from .build import (
 )
 from .generate import (
     DEFAULT_EXPERIMENTS,
+    RATIO_REPLICATE_PREFIX,
     ExperimentDef,
     WarehouseConfig,
     generate_source_data,
+    ratio_replicate_experiments,
 )
 
 __all__ = [
@@ -39,6 +41,8 @@ __all__ = [
     "split_statements",
     "verify_against_detail",
     "DEFAULT_EXPERIMENTS",
+    "RATIO_REPLICATE_PREFIX",
+    "ratio_replicate_experiments",
     "ExperimentDef",
     "WarehouseConfig",
     "generate_source_data",

@@ -19,6 +19,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -138,6 +140,58 @@ DEFAULT_EXPERIMENTS: tuple[ExperimentDef, ...] = (
 )
 
 
+#: 复制实验的名字前缀。校准脚本按它从数仓里认人，别随手改。
+RATIO_REPLICATE_PREFIX = "exp_ratio_rep"
+
+
+def ratio_replicate_experiments(
+    n: int,
+    *,
+    prefix: str = RATIO_REPLICATE_PREFIX,
+    bucket_span: int = 2_000,
+) -> tuple[ExperimentDef, ...]:
+    """造 ``n`` 个 **A/A 复制实验**：真实效应为 0，各自独占一层。
+
+    为什么要造它们：数仓的比值链路（06 / 07 两路 SQL）当初只被"平台编排与
+    独立实现算出同一个数"证明过**一致性**，而**校准**（序贯监控的 FWER、
+    区间覆盖、z 的方差）需要**重复实现** —— 一个 salt 只能给一个数，
+    给不出分布。报告里那句"比值链路被验证为校准需要很多个 salt 的重复"
+    指的就是这批东西。
+
+    两个性质决定了它对**已有数字零影响**，缺一不可：
+
+    1. ``true_lift=0`` —— 它不给 ``post_effect`` 加任何东西，所以
+       ``interaction`` 那条共享事件序列逐位不变。反过来说，**这个设计只能
+       校准零效应**：要给真实效应，必须让复制实验走自己的事件名和自己的
+       DWD 链路（否则它的效应会加进共享序列、把别的实验的数字改掉）。
+    2. 每个复制实验独占一层（各自的 ``layer_salt``）→ 与已有实验正交，
+       不改变任何已有实验的分流。
+
+    每个复制实验都取同一段桶位 ``[0, bucket_span)``：桶位是**各自层内**的
+    哈希位置，而层 salt 不同，所以它们路由到的是**不同的用户集合**，
+    规模相当、彼此独立 —— 这正是"同一批 salt 的重复实验"该有的样子。
+    """
+    if n < 1:
+        raise ValueError("复制实验个数必须为正")
+    if not 0 < bucket_span <= 10_000:
+        raise ValueError(f"bucket_span 必须落在 (0, 10000]，收到 {bucket_span}")
+    out: list[ExperimentDef] = []
+    for i in range(n):
+        name = f"{prefix}{i:03d}"
+        out.append(
+            ExperimentDef(
+                name=name,
+                layer=f"ratio_rep{i:03d}",
+                layer_salt=f"layer_ratio_rep{i:03d}",
+                bucket_start=0,
+                bucket_end=bucket_span,
+                true_lift=0.0,
+                hypothesis="A/A 复制实验：真实效应为 0，用于校准比值链路的序贯监控",
+            )
+        )
+    return tuple(out)
+
+
 @dataclass(frozen=True)
 class WarehouseConfig:
     """仿真源数据的超参数。"""
@@ -177,6 +231,56 @@ class WarehouseConfig:
     experiments: tuple[ExperimentDef, ...] = DEFAULT_EXPERIMENTS
 
 
+def config_fingerprint(cfg: WarehouseConfig) -> str:
+    """把**会影响落地数据**的那部分配置压成一个指纹。
+
+    为什么必须有它：``.generated`` 标记原来只是一个空文件，于是
+    "换了配置但复用了缓存"会**静默**发生。这不是假想的 —— 本轮就踩了：
+    先用 ``--quick``（12 个复制实验）建了一次，再跑默认（100 个）时缓存被复用，
+    SQL 链只建出 12 个复制实验，直到平台去读第 13 个才报
+    ``数仓 ADS 里找不到实验 'exp_ratio_rep012'``。
+    那次报错很直白，但把 ``--users 50000`` 写成复用 20,000 的数据，
+    就只会得到一个"看起来正常"的数 —— 这正是本仓库反复在防的那类静默错误。
+
+    指纹只装**决定数据的东西**：用户数、种子、窗口、活跃度参数、城市表，
+    以及每个实验的名字/分层/桶位/真实效应/簇键/护栏。
+    注释、假设文字这类不影响数据的内容**不进**指纹，否则改一句文案就会
+    触发一次无意义的重建（而且会让"为什么又重算了"变成噪音）。
+    """
+    payload = {
+        "n_users": cfg.n_users,
+        "seed": cfg.seed,
+        "start_ds": cfg.start_ds.isoformat(),
+        "entry_span_days": cfg.entry_span_days,
+        "pre_days": cfg.pre_days,
+        "post_days": cfg.post_days,
+        "daily_active_p": cfg.daily_active_p,
+        "user_level_mean": cfg.user_level_mean,
+        "user_level_sd": cfg.user_level_sd,
+        "daily_noise_sd": cfg.daily_noise_sd,
+        "cities": list(cfg.cities),
+        "experiments": [
+            {
+                "name": e.name,
+                "layer": e.layer,
+                "layer_salt": e.layer_salt,
+                "bucket": [e.bucket_start, e.bucket_end],
+                "true_lift": e.true_lift,
+                "cluster_key": e.cluster_key,
+                "control": e.control,
+                "treatment": e.treatment,
+                "guardrails": [
+                    [g.name, g.direction, g.max_harm, g.baseline, g.harm, g.noise]
+                    for g in e.guardrails
+                ],
+            }
+            for e in cfg.experiments
+        ],
+    }
+    blob = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()[:16]
+
+
 def generate_source_data(
     data_dir: str | Path,
     config: WarehouseConfig | None = None,
@@ -195,8 +299,17 @@ def generate_source_data(
     cfg = config or WarehouseConfig()
     out = Path(data_dir)
     marker = out / ".generated"
+    fingerprint = config_fingerprint(cfg)
     if marker.exists() and not force:
-        return {"__cached__": 1}
+        cached = marker.read_text(encoding="utf-8").strip()
+        if cached == fingerprint:
+            return {"__cached__": 1}
+        # 指纹对不上就得重建：**不能**沿用别人配置留下的落地文件。
+        # （旧版本的标记是个空文件，内容对不上指纹 → 这里也会重建一次。）
+        if cached:
+            print(
+                f"  [源数据] 缓存指纹不匹配（{cached} != {fingerprint}）→ 重新生成"
+            )
 
     rng = np.random.default_rng(cfg.seed)
     n = cfg.n_users
@@ -418,7 +531,8 @@ def generate_source_data(
         target.mkdir(parents=True, exist_ok=True)
         frame.to_parquet(target / "part-0000.parquet", index=False)
 
-    marker.write_text("ok", encoding="utf-8")
+    # 标记里存**配置指纹**而不是 "ok"：下次复用缓存前先核对配置，对不上就重建。
+    marker.write_text(fingerprint, encoding="utf-8")
     return {
         "exposure_log": len(exposures),
         "event_log": len(event),
