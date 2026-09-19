@@ -466,6 +466,132 @@ class TestWarehouseAnalysisUnit:
         assert "不是整簇随机化" in r.json()["detail"]
 
 
+class TestWarehouseGuardrails:
+    """数仓护栏链路（08 DWS -> 09 ADS -> 判定）：**接上了，而且没有污染主指标**。
+
+    这一组里最重要的一条不是"护栏能读出来"，而是
+    ``test_guardrail_events_do_not_pollute_the_main_metric``：
+    护栏事件与主指标共用一张 ODS 事件表（长表），而 01 路 DWD 一开始**没有**
+    按 event_name 过滤 —— 于是护栏的取值（延迟 ~100ms）被加进了主指标，
+    效应从 +27.2 变成 +161，而一切看起来都"正常显著"。
+    这条测试把那个过滤条件钉住。
+    """
+
+    def test_guardrail_tables_exist_and_are_declared_only(self, warehouse_con):
+        """08/09 两张表存在；且只包含**被声明**的护栏（配置维表说了算）。"""
+        declared = {
+            r[0]
+            for r in warehouse_con.execute(
+                "SELECT DISTINCT guardrail FROM dim_guardrail_config"
+            ).fetchall()
+        }
+        assert declared, "演示配置里应当声明了护栏"
+        produced = {
+            r[0]
+            for r in warehouse_con.execute(
+                "SELECT DISTINCT guardrail FROM ads_experiment_guardrail_result"
+            ).fetchall()
+        }
+        assert produced <= declared, (produced, declared)
+        assert produced, "ADS 里应当有护栏数据"
+
+    def test_guardrail_events_do_not_pollute_the_main_metric(self, warehouse_con):
+        """主指标只算 ``interaction`` 事件 —— 否则护栏取值会混进来。
+
+        实测（不加过滤时）：效应 +27.2 -> +161。两个数都"显著"，
+        所以这类错误不会被显著性检查发现，只能靠这条不变量。
+        """
+        rows = warehouse_con.execute(
+            "SELECT DISTINCT event_name FROM ods_event_log ORDER BY 1"
+        ).fetchall()
+        names = {r[0] for r in rows}
+        assert "interaction" in names
+        assert len(names) > 1, "护栏事件应当也在事件表里（长表），否则这条测试没意义"
+        # DWD 的主指标必须与"只算 interaction"完全一致
+        total = warehouse_con.execute(
+            "SELECT SUM(post_metric) FROM dwd_experiment_user"
+        ).fetchone()[0]
+        only_interaction = warehouse_con.execute(
+            """
+            SELECT SUM(metric_value) FROM ods_event_log
+            WHERE event_name = 'interaction' AND metric_value > 0
+            """
+        ).fetchone()[0]
+        # 粗粒度数量级校验：两者必须同量级；一旦护栏混入，量级会翻几倍
+        assert total < only_interaction * 1.5, (total, only_interaction)
+
+    def test_guardrail_harm_is_visible_in_the_ads(self, warehouse_con):
+        """注入的 +12% 伤害必须在 ADS 的均值上看得出来（可核对）。"""
+        rows = dict(
+            (
+                (r[0], r[1]),
+                (int(r[2]), float(r[3])),
+            )
+            for r in warehouse_con.execute(
+                """
+                SELECT variant, guardrail, user_cnt, value_mean
+                FROM ads_experiment_guardrail_result
+                WHERE experiment = 'exp_rank_v2' AND guardrail = 'latency_p99'
+                """
+            ).fetchall()
+        )
+        c_n, c_mean = rows[("control", "latency_p99")]
+        t_n, t_mean = rows[("treatment", "latency_p99")]
+        assert c_n > 1000 and t_n > 1000
+        assert 0.10 < (t_mean - c_mean) / c_mean < 0.14, (c_mean, t_mean)
+
+    def test_warehouse_path_judges_guardrails_and_recommends_stopping(self):
+        """走真实数仓路径：判定 fail，并给出"建议停止实验"。"""
+        import duckdb
+
+        from ablab.platform.analysis import analyse_experiment_from_warehouse
+        from ablab.platform.api import default_warehouse_path
+        from ablab.platform.guardrails import GuardrailSpec
+        from ablab.platform.registry import ExperimentRecord
+
+        path = default_warehouse_path()
+        if not path.exists():
+            import pytest
+
+            pytest.skip("没有数仓文件")
+        con = duckdb.connect(str(path), read_only=True)
+        try:
+            rec = ExperimentRecord(
+                name="exp_rank_v2",
+                variants=list(TWO_ARM),
+                salt="exp_rank_v2_v1",
+                primary_metric="interaction_per_user_14d",
+                warehouse_experiment="exp_rank_v2",
+                guardrails=["latency_p99", "complaint_rate"],
+                guardrail_specs=[
+                    GuardrailSpec("latency_p99", "lower_is_better", 0.05),
+                    GuardrailSpec("complaint_rate", "lower_is_better", 0.10),
+                ],
+            )
+            report = analyse_experiment_from_warehouse(rec, con)
+        finally:
+            con.close()
+        item = next(c for c in report.checks if c.name == "护栏指标")
+        assert item.status == "fail", item.message
+        assert report.health == "fail"
+        assert "停止实验" in item.message
+        assert "latency_p99" in item.message
+
+    def test_missing_guardrail_table_degrades_to_unknown(self):
+        """读不到护栏数据时返回空字典 -> 判 unknown（不是通过）。"""
+        import duckdb
+
+        from ablab.platform.datasource import _warehouse_guardrail_data
+
+        con = duckdb.connect(":memory:")
+        try:
+            # 内存库里没有 09 路表：这不是错误，而是"这份数据源还没有护栏"
+            series = _warehouse_guardrail_data(con, "exp_x", "control", "treatment")
+        finally:
+            con.close()
+        assert series == {}
+
+
 class TestWarehouseRatioMetric:
     """比值指标在**数仓侧**也要走对口径（M1 的独立实现当裁判）。
 

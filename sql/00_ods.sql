@@ -42,6 +42,17 @@ FROM read_parquet('{DATA_DIR}/user_profile/*.parquet');
 -- 设计权重必须来自**实验配置**，而不是从观测数据反推 ——
 -- 反推出来的权重会让 SRM 卡方恒等于 0，什么也检验不出来。
 -- ============================================================================
+-- 护栏声明维表：名字由业务定，所以是长表；方向与容忍度**必须显式声明**。
+-- 这张表回答的是"哪些护栏是被声明的"——08 路只认它给的名单，
+-- 而不是"事件里出现过什么"，免得一个误埋的事件名悄悄变成一条护栏。
+CREATE OR REPLACE VIEW dim_guardrail_config AS
+SELECT
+    CAST(experiment AS VARCHAR)  AS experiment,
+    CAST(guardrail AS VARCHAR)   AS guardrail,
+    CAST(direction AS VARCHAR)   AS direction,
+    CAST(max_harm AS DOUBLE)     AS max_harm
+FROM read_parquet('{DATA_DIR}/guardrail_config/*.parquet');
+
 CREATE OR REPLACE VIEW dim_experiment_config AS
 SELECT
     CAST(experiment AS VARCHAR)     AS experiment,

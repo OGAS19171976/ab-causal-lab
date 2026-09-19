@@ -58,6 +58,18 @@ def scalar(con, sql: str) -> int:
     return int(row[0])
 
 
+def _guardrail_harm_from_rows(rows, guardrail: str) -> float:
+    """从 ADS 行算某条护栏的相对伤害（只用于报告展示）。
+
+    方向假定 ``lower_is_better``（演示里两条都是），因为这里只打印，
+    真正判定在 ``ablab/platform/guardrails.py``（按声明的方向折算）。
+    """
+    means = {v: m for g, v, _n, m in rows if g == guardrail}
+    if "control" not in means or "treatment" not in means or not means["control"]:
+        return float("nan")
+    return float(means["treatment"] / means["control"] - 1.0)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="构建数仓链路并输出实验结论")
     ap.add_argument("--users", type=int, default=20_000, help="合成用户数")
@@ -243,6 +255,45 @@ def main() -> int:
     emit("  是 README 已知边界里还没做的那一条。")
     emit("  逐位一致性：平台编排与 M1 的独立实现在 1e-9 内一致（有测试守着）；")
     emit("  本节偏差列是实测差，量级 1e-14。")
+
+        # ---- 护栏链路（08/09）：长表 + 判定所需的可加量 ------------------------ #
+    emit("\n### 护栏链路：08 DWS -> 09 ADS（长表，不新增落地文件）")
+    emit("  护栏与主指标**共用一张事件表**（event_name = 护栏名），所以：")
+    emit("    · 不需要新的 Parquet 与新的 ODS 视图，08 路一条 GROUP BY 就够；")
+    emit("    · 代价是 01 路 DWD **必须**按 event_name = 'interaction' 过滤 ——")
+    emit("      不加这一条，护栏的取值（延迟 ~100ms）会被加进主指标：")
+    emit("      实测效应从 +27.2 变成 +161，而两个数都「正常显著」。")
+    emit("      这类错误显著性检查发现不了，只能靠不变量（有测试钉着）。")
+    emit("")
+    emit("  名单来自**声明**（dim_guardrail_config），不是「事件里出现过什么」：")
+    try:
+        declared = con.execute(
+            "SELECT experiment, guardrail, direction, max_harm "
+            "FROM dim_guardrail_config ORDER BY experiment, guardrail"
+        ).fetchall()
+        emit(f"  {'实验':<16}{'护栏':<18}{'方向':<18}{'容忍度':>8}")
+        for exp_name, guard, direction, limit in declared:
+            emit(f"  {exp_name:<16}{guard:<18}{direction:<18}{float(limit):>8.2%}")
+        emit("")
+        emit("  09 路 ADS（判定所需的可加量，**不含阈值** —— 阈值是声明，属于注册表）：")
+        rows = con.execute(
+            """
+            SELECT guardrail, variant, user_cnt, value_mean
+            FROM ads_experiment_guardrail_result
+            WHERE experiment = 'exp_rank_v2'
+            ORDER BY guardrail, variant
+            """
+        ).fetchall()
+        emit(f"  {'护栏':<18}{'臂':<12}{'n':>10}{'均值':>12}")
+        for guard, variant, n, mean in rows:
+            emit(f"  {guard:<18}{variant:<12}{int(n):>10}{float(mean):>12.4f}")
+        if rows:
+            harm = _guardrail_harm_from_rows(rows, "latency_p99")
+            emit("")
+            emit(f"  latency_p99 注入的真实伤害 = {harm:+.2%}"
+                 "（演示真值；判定用的是这个数**是否越过声明的容忍度**）")
+    except Exception as exc:  # 老库没有 09 路表
+        emit(f"  （这份数仓里没有护栏链路：{type(exc).__name__}）")
 
     emit(f"\n总耗时 {time.perf_counter() - t0:.1f}s")
     con.close()

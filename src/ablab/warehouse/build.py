@@ -68,6 +68,10 @@ SQL_ORDER: tuple[str, ...] = (
     # README 里所有已引用的数仓数字就全变了。
     "06_dws_experiment_ratio_daily.sql",
     "07_ads_experiment_ratio_result.sql",
+    # 护栏链路（08/09）：与 06/07 同一个理由独立成表 —— 它既不是主指标口径，
+    # 也不是比值口径，而是"另一组指标"。名单来自声明（dim_guardrail_config）。
+    "08_dws_experiment_guardrail_daily.sql",
+    "09_ads_experiment_guardrail_result.sql",
 )
 
 

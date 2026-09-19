@@ -38,6 +38,29 @@ __all__ = [
 
 
 @dataclass(frozen=True)
+class GuardrailDef:
+    """数仓里的一条**护栏声明**（演示真值的一部分）。
+
+    ``harm`` 是注入的**相对伤害**：处置组在这条护栏上真的劣化多少。
+    它与 ``ExperimentDef.true_lift`` 同一个性质 —— **仅演示用**：
+    真实数仓里没有"真值"这一列，护栏的值来自埋点，不需要注入。
+    有了它，"护栏触发 -> 建议停实验"这条链路才能在真实数仓路径上被跑到。
+    """
+
+    name: str
+    #: ``lower_is_better``（延迟/崩溃率）或 ``higher_is_better``（收入/留存）
+    direction: str = "lower_is_better"
+    #: 允许的最大相对劣化（如 0.05 = 5%）
+    max_harm: float = 0.05
+    #: 基线量纲（例如延迟 100ms）。判定只看相对伤害，所以量纲是装饰性的
+    baseline: float = 100.0
+    #: **注入的相对伤害**（仅演示）。0 表示这条护栏没有劣化
+    harm: float = 0.0
+    #: 护栏自身的日噪声（相对标准差）
+    noise: float = 0.02
+
+
+@dataclass(frozen=True)
 class ExperimentDef:
     """一个实验的分层与分流定义。"""
 
@@ -48,6 +71,8 @@ class ExperimentDef:
     bucket_end: int
     true_lift: float
     hypothesis: str
+    #: 该实验声明的护栏（含**仅演示用**的注入伤害）。空元组表示没有护栏。
+    guardrails: tuple[GuardrailDef, ...] = ()
     control: str = "control"
     treatment: str = "treatment"
     #: 设为列名（如 ``"city"``）表示**整簇随机化**：分流在簇级别做，
@@ -68,6 +93,14 @@ DEFAULT_EXPERIMENTS: tuple[ExperimentDef, ...] = (
         bucket_end=8000,  # 占 80% 流量
         true_lift=2.0,
         hypothesis="新排序模型提升人均互动次数",
+        # 排序模型最常见的代价就是延迟：这条护栏注入 +12% 的真实伤害，
+        # 于是数仓路径也能演示"护栏触发 -> 建议停实验"（容忍度 5%）
+        guardrails=(
+            GuardrailDef("latency_p99", "lower_is_better", 0.05,
+                         baseline=100.0, harm=0.12),
+            GuardrailDef("complaint_rate", "lower_is_better", 0.10,
+                         baseline=1.0, harm=0.0, noise=0.05),
+        ),
     ),
     ExperimentDef(
         name="exp_rec_emb",
@@ -144,6 +177,8 @@ def generate_source_data(
     post_effect = np.zeros(n)  # 每个用户的累积真实效应（只有处理后窗口吃得到）
 
     exposure_frames: list[pd.DataFrame] = []
+    guard_frames: list[pd.DataFrame] = []
+    guard_plans: list[tuple[ExperimentDef, np.ndarray, np.ndarray]] = []
     config_rows: list[dict] = []
 
     for exp in cfg.experiments:
@@ -235,6 +270,10 @@ def generate_source_data(
             ]
         )
 
+        # 护栏事件的生成挪到后面：它要用到 offsets/active 这些**之后才定义**的量
+        # （第一版直接写在这里，跑起来就是 UnboundLocalError: offsets）。
+        guard_plans.append((exp, routed, is_treatment))
+
     # 同一用户重复曝光（用于验证 DWD 层的去重口径）
     exposures = pd.concat(exposure_frames, ignore_index=True)
     dups = exposures.sample(frac=0.10, random_state=cfg.seed).copy()
@@ -242,6 +281,24 @@ def generate_source_data(
     exposures = pd.concat([exposures, dups], ignore_index=True)
 
     exp_config = pd.DataFrame(config_rows)
+
+    # 护栏声明（长表）：08 路只认这张表给的名单 —— 声明是护栏存在的**前提**，
+    # 不是"事件里出现过什么"。方向与容忍度也在这里，但它们只是给数仓一份
+    # 可追溯的副本；**判定用的是注册表里的声明**（见 09 路的注释）。
+    guardrail_rows = [
+        {
+            "experiment": exp.name,
+            "guardrail": guard.name,
+            "direction": guard.direction,
+            "max_harm": guard.max_harm,
+        }
+        for exp in cfg.experiments
+        for guard in exp.guardrails
+    ]
+    guardrail_config = pd.DataFrame(
+        guardrail_rows,
+        columns=["experiment", "guardrail", "direction", "max_harm"],
+    )
 
     # ---- 行为明细 -------------------------------------------------------- #
     offsets = np.arange(-cfg.pre_days, cfg.post_days)
@@ -251,6 +308,35 @@ def generate_source_data(
     active = rng.random((n, offsets.size)) < cfg.daily_active_p
     noise = rng.normal(0.0, cfg.daily_noise_sd, (n, offsets.size))
     values = level[:, None] + noise + post_effect[:, None] * is_post
+
+    # ---- 护栏事件：与主指标同一批用户、同一个日窗 ------------------------ #
+    #
+    # 建模成**长表**（event_name = 护栏名）而不是给主指标表加列：
+    # 每个实验声明几个护栏是业务决定的，列式建模会逼着人每加一个护栏
+    # 就改一次已发布层的表结构 —— 而按本仓库的规矩，那会让所有引用过的数字全变。
+    for exp, routed, is_treatment in guard_plans:
+        for guard in exp.guardrails:
+            # 伤害只作用于**处置组**，而且只在处置之后（is_post）
+            boost = np.where(is_treatment, guard.harm, 0.0)
+            sign = 1.0 if guard.direction == "lower_is_better" else -1.0
+            g_noise = rng.normal(1.0, guard.noise, (n, offsets.size))
+            g_values = guard.baseline * g_noise * (
+                1.0 + sign * boost[:, None] * is_post[None, :]
+            )
+            gu, gd = np.nonzero(active & routed[:, None])
+            guard_frames.append(
+                pd.DataFrame(
+                    {
+                        "ds": [
+                            expose_ds[i] + timedelta(days=int(offsets[j]))
+                            for i, j in zip(gu, gd)
+                        ],
+                        "user_id": np.array(user_ids, dtype=object)[gu],
+                        "event_name": guard.name,
+                        "metric_value": g_values[gu, gd],
+                    }
+                )
+            )
 
     u_idx, d_idx = np.nonzero(active)
     event = pd.DataFrame(
@@ -262,12 +348,18 @@ def generate_source_data(
         }
     )
 
+    # 护栏事件与主指标共表（ODS 的 event_log 本来就是"按天按用户的事件"）。
+    # 用 concat 而不是另写一张 Parquet：这样 08 路 SQL 只需按 event_name 过滤。
+    if guard_frames:
+        event = pd.concat([event, *guard_frames], ignore_index=True)
+
     # ---- 落盘 ------------------------------------------------------------ #
     for name, frame in (
         ("exposure_log", exposures),
         ("event_log", event),
         ("user_profile", profile),
         ("experiment_config", exp_config),
+        ("guardrail_config", guardrail_config),
     ):
         target = out / name
         target.mkdir(parents=True, exist_ok=True)
@@ -279,4 +371,5 @@ def generate_source_data(
         "event_log": len(event),
         "user_profile": len(profile),
         "experiment_config": len(exp_config),
+        "guardrail_config": len(guardrail_config),
     }

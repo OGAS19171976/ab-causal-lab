@@ -95,6 +95,9 @@ CLAIMS: list[tuple[str, str, str]] = [
     ("治理·护栏：越界建议停实验", "governance_report.md", "建议停止实验"),
     ("治理·护栏：缺数据不等于通过", "governance_report.md", "不是通过"),
     ("治理·护栏：方向不从名字猜", "governance_report.md", "不从指标名猜"),
+    # 数仓护栏链路：两臂均值与"事件名过滤"是稳定的
+    ("数仓·护栏：长表链路", "warehouse_report.md", "dim_guardrail_config"),
+    ("数仓·护栏：注入的伤害可见", "warehouse_report.md", "latency_p99"),
 ]
 
 

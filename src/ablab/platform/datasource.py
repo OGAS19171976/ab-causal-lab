@@ -863,6 +863,12 @@ def build_warehouse_data(
         looks=looks,
         primary_estimator=primary_estimator,
         true_lift=float(t_row["true_lift"]),
+        # 护栏走 09 路 ADS（08 -> 09 的长表链路）。取不到时返回空字典 ——
+        # 于是护栏会被判 unknown（"无法判断"），**不是通过**：
+        # 缺数据时假装通过正是这一块最容易犯的错。
+        guardrail_series=_warehouse_guardrail_data(
+            con, experiment, control_name, treated_name
+        ),
         extra={
             "layer": str(t_row["layer"]),
             "hypothesis": str(t_row["hypothesis"]),
@@ -884,6 +890,50 @@ def build_warehouse_data(
                 "两次读取走了不同口径"
             )
     return data
+
+
+def _warehouse_guardrail_data(
+    con: Any,
+    experiment: str,
+    control: str,
+    treated: str,
+) -> dict[str, dict[str, Any]]:
+    """从 09 路 ADS 读护栏的充分统计量。
+
+    返回 ``{护栏名: {臂名: AggregateStats}}``，形状与合成路径完全一致 ——
+    所以护栏的判定规则（方向折算、置信下界、Bonferroni）只写了一份，
+    两条数据源走同一段代码。
+
+    **读不到就返回空字典**：宁可在报告里写"无法判断"，也不要因为
+    "数仓里没有这张表"而让护栏看起来通过。表不存在（老库）与没有该实验的
+    护栏行，都归到这一条。
+    """
+    from ..inference.aggregates import AggregateStats
+
+    try:
+        rows = con.execute(
+            """
+            SELECT guardrail, variant, user_cnt, value_sum, value_sq_sum
+            FROM ads_experiment_guardrail_result
+            WHERE experiment = ?
+            """,
+            [experiment],
+        ).fetchall()
+    except Exception:
+        # 老库没有 09 路表：这不是错误，而是"这份数据源还没有护栏"
+        return {}
+
+    series: dict[str, dict[str, Any]] = {}
+    for guardrail, variant, n, value_sum, value_sq_sum in rows:
+        name = str(guardrail)
+        if str(variant) not in (control, treated):
+            continue
+        series.setdefault(name, {})[str(variant)] = AggregateStats(
+            n=int(n),
+            sum_y=float(value_sum or 0.0),
+            sum_yy=float(value_sq_sum or 0.0),
+        )
+    return series
 
 
 def _warehouse_ratio_data(

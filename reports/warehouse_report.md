@@ -7,7 +7,7 @@ ab-causal-lab · 数仓链路 ODS → DWD → DWS → ADS
 
 ### 1. 各层规模
   ods_exposure_log                       30,741   ODS 曝光日志（分流服务直接落盘）
-  ods_event_log                         447,597   ODS 行为明细
+  ods_event_log                       1,164,913   ODS 行为明细
   dwd_experiment_user                    27,946   DWD 实验单元宽表（已去重、已对齐前后窗口）
   dws_experiment_variant_daily               84   DWS 实验×分支×日（全部可加字段）
   ads_experiment_result                       4   ADS 实验结果（点估计 + 方差）
@@ -115,7 +115,7 @@ exp_rec_emb 的真实效应是 0（负对照）。如果 post-only 分析给出�
   实验                    平台比值     平台 SE        独立实现        偏差         p
   exp_rank_v2       2.350765  0.243864    2.350765  7.11e-15  6.24e-22
     末次查看 == 主结论：True；监控口径=ratio_delta；查看次数=5
-  exp_rec_emb      -0.739366  0.283414   -0.739366  1.42e-14    0.0091
+  exp_rec_emb      -0.739366  0.283414   -0.739366  0.00e+00    0.0091
     末次查看 == 主结论：True；监控口径=ratio_delta；查看次数=5
 
   负对照（exp_rec_emb 的真实效应为零）—— **实测它显著**（p=0.0091），
@@ -129,4 +129,26 @@ exp_rec_emb 的真实效应是 0（负对照）。如果 post-only 分析给出�
   是 README 已知边界里还没做的那一条。
   逐位一致性：平台编排与 M1 的独立实现在 1e-9 内一致（有测试守着）；
   本节偏差列是实测差，量级 1e-14。
+
+### 护栏链路：08 DWS -> 09 ADS（长表，不新增落地文件）
+  护栏与主指标**共用一张事件表**（event_name = 护栏名），所以：
+    · 不需要新的 Parquet 与新的 ODS 视图，08 路一条 GROUP BY 就够；
+    · 代价是 01 路 DWD **必须**按 event_name = 'interaction' 过滤 ——
+      不加这一条，护栏的取值（延迟 ~100ms）会被加进主指标：
+      实测效应从 +27.2 变成 +161，而两个数都「正常显著」。
+      这类错误显著性检查发现不了，只能靠不变量（有测试钉着）。
+
+  名单来自**声明**（dim_guardrail_config），不是「事件里出现过什么」：
+  实验              护栏                方向                     容忍度
+  exp_rank_v2     complaint_rate    lower_is_better     10.00%
+  exp_rank_v2     latency_p99       lower_is_better      5.00%
+
+  09 路 ADS（判定所需的可加量，**不含阈值** —— 阈值是声明，属于注册表）：
+  护栏                臂                    n          均值
+  complaint_rate    control          89358      0.9996
+  complaint_rate    treatment        89967      0.9998
+  latency_p99       control          89358     99.9973
+  latency_p99       treatment        89967    111.9857
+
+  latency_p99 注入的真实伤害 = +11.99%（演示真值；判定用的是这个数**是否越过声明的容忍度**）
 ```

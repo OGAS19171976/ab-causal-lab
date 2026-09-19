@@ -53,6 +53,10 @@ windowed AS (
     FROM expo e
     LEFT JOIN ods_event_log ev
            ON ev.user_id = e.user_id
+          -- **必须按事件名过滤**：event_log 是长表，除了主指标还有护栏事件
+          -- （08 路要用）。不过滤就会把护栏的取值（延迟 ~100ms）加进主指标 ——
+          -- 实测这会把效应从 +27.2 抬到 +161，而一切看起来都"正常显著"。
+          AND ev.event_name = 'interaction'
           AND ev.ds >= e.expose_ds - INTERVAL {PRE_DAYS} DAY
           AND ev.ds <  e.expose_ds + INTERVAL {POST_DAYS} DAY
     GROUP BY
