@@ -445,6 +445,10 @@ def build_synthetic_data(
             n_looks=n_looks,
             true_lift=true_lift,
             seed=seed,
+            # **声明必须传下去**：第一版这里漏了 primary_estimator，
+            # 于是簇级路径永远用 dataclass 的默认值 —— 声明 estimator='cuped'
+            # 被静默忽略（与数仓那条路径当初的毛病一模一样）。
+            primary_estimator=primary_estimator,
         )
     if metric_type == "ratio":
         return _synthetic_ratio(
@@ -641,6 +645,7 @@ def _synthetic_cluster(
     n_looks: int,
     true_lift: float,
     seed: int,
+    primary_estimator: str = "cuped",
 ) -> ExperimentData:
     """整簇随机化场景：处理在**簇**级别分配，用户嵌在簇内。
 
@@ -663,16 +668,28 @@ def _synthetic_cluster(
         seed=seed,
     )
 
-    # 每簇一组充分统计量。x 全为 0 —— 这个 DGP 没有前置指标，
-    # 所以整簇路径只能用 post-only 口径（有簇级前置指标时才能上 CUPED）。
+    # 每簇一组充分统计量。**带前置指标**（簇场景现在会生成它），
+    # 于是簇级 CUPED 在合成路径上也能跑 —— 这是"能重复抽样地校准它"的前提：
+    # 换 salt 就是换一次实验实现，才能量出 A/A 下的误停率。
     cluster_codes = sample.cluster_id
     unique_clusters = sorted(set(cluster_codes.tolist()))
     first_index = {g: int(np.flatnonzero(cluster_codes == g)[0]) for g in unique_clusters}
     treated_clusters = [g for g in unique_clusters if bool(sample.treated[first_index[g]])]
     control_clusters = [g for g in unique_clusters if not bool(sample.treated[first_index[g]])]
     by_cluster = {g: sample.outcome[cluster_codes == g] for g in unique_clusters}
-    per_cluster_t = [AggregateStats.from_outcomes(by_cluster[g]) for g in treated_clusters]
-    per_cluster_c = [AggregateStats.from_outcomes(by_cluster[g]) for g in control_clusters]
+    pre = getattr(sample, "pre_outcome", None)
+    by_cluster_pre = (
+        {g: pre[cluster_codes == g] for g in unique_clusters} if pre is not None else {}
+    )
+
+    def cluster_stats(g: int):
+        """每簇一组充分统计量。有前置指标就带上它 —— 簇级 CUPED 的原料。"""
+        if pre is None:
+            return AggregateStats.from_outcomes(by_cluster[g])
+        return AggregateStats.from_arrays(by_cluster[g], by_cluster_pre[g])
+
+    per_cluster_t = [cluster_stats(g) for g in treated_clusters]
+    per_cluster_c = [cluster_stats(g) for g in control_clusters]
 
     rng = np.random.default_rng(seed + 2)
     order_t = rng.permutation(len(per_cluster_t))
@@ -714,8 +731,10 @@ def _synthetic_cluster(
         all_weights={"control": 0.5, "treatment": 0.5},
         design_weights={"control": 0.5, "treatment": 0.5},
         looks=tuple(looks),
-        # 整簇路径没有簇级前置指标 → 只能用 post-only
-        primary_estimator="post_only",
+        # **按声明走**：簇场景现在会生成前置指标（簇间共享同一个簇效应），
+        # 所以簇级 CUPED 在合成路径上也能跑 —— 而且它必须能跑，
+        # 否则「换 salt 重复抽样地校准簇级 CUPED」这件事没有数据源。
+        primary_estimator=primary_estimator,
         analysis_unit="cluster",
         metric_type="mean",
         true_lift=float(true_lift),

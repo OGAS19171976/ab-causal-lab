@@ -230,6 +230,9 @@ def main() -> int:
     n_unit_salts = 100 if args.quick else 300
     # 比值口径的校准审计（合成路径，每次 8k 用户）—— 与 M6.1 那个同量级
     n_ratio_salts = 60 if args.quick else 200
+    # 簇级 CUPED 的校准次数：每次要跑两遍分析（cuped + post_only），
+    # 200 次约 1 分钟；快速版给 40 次。
+    n_cluster_cuped = 40 if args.quick else 200
 
     log: list[str] = []
     t_start = time.time()
@@ -396,6 +399,24 @@ def main() -> int:
 
     say("")
     say("=" * 78)
+    # ---- 簇级 CUPED 的校准（换 salt 重复抽样） ----------------------------- #
+    say("\n### 7. 簇级 CUPED 的校准：观测单位必须仍然是簇")
+    say("整簇随机化下按用户做推断会把簇内相关当成独立信息 ——")
+    say("那条错误做法的误停率在 M1/M6 早就量过（60% 以上）。")
+    say("CUPED 引入回归调整之后，同一个问题必须**重新问一遍**：")
+    say("调整之后观测单位还是簇吗？能重复抽样的数据源只有合成路径")
+    say("（数仓只有一份实现），所以这里换 salt 跑 A/A：")
+    say("")
+    from ablab.validation.cluster_cuped_audit import run_cluster_cuped_audit
+
+    cca = run_cluster_cuped_audit(n_trials=n_cluster_cuped, n_users=4000)
+    for line in cca.summary().splitlines():
+        say("  " + line)
+    say("")
+    say("  结论：**簇级 CUPED 守住名义水平**（Wilson 区间覆盖 5%），")
+    say("  而用户级检验的误停率是它的十几倍 —— 也就是说 CUPED 没有、也不该")
+    say("  改变「观测单位」这件事。")
+
     say(f"总耗时 {time.time() - t_start:.0f}s；图：fig28_monitoring_estimator.png、"
         "fig29_unit_awareness.png、fig30_mde_power.png")
     say("=" * 78)

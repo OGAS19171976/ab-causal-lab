@@ -271,6 +271,81 @@ class TestM6Audits:
 # --------------------------------------------------------------------------- #
 # 接口层：声明必须真的生效
 # --------------------------------------------------------------------------- #
+class TestClusterCupedCalibration:
+    """簇级 CUPED 的**校准**：A/A 下它必须守住名义水平。
+
+    这是"口径变了就重跑审计"那条规矩的一次执行：整簇随机化按用户推断
+    会把簇内相关当成独立信息（误停率 60%+），CUPED 引入回归调整之后，
+    同一个问题要重新量。能重复抽样的数据源只有合成路径，所以换 salt 跑 A/A。
+    """
+
+    def test_synthetic_cluster_path_honours_the_declared_estimator(self):
+        """**声明必须传下去**：簇级合成路径原先漏传 primary_estimator，
+        于是 `estimator="cuped"` 被静默忽略（主口径永远退回簇级 post-only）。
+        实测修好之后：cuped -> cluster_cuped / post_only -> cluster_level。
+        """
+        from ablab.platform.analysis import analyse_experiment
+        from ablab.platform.registry import ExperimentRecord
+
+        variants = [
+            {"name": "control", "weight": 0.5},
+            {"name": "treatment", "weight": 0.5},
+        ]
+
+        def run(estimator: str):
+            rec = ExperimentRecord(
+                name="cluster_decl", variants=list(variants),
+                salt=f"cluster_decl_{estimator}", primary_metric="m",
+                analysis_unit="cluster", estimator=estimator,
+            )
+            return analyse_experiment(rec, n_users=3000)
+
+        cuped = run("cuped")
+        assert cuped.primary_estimator_name == "cluster_cuped"
+        assert cuped.alt_estimator_name == "cluster_level"
+        assert cuped.cuped_fit is not None
+        post = run("post_only")
+        assert post.primary_estimator_name == "cluster_level"
+        assert post.alt_estimator_name == "unit_level"
+
+    def test_cluster_cuped_keeps_the_nominal_level_while_unit_level_does_not(self):
+        """A/A 误停率：簇级 CUPED 与簇级 Welch 都在名义水平附近，
+        **用户级**检验则高一个量级（那正是错误做法）。
+
+        小样本（24 次）以控制测试时长：断言量级而不是具体比例 ——
+        簇级两行必须明显低于用户级那一行。
+        """
+        from ablab.validation.cluster_cuped_audit import run_cluster_cuped_audit
+
+        r = run_cluster_cuped_audit(n_trials=24, n_users=3000)
+        assert r.unit_level_fpr > 0.3, r.summary()
+        assert r.cluster_level_fpr < 0.15, r.summary()
+        assert r.cluster_cuped_fpr < 0.15, r.summary()
+        assert r.cluster_cuped_fpr < r.unit_level_fpr / 3
+        # CUPED 真的在起作用（这个 DGP 里簇效应主导，所以缩减很大）
+        assert r.mean_variance_reduction > 0.3, r.summary()
+
+    def test_cluster_cuped_requires_cluster_level_pre_metric(self):
+        """拿不到簇级前置指标时报错 —— 不静默退回 post-only。"""
+        import numpy as np
+        import pytest
+
+        from ablab.inference.aggregates import AggregateStats
+        from ablab.platform.datasource import LookData
+
+        arm = tuple(AggregateStats(n=50, sum_y=float(i) * 10.0) for i in range(4))
+        look = LookData(
+            label="l", information_fraction=1.0,
+            treatment=AggregateStats(n=200, sum_y=400.0),
+            control=AggregateStats(n=200, sum_y=400.0),
+            cluster_treatment=arm, cluster_control=arm,
+        )
+        assert not look.clusters_have_pre_metric
+        with pytest.raises(ValueError, match="前置指标"):
+            look.cluster_cuped()
+        assert np.isfinite(AggregateStats(n=1).sum_x)
+
+
 class TestDeclarationsThroughAPI:
     @pytest.fixture
     def client(self, work_dir):

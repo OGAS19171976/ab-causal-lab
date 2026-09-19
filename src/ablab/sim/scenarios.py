@@ -183,6 +183,9 @@ class ClusterScenarioConfig:
     seed: int = 20260101
     #: 簇大小是否不等（1.0 表示完全相等）
     size_cv: float = 0.0
+    #: 前置指标与后置指标的相关（CUPED 的原料）。0 表示没有前置指标 ——
+    #: 那种情况下簇级 CUPED 不可用（会报错，而不是静默退回 post-only）。
+    pre_post_correlation: float = 0.70
 
     def __post_init__(self) -> None:
         if self.n_clusters < 8:
@@ -205,6 +208,9 @@ class ClusterSample:
     treated: np.ndarray  # (n,) bool，由簇决定
     outcome: np.ndarray  # (n,)
     true_lift: float
+    #: 前置指标（可选）。簇级 CUPED 需要它 —— 且必须是**同一个人**的前置值，
+    #: 否则协方差算的是两批人之间的关系。
+    pre_outcome: np.ndarray | None = None
 
     def __len__(self) -> int:
         return int(self.outcome.size)
@@ -260,11 +266,27 @@ def generate_cluster_scenario(
         + true_lift * cluster_treated[cid]
     )
 
+    # 前置指标：**共享簇级随机效应**，噪声与后置部分相关。
+    # 为什么共享簇效应是关键：簇级 CUPED 靠的正是"簇与簇之间"的前后相关
+    # （簇效应不随时间变），只让个体噪声相关的话，簇均值上的相关会很小、
+    # 方差缩减接近于 0 —— 那种 DGP 测不出 CUPED 到底有没有用。
+    pre_outcome = None
+    rho = float(cfg.pre_post_correlation)
+    if rho > 0:
+        shared = rng.normal(0.0, cfg.user_sd, int(sizes.sum()))
+        fresh = rng.normal(0.0, cfg.user_sd, int(sizes.sum()))
+        pre_outcome = (
+            cfg.baseline
+            + cluster_effect[cid]
+            + (rho * shared + np.sqrt(max(1.0 - rho * rho, 0.0)) * fresh)
+        ).astype(float)
+
     return ClusterSample(
         cluster_id=np.repeat(np.array(cluster_ids, dtype=object), sizes),
         user_id=np.array([f"u{i:07d}" for i in range(int(sizes.sum()))], dtype=object),
         cluster_treated=cluster_treated,
         treated=cluster_treated[cid],
         outcome=outcome.astype(float),
+        pre_outcome=pre_outcome,
         true_lift=true_lift,
     )
