@@ -1780,8 +1780,51 @@ M6 生产口径自身的边界：
 5. **CATE 的置信区间**（GRF 的渐近正态性），让 M4 从"排序可用"走到"水平也可用"。
 
 工程上还剩一条欠账：**比值指标的"数仓侧"**。簇粒度已经做完（见 13.4），
-比值还差 ADS 里的一列分母 —— 语义与现有的 `x`（前置指标）不同，不能混用，
-要新增一张比值 ADS。**做完必须重跑 13.2 那一轮审计**：换了数据源，校准主张就不再自动成立。
+比值还差 ADS 里的一列分母 —— 语义与现有的 `x`（前置指标）不同，不能混用。
+这条我已经把施工口径写下来了（见下），因为它是这个仓库里**唯一一处
+"改动会牵动已引用数字"**的地方，值得先想清楚再动手。
+
+### 施工口径：比值指标接进数仓（下一次开工照着做）
+
+**为什么不能"顺手加一列"**：ADS 现在的 `x` 是**前置指标**（CUPED 的协变量），
+而比值指标要的 `x` 是**分母**（曝光/订单数）。两者语义不同，混用会让
+CUPED 的 θ̂ 变成"用曝光数校正点击率"这种没有意义的东西。
+所以必须**新增一张比值 ADS**，而不是改现有那张。
+
+**硬约束（这一条决定了改动顺序）**：**DGP 只能做加法。**
+现有 `ods_*` / `dwd_experiment_user` / `dws_experiment_variant_daily` /
+`ads_experiment_result` 的内容**一格都不能变** —— README 里所有已引用的数仓数字
+（27.248206 / 23.342905 / 30,741 / 27,946 / `-3.9243251037`）都挂在这些表上。
+新增指标要作为**新实验 + 新表**接进来，而不是往旧表里加列。
+
+按依赖顺序，需要动的地方：
+
+1. `src/ablab/warehouse/generate.py`：给源数据加**一对可加列**
+   （如 `exposure_cnt` / `click_cnt`，逐用户）。注意它与 `post_metric` 的关系要在
+   文档里写清（比值指标的分子分母都必须是**可加**的，否则 DWS 的 `SUM` 无意义）。
+2. `sql/`：**不要**往现有的 `dws_experiment_variant_daily` / `ads_experiment_result`
+   里加列（那会改动已引用数字）。新增两张表：一张按 `ds` × `variant` 的
+   `dws_experiment_ratio_daily`，一张输出 `sum_y` / `sum_x` / `n` 三个可加量的
+   `ads_experiment_ratio_result`。文件名顺延现有编号（`sql/06_*` 已被簇粒度 DWS 占用）。
+3. `src/ablab/platform/datasource.py`：照 `_warehouse_cluster_data` 的样子加一个
+   `_warehouse_ratio_data` 分支（它是"新增一种粒度"的现成模板：读新表 → 组装
+   `LookData` → 填 `metric_type="ratio"`），并在 `build_warehouse_data` 里按
+   `record.metric_type` 分派。**注意** `analyse_experiment_from_warehouse` 现在会拒绝
+   `metric_type != "mean"`，要把这个闸门改成"ratio 走新分支、其余仍然拒绝"。
+4. 注册表：比值实验在创建时**禁止** `estimator=cuped`（CUPED 需要前置协变量，
+   而比值 ADS 里没有），与现在"簇级 + CUPED"那条闸门同一个位置、同一个理由。
+5. 测试：照 `test_platform_warehouse.py::TestWarehouseAnalysisUnit` 的结构，
+   新增一个比值数仓夹具，断言"平台比值口径 == M1 的 `ratio_delta_method`（吃明细）
+   在 1e-9 内一致" —— **让 M1 那份独立实现当裁判**，而不是自己和自己比。
+6. **做完必须重跑 13.2 那一轮审计**（`run_m6_validation.py` 里的分析单元审计）
+   与 `scripts/run_warehouse.py`：换了数据源，校准主张就不再自动成立 ——
+   这是"改了数据就要重跑审计"这条规矩的第 N 次应用。
+7. `scripts/check_readme_claims.py`：如果 README 新增了比值数仓的数字，
+   把它们加进声明清单 —— 否则新数字又变成"没人核对"的那种。
+
+**验收标准**（缺一条都算没做完）：默认那两条实验的所有已引用数字**逐位未变**；
+比值路径的三条读取路径（DWD 明细 / ADS 汇总 / 平台编排）互相一致；
+注册表拦住 `ratio + cuped` 组合；审计重跑通过。
 
 ## 八、参考
 
