@@ -82,6 +82,8 @@ CLAIMS: list[tuple[str, str, str]] = [
     # 保形个体效应区间（数值随 --quick 变，只钉文本）
     ("M4·保形：对象不同", "cate_interval_report.md", "个体效应：解析区间做不到"),
     ("M4·保形：边际覆盖与条件均值的区分", "cate_interval_report.md", "预测区间"),
+    ("M4·保形：分组覆盖两端最弱", "cate_interval_report.md", "两端最弱"),
+    ("M4·保形：决策相关的数", "cate_interval_report.md", "决策相关"),
     # 默认路径（AIPW + 自动裁剪）：仍然只加文本类声明（数值随 --quick 变）
     ("M4·默认路径：已接成默认", "cate_interval_report.md", "默认路径"),
     ("M4·默认路径：代价是估计目标变了", "cate_interval_report.md", "重叠总体"),

@@ -914,6 +914,149 @@ def run_signal_comparison(
 
 
 # --------------------------------------------------------------------------- #
+# 二之五、保形区间的**分组**覆盖：边际达标之后还剩什么问题
+# --------------------------------------------------------------------------- #
+@dataclass
+class ConformalCoverageAudit:
+    """保形个体效应区间的覆盖诊断：边际 vs 分组。
+
+    上一轮量到它的**边际**覆盖达标（≈0.95）。这一轮量的是**分组**覆盖 ——
+    因为"平均 95%"与"每个人 95%"是两件事，而后者在无假设下
+    **被证明不可能**（Barber 等 2019）。所以这里的目标不是修好它，
+    而是把差距**量出来**：最差的组差多少、按什么分组差异最大。
+    """
+
+    n_scenarios: int
+    n_units: int
+    alpha: float
+    #: 边际覆盖（应当≈1−α）
+    marginal_coverage: float
+    #: 按**估计** τ̂ 的十分位分组后的覆盖（决策通常就是按它排序做的）
+    coverage_by_estimate_decile: list[float] = field(default_factory=list)
+    #: 按**真实** τ 的十分位分组后的覆盖（只有仿真知道真值，用于定位问题）
+    coverage_by_true_decile: list[float] = field(default_factory=list)
+    #: 处置组 / 对照组各自的覆盖
+    coverage_treated: float = float("nan")
+    coverage_control: float = float("nan")
+    #: 全部组里最差/最好
+    worst_group: float = float("nan")
+    best_group: float = float("nan")
+    #: 有多少比例的组低于名义值
+    share_below_nominal: float = float("nan")
+    #: 平均半宽（与真 CATE 的离散度比，说明代价）
+    mean_half_width: float = float("nan")
+    mean_true_sd: float = float("nan")
+    #: **决策相关**：用"区间下界 > 0"挑选出来的那批人里，真实效应确实 > 0 的比例
+    selection_precision: float = float("nan")
+    #: 这批人占全体多少（挑选率）
+    selection_share: float = float("nan")
+
+    def summary(self) -> str:
+        nominal = 1.0 - self.alpha
+        lines = [
+            f"保形区间覆盖诊断（{self.n_scenarios} 个场景平均，每次 n={self.n_units}，"
+            f"名义 {nominal:.2f}）",
+            f"  边际覆盖 **{self.marginal_coverage:.4f}**"
+            f"（这就是它保证的东西）",
+            f"  分组覆盖：最差 **{self.worst_group:.4f}**、"
+            f"最好 {self.best_group:.4f}，"
+            f"{self.share_below_nominal:.0%} 的组低于名义值",
+            f"  按估计值分十组：{['%.3f' % c for c in self.coverage_by_estimate_decile]}",
+            f"  按真实值分十组：{['%.3f' % c for c in self.coverage_by_true_decile]}",
+            f"  处置组 {self.coverage_treated:.4f} / 对照组 {self.coverage_control:.4f}",
+            f"  平均半宽 {self.mean_half_width:.3f} vs 真 CATE 的 sd "
+            f"{self.mean_true_sd:.3f}",
+            f"  决策相关：按「区间下界 > 0」挑人 -> 选中率 "
+            f"{self.selection_share:.2%}，选中的人里真实效应 > 0 的比例 "
+            f"**{self.selection_precision:.4f}**",
+            "  读法：**分组覆盖不是它承诺的东西**（条件覆盖在无假设下被证明不可能，",
+            "  Barber 等 2019）。所以这里报出来的是边界，不是待修的 bug ——",
+            "  它同时说明「按估计值排序做决策」时，两端的人拿到的区间质量并不相同。",
+        ]
+        return "\n".join(lines)
+
+
+def run_conformal_coverage_audit(
+    *,
+    n_scenarios: int = 10,
+    n: int = 2000,
+    alpha: float = 0.05,
+    seed: int = 0,
+) -> ConformalCoverageAudit:
+    """多场景平均地量保形区间的边际与分组覆盖。
+
+    **分组覆盖只主张为诊断**：条件覆盖在无假设下不可能，
+    这里量的是"它离条件覆盖有多远"，而不是"它做到了条件覆盖"。
+    """
+    from ..causal.conformal import conformal_ite_intervals
+    from ..causal.hte import HTEConfig, generate_hte_data
+
+    deciles = 10
+    est_groups = np.zeros(deciles)
+    true_groups = np.zeros(deciles)
+    marginal: list[float] = []
+    treated_cov: list[float] = []
+    control_cov: list[float] = []
+    half_widths: list[float] = []
+    true_sds: list[float] = []
+    precision: list[float] = []
+    share: list[float] = []
+
+    for s in range(n_scenarios):
+        data = generate_hte_data(
+            HTEConfig(n=n, n_features=6, n_informative=3, seed=seed + s,
+                      cate_form="nonlinear")
+        )
+        res = conformal_ite_intervals(
+            x=data.X, d=data.D, y=data.Y, propensity=data.propensity,
+            alpha=alpha, seed=1000 + s,
+        )
+        tau = np.asarray(data.tau)
+        inside = (res.lower <= tau) & (tau <= res.upper)
+        marginal.append(float(inside.mean()))
+        treated_cov.append(float(inside[data.D == 1].mean()))
+        control_cov.append(float(inside[data.D == 0].mean()))
+        half_widths.append(res.mean_width() / 2.0)
+        true_sds.append(float(np.std(tau)))
+
+        # 决策相关：按"区间下界 > 0"挑选，看选中的人里真正为正的比例
+        picked = res.lower > 0
+        if picked.any():
+            precision.append(float(np.mean(tau[picked] > 0)))
+        share.append(float(picked.mean()))
+
+        # 按**估计值**分十组：用区间中点当"估计"
+        estimate = (res.lower + res.upper) / 2.0
+        for values, acc in ((estimate, est_groups), (tau, true_groups)):
+            edges = np.quantile(values, np.linspace(0, 1, deciles + 1)[1:-1])
+            g = np.searchsorted(edges, values, side="right")
+            for k in range(deciles):
+                m = g == k
+                if m.any():
+                    acc[k] += float(inside[m].mean())
+    est_groups /= n_scenarios
+    true_groups /= n_scenarios
+    all_groups = np.concatenate([est_groups, true_groups])
+    return ConformalCoverageAudit(
+        n_scenarios=n_scenarios,
+        n_units=n,
+        alpha=alpha,
+        marginal_coverage=float(np.mean(marginal)),
+        coverage_by_estimate_decile=[float(x) for x in est_groups],
+        coverage_by_true_decile=[float(x) for x in true_groups],
+        coverage_treated=float(np.mean(treated_cov)),
+        coverage_control=float(np.mean(control_cov)),
+        worst_group=float(np.min(all_groups)),
+        best_group=float(np.max(all_groups)),
+        share_below_nominal=float(np.mean(all_groups < 1.0 - alpha)),
+        mean_half_width=float(np.mean(half_widths)),
+        mean_true_sd=float(np.mean(true_sds)),
+        selection_precision=float(np.mean(precision)) if precision else float("nan"),
+        selection_share=float(np.mean(share)),
+    )
+
+
+# --------------------------------------------------------------------------- #
 # 三、排序指标 vs 水平指标
 # --------------------------------------------------------------------------- #
 @dataclass

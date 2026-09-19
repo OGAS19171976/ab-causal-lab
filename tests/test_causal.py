@@ -690,6 +690,75 @@ class TestConformalITE:
             conformal_ite_intervals(x=x, d=d, y=y, propensity=p, seed=0)
 
 
+class TestConformalConditionalCoverage:
+    """保形区间的**分组**覆盖：边际达标之后还剩什么。
+
+    "平均 95%"与"每个人 95%"是两件事，后者在无假设下被证明不可能
+    （Barber 等 2019）。所以这一组钉的是**边界的样子**，不是"修好它"：
+
+      实测（10 个场景平均、n=2000）：按估计值分十组，
+      最低组 0.809、最高组 **0.688**，而中间几组 ≈0.99~1.00；
+      按**真实值**分组反而平（0.907~0.958）。
+      按"下界 > 0"挑人：选中率 5.6%，选中者中真实为正的占 **0.8559**。
+    """
+
+    @staticmethod
+    def _audit(n_scenarios: int = 4):
+        from ablab.validation.hte_audit import run_conformal_coverage_audit
+
+        return run_conformal_coverage_audit(n_scenarios=n_scenarios, n=2000)
+
+    def test_marginal_coverage_is_near_nominal(self):
+        a = self._audit()
+        assert a.marginal_coverage > 0.88, a.marginal_coverage
+
+    def test_extremes_are_the_weakest_groups(self):
+        """**两端最弱、中间过覆盖** —— 这条是这一组存在的理由。
+
+        它同时解释了为什么"用它做决策"要打折：被挑中的恰好是覆盖最弱的
+        那一段（区间下界 > 0 的人正是估计值最高的一批）。
+        """
+        a = self._audit()
+        deciles = a.coverage_by_estimate_decile
+        assert len(deciles) == 10
+        middle = sum(deciles[3:7]) / 4
+        # 两端明显低于中间（放宽到"至少低 5 个百分点"，避免小样本噪声）
+        assert min(deciles[0], deciles[-1]) < middle - 0.05, (deciles, middle)
+        assert a.worst_group < 0.90, a.worst_group
+
+    def test_coverage_by_true_value_is_flatter_than_by_estimate(self):
+        """按**真实值**分组比按**估计值**分组平 —— 波动来自估计误差。
+
+        这条把原因也钉住了：如果按真值分组也很差，那说明问题在区间构造；
+        实测它比较平（0.907~0.958），所以问题在"谁被分到哪一组"。
+        """
+        a = self._audit()
+        spread_true = max(a.coverage_by_true_decile) - min(a.coverage_by_true_decile)
+        spread_est = max(a.coverage_by_estimate_decile) - min(
+            a.coverage_by_estimate_decile
+        )
+        assert spread_true < spread_est, (spread_true, spread_est)
+
+    def test_selection_precision_is_below_nominal_but_useful(self):
+        """决策相关的数：按"下界 > 0"挑人，选中者中真实为正的比例。
+
+        **它不是名义覆盖率**（实测 ≈0.856，而不是 0.95），
+        但远好于随机。用这个区间做筛选时应当按这个数量级预期 ——
+        把 0.95 当成"决策正确率"是这类方法最容易被误用的地方。
+        """
+        a = self._audit()
+        assert 0.6 < a.selection_precision < 0.98, a.selection_precision
+        assert 0.0 < a.selection_share < 0.3, a.selection_share
+
+    def test_arms_are_roughly_balanced(self):
+        """处置组与对照组的覆盖不应当差很多（差很多说明权重写错了）。"""
+        a = self._audit()
+        assert abs(a.coverage_treated - a.coverage_control) < 0.08, (
+            a.coverage_treated,
+            a.coverage_control,
+        )
+
+
 class TestGatesBlp:
     """组级路线：单元级不可行（上一条），**组级可行** —— 换成 BLP/GATES。
 

@@ -384,6 +384,31 @@ def main() -> int:
     emit("    裁剪，并报告被裁剪的单元比例**（本 DGP 是 5.9%）。")
     emit("    没有结局模型时，裁剪要停在 0.05 附近。")
 
+    # ---- 8b. 保形区间的**分组**覆盖：边际达标之后还剩什么问题 -------------- #
+    emit("\n### 8b. 保形区间的分组覆盖：边际达标，但**两端最弱**")
+    emit("  「平均 95%」与「每个人 95%」是两件事：后者在无假设下**被证明不可能**")
+    emit("  （Barber 等 2019）。所以这一节不是修它，而是把差距**量出来**。")
+    emit("")
+    from ablab.validation.hte_audit import run_conformal_coverage_audit
+
+    cca = run_conformal_coverage_audit(
+        n_scenarios=4 if args.quick else 10, n=2000, alpha=0.05
+    )
+    for line in cca.summary().splitlines():
+        emit("  " + line)
+    emit("")
+    emit("  三个可操作的读法：")
+    emit("    1. **按估计值分的两端最差**（最低组与最高组明显低于名义值），")
+    emit("       中间反而过覆盖（≈0.99~1.00）—— 也就是说区间在「最需要精确的人」")
+    emit("       身上最不精确；")
+    emit("    2. **按真实值分组反而比较平**（都在 0.90~0.96）：说明波动主要来自")
+    emit("       **估计误差**而不是效应本身的大小；")
+    emit("    3. **决策相关的那个数**：按「区间下界 > 0」挑人，选中率约 5.6%，")
+    emit("       选中的人里真实效应 > 0 的比例约 **0.86** —— 它不是 0.95，")
+    emit("       但远好于随机；用这个区间做筛选时，应当按这个数量级来预期。")
+    emit("  所以上一节那句「可以用它做决策」要加限定：**决策正确率不是名义覆盖率**，")
+    emit("  而且被挑中的恰好是覆盖最弱的那一段。")
+
     emit(f"\n总耗时 {time.perf_counter() - t0:.1f}s")
 
     report = out_dir / "cate_interval_report.md"
