@@ -61,6 +61,12 @@ CLAIMS: list[tuple[str, str, str]] = [
     ("M4·CATE 区间：结论是「校准不了」", "cate_interval_report.md", "但它校准不了"),
     ("M4·CATE 区间：结论并进了 M4 报告", "m4_validation.md", "CATE 的区间：两条路线的覆盖率"),
     ("M4·CATE 区间：原因是偏差不是方差", "cate_interval_report.md", "而是**点估计有偏**"),
+    # 组级校准（BLP/GATES）：同样只加文本类声明 —— 覆盖率与斜率会随
+    # --quick（分裂次数 6 vs 30）变，把数字写进清单就是第 31 条那个假红灯。
+    ("M4·组级校准：换推断对象", "cate_interval_report.md", "组级路线：BLP 与 GATES"),
+    ("M4·组级校准：验收结论", "cate_interval_report.md", "对象不同，结论不同"),
+    ("M4·组级校准：瓶颈是信号重尾", "cate_interval_report.md", "重尾到不实用"),
+    ("M4·组级校准：下一步换 AIPW 信号", "cate_interval_report.md", "AIPW 信号"),
     ("数仓：CUPED 与 DWD 明细一致", "warehouse_report.md", "一致"),
     ("数仓：ADS 判据写在报告里", "warehouse_report.md", "判据"),
     # 比值链路（06/07）的数字 —— 它们是"接通了"这件事唯一的实测证据

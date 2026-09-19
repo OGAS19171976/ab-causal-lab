@@ -17,7 +17,7 @@ DML 的 θ 有真值可比，直接量偏置和覆盖率就行。但 CATE 不行
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -422,6 +422,214 @@ def run_cate_coverage_audit(
         true_cate_sd=mean("true_sd"),
         estimate_sd=mean("est_sd"),
         finite_share=mean("finite"),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 二之三、CATE 的**组级**校准：BLP 与 GATES
+# --------------------------------------------------------------------------- #
+def _ols(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """普通最小二乘 + HC0 稳健标准误（分样本之后这就是经典推断）。
+
+    只依赖 numpy：这一节要的是"在留出样本上做一次线性回归"，
+    引 sklearn 的 LinearRegression 不会有任何额外信息，还挡住标准误。
+    """
+    inv = np.linalg.pinv(x.T @ x)
+    beta = inv @ (x.T @ y)
+    resid = y - x @ beta
+    meat = x.T @ (x * (resid**2)[:, None])
+    cov = inv @ meat @ inv
+    return beta, np.sqrt(np.maximum(np.diag(cov), 0.0))
+
+
+@dataclass
+class GatesBlpResult:
+    """CATE 的**特征**（而不是 CATE 函数）的校准结果。
+
+    为什么换对象：Chernozhukov 等（arXiv:1712.04802）指出，通用 ML 工具在
+    高维/非参下连 CATE 的一致估计都拿不到，自适应置信集更不存在 ——
+    所以对 ``s0(Z)`` 本身做单元级推断是**注定**失败的（本仓库实测覆盖率
+    0.13~0.44，见 ``CateIntervalCoverage``）。他们转而推断 CATE 的**特征**：
+
+    * **BLP**：把信号回归到代理上。``斜率 = 1`` 就是校准；推断来自经典 OLS，
+      **不要求代理一致** —— 这正是它绕开那个不可能性的方式。
+    * **GATES**：按代理的分位数分组，组内平均效应的**有效置信区间**。
+      于是"排序可用、水平不可用"可以正确地软化成：
+      **组级水平可用，单元级不可用**。
+
+    信号用 Horvitz-Thompson 变换 ``H = (D - p)/(p(1-p))``，``signal = H·Y``，
+    它满足 ``E[signal | Z] = s0(Z)``，**不需要结果模型**（本仓库仿真的 p 已知）。
+    """
+
+    n: int
+    n_splits: int
+    n_groups: int
+    #: BLP 斜率（应当 ≈ 1）与其标准误、以及"CI 盖住 1"的比例
+    blp_slope: float
+    blp_slope_se: float
+    blp_covers_one: float
+    #: GATES：各组平均效应、以及组级覆盖率（对真实组 ATE）
+    gates_effects: list[float]
+    gates_true: list[float]
+    gates_coverage: float
+    gates_mean_length: float
+    #: 各组「估计 − 真实」的均值及其蒙特卡洛标准误（用于区分偏差与噪音）
+    gates_gap: list[float] = field(default_factory=list)
+    gates_gap_mc_se: list[float] = field(default_factory=list)
+    #: HT 信号的诊断：峰度（正态为 3）与**重叠度**（倾向得分落在 [0.05,0.95] 外的比例）
+    #: 这两个数解释了"为什么区间有效却又宽又不稳"：峰度 752 的信号 + 近乎违背的
+    #: 正值性假设。见 README 已知边界里那条"应当换 AIPW 信号"。
+    signal_kurtosis: float = float("nan")
+    overlap_violation_share: float = float("nan")
+    #: 对照：同一次实验里单元级那两条路线的覆盖率（见 CateIntervalCoverage）
+    unit_level_note: str = ""
+
+    def summary(self) -> str:
+        lines = [
+            f"CATE 的**组级**校准（{self.n_splits} 次分裂 × n={self.n}，"
+            f"{self.n_groups} 组，HT 信号，分样本经典推断）",
+            f"  BLP：斜率 {self.blp_slope:.4f}（SE {self.blp_slope_se:.4f}），"
+            f"CI 盖住 1 的比例 {self.blp_covers_one:.3f}（校准则应当 ≈ 0.95）",
+            f"  GATES 组级覆盖率 {self.gates_coverage:.4f}，"
+            f"平均区间长度 {self.gates_mean_length:.4f}",
+            f"  信号诊断：峰度 {self.signal_kurtosis:.1f}（正态为 3），"
+            f"倾向得分落在 [0.05,0.95] 外的比例 {self.overlap_violation_share:.4f}",
+            "  各组：",
+        ]
+        for i, (eff, true) in enumerate(zip(self.gates_effects, self.gates_true)):
+            gap = eff - true
+            mc = self.gates_gap_mc_se[i] if i < len(self.gates_gap_mc_se) else float("nan")
+            # 只有超出蒙特卡洛噪音才叫偏差，否则一律记为噪音（不做无依据的断言）
+            verdict = "噪音范围内" if abs(gap) <= 2 * mc else "超出噪音"
+            lines.append(
+                f"    组{i + 1}: 估计 {eff:+.4f} vs 真实 {true:+.4f}"
+                f"（差 {gap:+.4f} ± {mc:.4f}，{verdict}）"
+            )
+        if self.unit_level_note:
+            lines.append(f"  对照：{self.unit_level_note}")
+        return "\n".join(lines)
+
+
+def run_gates_blp_audit(
+    *,
+    n: int = 1500,
+    n_splits: int = 20,
+    n_groups: int = 4,
+    n_trees: int = 40,
+    max_depth: int = 5,
+    min_leaf: int = 20,
+    seed: int = 0,
+    cate_form: str = "nonlinear",
+    proxy_kind: str = "forest",
+) -> GatesBlpResult:
+    """BLP 与 GATES 的实测校准（这是"组级水平可用"这句话的唯一证据）。
+
+    流程（每一步都对应文献里的一个决定）：
+      1. 把样本随机劈成**辅助样本**（训练代理）与**主样本**（做推断）；
+      2. 辅助样本上拟合因果森林当代理 τ̂（**允许它有偏**）；
+      3. 主样本上算 HT 信号；
+      4. BLP：``signal ~ 1 + τ̂`` 的斜率；GATES：按 τ̂ 分位数切 K 组、
+         ``signal ~ 组哑变量``；
+      5. 重复 ``n_splits`` 次，统计覆盖：BLP 的 CI 盖住 1、GATES 的 CI 盖住
+         **真实的组 ATE**（真值由 DGP 直接给出，不需要估计）。
+
+    ``proxy_kind="oracle"`` 是**正对照**：直接拿真 CATE 当代理（模拟"代理已
+    校准"这个理想情形）。它必须给出 BLP 斜率 ≈ 1、覆盖率 ≈ 0.95 ——
+    否则说明这个审计连真值都验不过，那 0.95 就只是"永远通过"，没有信息。
+    """
+    from ..causal.forest import CausalForest, ForestConfig
+    from ..causal.hte import HTEConfig, generate_hte_data
+
+    z = 1.959963984540054
+    slopes: list[float] = []
+    slope_ses: list[float] = []
+    covers_one = 0
+    effects_acc = np.zeros(n_groups)
+    true_acc = np.zeros(n_groups)
+    gaps: list[list[float]] = [[] for _ in range(n_groups)]
+    kurt_acc: list[float] = []
+    overlap_acc: list[float] = []
+    group_hits = 0
+    group_total = 0
+    lengths: list[float] = []
+
+    for s in range(n_splits):
+        data = generate_hte_data(
+            HTEConfig(n=n, n_features=6, n_informative=3, seed=seed + s, cate_form=cate_form)
+        )
+        rng = np.random.default_rng(1000 + s)
+        perm = rng.permutation(n)
+        aux, main = perm[: n // 2], perm[n // 2 :]
+        if proxy_kind == "oracle":
+            # 正对照：代理 = 真值。不需要训练，也不需要辅助样本。
+            main = perm
+            proxy = np.asarray(data.tau)[main]
+        elif proxy_kind == "forest":
+            cfg = ForestConfig(n_trees=n_trees, max_depth=max_depth, min_leaf=min_leaf)
+            forest = CausalForest(cfg)
+            forest.fit(data.X[aux], data.D[aux], data.Y[aux])
+            proxy = forest.predict(data.X[main])
+        else:  # pragma: no cover - 参数校验
+            raise ValueError(f"未知的 proxy_kind: {proxy_kind!r}（可选 forest / oracle）")
+
+        p = np.asarray(data.propensity)[main]
+        d = np.asarray(data.D)[main]
+        y = np.asarray(data.Y)[main]
+        # Horvitz-Thompson 信号：E[signal | Z] = s0(Z)，不需要结果模型
+        signal = (d - p) / (p * (1.0 - p)) * y
+        kurt = float(((signal - signal.mean()) ** 4).mean() / signal.var() ** 2)
+        kurt_acc.append(kurt)
+        overlap_acc.append(float(np.mean((p < 0.05) | (p > 0.95))))
+
+        # ---- BLP ---- #
+        x = np.column_stack([np.ones(main.size), proxy - proxy.mean()])
+        beta, se = _ols(x, signal)
+        slopes.append(float(beta[1]))
+        slope_ses.append(float(se[1]))
+        covers_one += int(abs(beta[1] - 1.0) <= z * se[1])
+
+        # ---- GATES ---- #
+        # 分位数组：用主样本上的代理分位数切，组大小尽量均衡
+        edges = np.quantile(proxy, np.linspace(0, 1, n_groups + 1)[1:-1])
+        group = np.searchsorted(edges, proxy, side="right")
+        dummies = np.zeros((main.size, n_groups))
+        dummies[np.arange(main.size), group] = 1.0
+        # 去掉空组（分位数理论上不会空，保险起见）
+        keep = [g for g in range(n_groups) if dummies[:, g].sum() > 1]
+        g_eff, g_se = _ols(dummies[:, keep], signal)
+        true_tau = np.asarray(data.tau)[main]
+        for j, g in enumerate(keep):
+            true_group = float(true_tau[group == g].mean())
+            effects_acc[g] += float(g_eff[j])
+            true_acc[g] += true_group
+            gaps[g].append(float(g_eff[j]) - true_group)
+            group_total += 1
+            group_hits += int(abs(g_eff[j] - true_group) <= z * g_se[j])
+            lengths.append(2 * z * float(g_se[j]))
+
+    return GatesBlpResult(
+        n=n,
+        n_splits=n_splits,
+        n_groups=n_groups,
+        blp_slope=float(np.mean(slopes)),
+        blp_slope_se=float(np.mean(slope_ses)),
+        blp_covers_one=covers_one / n_splits,
+        gates_effects=list(effects_acc / n_splits),
+        gates_true=list(true_acc / n_splits),
+        gates_coverage=group_hits / max(group_total, 1),
+        gates_mean_length=float(np.mean(lengths)) if lengths else float("nan"),
+        gates_gap=[float(np.mean(g)) if g else float("nan") for g in gaps],
+        gates_gap_mc_se=[
+            float(np.std(g, ddof=1) / np.sqrt(len(g))) if len(g) > 1 else float("nan")
+            for g in gaps
+        ],
+        signal_kurtosis=float(np.mean(kurt_acc)) if kurt_acc else float("nan"),
+        overlap_violation_share=float(np.mean(overlap_acc)) if overlap_acc else float("nan"),
+        unit_level_note=(
+            "单元级那两条路线（叶内方差 / bootstrap）实测覆盖率 0.13~0.74，"
+            "而这里是**组级**：对象不同，不能直接比大小，只能比"
+            "「谁给出了可用的区间」"
+        ),
     )
 
 

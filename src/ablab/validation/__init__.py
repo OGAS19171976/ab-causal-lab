@@ -40,10 +40,12 @@ from .hte_audit import (
     CateIntervalCoverage,
     CATEModelComparison,
     DMLEstimationAudit,
+    GatesBlpResult,
     UpliftMetricAudit,
     run_cate_coverage_audit,
     run_cate_form_comparison,
     run_dml_audit,
+    run_gates_blp_audit,
     run_uplift_metric_audit,
 )
 from .methods import (
@@ -142,6 +144,8 @@ __all__ = [
     "CATEModelComparison",
     "CateIntervalCoverage",
     "run_cate_coverage_audit",
+    "GatesBlpResult",
+    "run_gates_blp_audit",
     "CATEFormResult",
     "DMLEstimationAudit",
     "UpliftMetricAudit",

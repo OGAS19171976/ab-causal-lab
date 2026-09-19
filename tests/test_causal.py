@@ -427,6 +427,84 @@ class TestCateInterval:
         )
 
 
+class TestGatesBlp:
+    """组级路线：单元级不可行（上一条），**组级可行** —— 换成 BLP/GATES。
+
+    依据 Chernozhukov 等（arXiv:1712.04802）：通用 ML 工具下 CATE 的一致估计
+    与自适应置信集都不存在，所以推断对象应当是 CATE 的**特征**。信号取
+    Horvitz-Thompson，分样本做经典 OLS 推断，于是**不要求代理一致**。
+
+    这些断言钉三件事，缺一件这条路线就会被误读：
+      1. 组级区间确实给出名义覆盖（与单元级的 0.4 形成对照）；
+      2. 审计**有功效** —— 真值代理通过、未校准的森林代理被推开；
+      3. HT 信号在本 DGP 下重尾（峰度远超 3）且正值性近乎违背 ——
+         这是"区间有效但又宽又不稳"的原因，也是下一步换 AIPW 信号的依据。
+    """
+
+    @staticmethod
+    def _run(proxy_kind: str):
+        from ablab.validation.hte_audit import run_gates_blp_audit
+
+        return run_gates_blp_audit(
+            n=1500, n_splits=8, n_groups=4, seed=0, proxy_kind=proxy_kind
+        )
+
+    def test_shapes_and_ranges(self):
+        r = self._run("forest")
+        assert r.n_groups == 4
+        assert len(r.gates_effects) == len(r.gates_true) == len(r.gates_gap) == 4
+        assert 0.0 <= r.gates_coverage <= 1.0
+        assert 0.0 <= r.blp_covers_one <= 1.0
+        assert r.gates_mean_length > 0.0
+        assert all(len(g) == 4 for g in (r.gates_gap, r.gates_gap_mc_se))
+
+    def test_group_level_coverage_beats_unit_level(self):
+        """**组级覆盖率是名义值量级**，而单元级实测只有 0.13~0.44。
+
+        两个数不能直接比大小（对象不同：一个是 E[τ|组]，一个是 τ(X)），
+        能比的是"谁给出了可用的区间"。所以断言的是组级落在名义值附近，
+        且**明显高于**单元级那条路线的实测上界。
+        """
+        r = self._run("forest")
+        assert r.gates_coverage > 0.8, (
+            f"组级覆盖率 {r.gates_coverage:.3f} —— 若真掉到这个量级，"
+            "说明 HT 信号或分样本流程坏了，而不是名义性波动"
+        )
+
+    def test_calibrated_proxy_passes_and_miscalibrated_is_rejected(self):
+        """审计的**功效**：真值代理斜率≈1，森林代理被明显推开。
+
+        实测（n=1500、8 次分裂）：真值代理斜率 1.05（SE 0.20），
+        森林代理 1.45（SE 0.78）。森林代理不只是斜率大，它的 SE 还大 4 倍 ——
+        因为 τ̂ 被"压平"（attenuation），Var(τ̂) 变小，斜率与它的方差一起变大。
+        断言用宽松倍数，钉的是方向而不是那两个具体数。
+        """
+        forest, oracle = self._run("forest"), self._run("oracle")
+        assert abs(oracle.blp_slope - 1.0) < abs(forest.blp_slope - 1.0), (
+            f"真值代理 {oracle.blp_slope:.3f} vs 森林代理 {forest.blp_slope:.3f}"
+        )
+        assert forest.blp_slope_se > 2 * oracle.blp_slope_se
+
+    def test_signal_is_heavy_tailed_and_positivity_is_violated(self):
+        """重尾与重叠度诊断 —— 记下的是**瓶颈**，不是可以忽略的细节。
+
+        实测：倾向得分范围 [0.014, 1.000]，权重 1/(p(1-p)) 最大 5530；
+        信号峰度 70~875（Y 自身只有 ~4.6）。组级 SE 用 HC0，在这个峰度下
+        有限样本不可靠，覆盖率才会在 0.88~0.96 之间摆动。
+        """
+        r = self._run("forest")
+        assert r.signal_kurtosis > 10.0, r.signal_kurtosis
+        assert 0.0 < r.overlap_violation_share < 0.5, r.overlap_violation_share
+
+    def test_unknown_proxy_kind_is_rejected(self):
+        import pytest
+
+        from ablab.validation.hte_audit import run_gates_blp_audit
+
+        with pytest.raises(ValueError, match="proxy_kind"):
+            run_gates_blp_audit(n=200, n_splits=1, proxy_kind="nonsense")
+
+
 class TestPretrendTest:
     def test_passes_under_parallel_trends(self):
         cfg = StaggeredPanelConfig(
