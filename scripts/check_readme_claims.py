@@ -98,8 +98,11 @@ CLAIMS: list[tuple[str, str, str]] = [
     ("治理·护栏：越界建议停实验", "governance_report.md", "建议停止实验"),
     ("治理·护栏：缺数据不等于通过", "governance_report.md", "不是通过"),
     ("治理·护栏：方向不从名字猜", "governance_report.md", "不从指标名猜"),
+    ("治理·护栏：判定已校准", "governance_report.md", "误停率"),
+    ("治理·护栏：H0 不误停", "governance_report.md", "宁可少停"),
+    ("治理·护栏：边界点是真正的工作点", "governance_report.md", "边界点"),
     # 数仓护栏链路：两臂均值与"事件名过滤"是稳定的
-    ("数仓·护栏：长表链路", "warehouse_report.md", "dim_guardrail_config"),
+    ("数仓·护栏：长表链路", "warehouse_report.md", "护栏链路"),
     ("数仓·护栏：注入的伤害可见", "warehouse_report.md", "latency_p99"),
     # 簇级 CUPED（文本类：数值随数据重生成会变）
     ("数仓·簇级 CUPED：口径已打开", "warehouse_report.md", "簇级 CUPED"),

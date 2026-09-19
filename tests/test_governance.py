@@ -412,6 +412,58 @@ class TestAuthAndActor:
             reg.close()
 
 
+class TestGuardrailCalibration:
+    """护栏判定的**运行特征**：误停率与功效。
+
+    规则问的是"伤害是否超过容忍度"，所以它不是 5% 水平的检验 ——
+    H0（真实伤害 0）下几乎不会喊停，而这是**有意**的取舍。
+    这一组把"保守到什么程度、真有害时能不能喊出来"钉住：
+    只写规则合理、不给运行特征，等于让别人替我们相信。
+    """
+
+    def test_h0_almost_never_stops_and_h1_almost_always_stops(self):
+        """H0 误停 0 / 边界点开始出现停止 / H1 全部停止。
+
+        实测（80 次/场景、n=3000、容忍度 5%）：H0 停 0 次；
+        边界点（伤害正好 5%）停 4 次、观察 36 次；注入 12% 时停 80 次。
+        这里用小样本跑（6 次）以控制测试时长，断言方向而不是具体比例。
+        """
+        from ablab.validation.guardrail_audit import run_guardrail_audit
+
+        cal = run_guardrail_audit(n_trials=6, n_users=1500, max_harm=0.05, harm=0.30)
+        assert cal.false_stop_rate == 0.0, cal.statuses_h0
+        assert cal.power >= 0.5, cal.statuses_h1
+        assert cal.statuses_h0.get("unknown", 0) == 0
+        # 判定分布必须覆盖到"通过"这一档：否则是规则没跑起来
+        assert cal.statuses_h0.get("ok", 0) == 6
+
+    def test_boundary_point_is_the_real_operating_point(self):
+        """边界点（伤害正好等于容忍度）落在"观察/通过"之间，而不是全停。
+
+        这一条是这条规则的性格：**点估计要越界、置信下界也要越界**才停，
+        所以压线时大量进入"观察"带。把它钉住，免得有人把阈值改到 0
+        还以为只是"更灵敏"——那会让 H0 误停率跳到 alpha 附近。
+        """
+        from ablab.validation.guardrail_audit import run_guardrail_audit
+
+        cal = run_guardrail_audit(n_trials=6, n_users=1500, max_harm=0.05, harm=0.05)
+        assert cal.boundary_statuses.get("unknown", 0) == 0
+        assert cal.boundary_statuses.get("ok", 0) + cal.boundary_statuses.get("watch", 0) > 0
+
+    def test_declared_tolerance_drives_the_verdict(self):
+        """同一条数据、同一个伤害：容忍度收紧到 1% 就该停，放宽到 50% 就通过。
+
+        这是"阈值必须事先声明"的可测含义：判定随**声明**变，
+        而不是随数据变。
+        """
+        from ablab.validation.guardrail_audit import run_guardrail_audit
+
+        tight = run_guardrail_audit(n_trials=3, n_users=1500, max_harm=0.01, harm=0.12)
+        loose = run_guardrail_audit(n_trials=3, n_users=1500, max_harm=0.50, harm=0.12)
+        assert tight.power == 1.0, tight.statuses_h1
+        assert loose.power == 0.0, loose.statuses_h1
+
+
 class TestGuardrailAnalysis:
     """护栏：**真的判定**，并且把"无法判断"与"通过"严格分开。
 
