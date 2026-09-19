@@ -321,6 +321,23 @@ class TestSunAbraham:
         assert set(sa.event_study) <= {-2, -1, 0, 1, 2}
         assert set(sa.weights) <= {0, 1, 2}  # 整体 ATT 只聚合 k>=0
 
+    def test_event_study_se_uses_influence_too(self):
+        """事件研究的聚合也改用影响函数了 —— 但它的影响**很小，而且符号不定**。
+
+        实测（HEADLINE 面板）：多数 k 上两者只差几个百分点，个别 k 上
+        影响函数算出的 SE 反而**更小** —— 因为格子之间的协方差**可以为负**
+        （不同队列、不同基准期），所以"影响函数版必然更大"这句话是错的。
+        这条断言只钉住"两者同量级"：改的是算法，不是数字。
+        """
+        panel, _ = generate_staggered_panel(HEADLINE)
+        cs = callaway_santanna(panel)
+        for k, est in cs.event_study.items():
+            rows = [e for (g, t), e in cs.group_time.items() if t - g == k]
+            w = np.array([e.n_treatment for e in rows], dtype=float)
+            w = w / w.sum()
+            naive = float(np.sqrt(sum(wi**2 * e.std_error**2 for wi, e in zip(w, rows))))
+            assert 0.7 * naive <= est.std_error <= 1.4 * naive, (k, est.std_error, naive)
+
     def test_aggregation_variance_audit_separates_the_two(self):
         """审计本身要能分辨两种算法：H0 下独立合成的越界率明显更高。
 

@@ -47,6 +47,9 @@ __all__ = [
 
 ControlGroup = Literal["never_treated", "not_yet_treated"]
 
+#: ``(队列, 绝对期数)`` 的键
+EstimatorKey = tuple[int, int]
+
 
 # --------------------------------------------------------------------------- #
 # 2×2
@@ -426,8 +429,12 @@ def _cs_group_time(
     base: int,
     control_group: ControlGroup,
     alpha: float,
-) -> Estimate | None:
-    """单个 ``ATT(g, t)``：``E[Y_t - Y_base | G=g] - E[Y_t - Y_base | C]``。"""
+) -> tuple[Estimate, np.ndarray] | None:
+    """单个 ``ATT(g, t)`` 及其**影响函数**。
+
+    连影响函数一起返回，是因为聚合必须用它：各 ``ATT(g,t)`` 之间相关
+    （共用对照单元、相邻队列还共用基准期），按独立量合成会低估方差。
+    """
     out = cs_att_with_influence(panel, cohort, period, base, control_group)
     if out is None:
         return None
@@ -435,10 +442,10 @@ def _cs_group_time(
 
     n = psi.size
     se = float(np.sqrt(np.var(psi, ddof=1) / n))
-    inference = t_inference(effect, se=se, degrees_of_freedom=max(n - 1, 1), alpha=alpha)
-    ci_low, ci_high = inference.interval(effect)
+    inf = t_inference(effect, se=se, degrees_of_freedom=max(n - 1, 1), alpha=alpha)
+    ci_low, ci_high = inf.interval(effect)
 
-    return Estimate(
+    estimate = Estimate(
         metric=f"ATT({cohort},{period})",
         variant="treated",
         control="control",
@@ -448,13 +455,14 @@ def _cs_group_time(
         std_error=se,
         ci_low=float(ci_low),
         ci_high=float(ci_high),
-        p_value=inference.p_value,
+        p_value=inf.p_value,
         n_treatment=n_t,
         n_control=n_c,
         mean_treatment=effect,
         mean_control=0.0,
         alpha=alpha,
     )
+    return estimate, psi
 
 
 def callaway_santanna(
@@ -475,6 +483,8 @@ def callaway_santanna(
     """
     events: dict[tuple[int, int], Estimate] = {}
     weights: dict[tuple[int, int], float] = {}
+    #: 每个 ATT(g,t) 的影响函数，**聚合时必须用它**（见下面的方差说明）
+    psi_map: dict[tuple[int, int], np.ndarray] = {}
 
     for g in panel.cohorts():
         g = int(g)
@@ -489,11 +499,13 @@ def callaway_santanna(
             if base_period == "universal" and t > base and t < g:
                 # 基准期之后的处置前时期也能算，但口径容易混淆，跳过
                 continue
-            est = _cs_group_time(panel, g, t, base, control_group, alpha)
-            if est is None:
+            out = _cs_group_time(panel, g, t, base, control_group, alpha)
+            if out is None:
                 continue
+            est, psi = out
             events[(g, t)] = est
             weights[(g, t)] = float(est.n_treatment)
+            psi_map[(g, t)] = psi
 
     if not events:
         raise ValueError("没有任何可估计的 ATT(g,t)，检查队列设置与对照组选择")
@@ -519,10 +531,7 @@ def callaway_santanna(
     naive_overall_se = float(np.sqrt((w**2 * ses**2).sum()))
     psi_overall = np.zeros(panel.n_units)
     for weight, key in zip(w, post_keys):
-        out = cs_att_with_influence(panel, key[0], key[1], key[0] - 1, control_group)
-        if out is None:  # pragma: no cover - 与上面同源，不该发生
-            continue
-        psi_overall = psi_overall + weight * out[1]
+        psi_overall = psi_overall + weight * psi_map[key]
     overall_se = float(np.sqrt(np.var(psi_overall, ddof=1) / panel.n_units))
     overall_inf = t_inference(
         overall_effect, se=overall_se, degrees_of_freedom=max(panel.n_units - 1, 1), alpha=alpha
@@ -568,18 +577,25 @@ def callaway_santanna(
     )
 
     # ---- 事件研究：按相对期数聚合 ---------------------------------------- #
-    es: dict[int, list[tuple[float, float, int]]] = {}
-    for (g, t), est in events.items():
-        k = t - g
-        es.setdefault(k, []).append((est.absolute_effect, est.std_error, est.n_treatment))
+    #
+    # 这里的 SE **必须**用影响函数合成，理由与整体 ATT 完全相同：
+    # 同一 k 上的各 ATT(g,t) 共用对照单元，不同 k 之间还共用基准期。
+    # 第一版这里是 sqrt(Σ w² se²)（独立合成）—— 整体 ATT 那处修好之后
+    # 这一处漏了一阵子，是靠"把仓库里所有方差合成点扫一遍"才发现的。
+    # **同一个教训要应用到所有相关处，而不是只修被报告出来的那一处。**
+    es: dict[int, list[tuple[EstimatorKey, int]]] = {}
+    for (g, t) in events:
+        es.setdefault(t - g, []).append(((g, t), int(events[(g, t)].n_treatment)))
 
     event_study: dict[int, Estimate] = {}
     for k, rows in sorted(es.items()):
-        ww = np.array([r[2] for r in rows], dtype=float)
+        ww = np.array([n for _key, n in rows], dtype=float)
         ww = ww / ww.sum()
-        eff = float(sum(wi * r[0] for wi, r in zip(ww, rows)))
-        se = float(np.sqrt(sum(wi**2 * r[1] ** 2 for wi, r in zip(ww, rows))))
-        inf = t_inference(eff, se=se, degrees_of_freedom=max(panel.n_units - 1, 1), alpha=alpha)
+        eff = float(sum(wi * events[key].absolute_effect for wi, (key, _n) in zip(ww, rows)))
+        psi = np.zeros(panel.n_units)
+        for wi, (key, _n) in zip(ww, rows):
+            psi = psi + wi * psi_map[key]
+        se, inf = _se_from_influence(eff, psi, alpha)
         lo, hi = inf.interval(eff)
         event_study[k] = Estimate(
             metric=f"event_study(k={k})",
@@ -592,7 +608,7 @@ def callaway_santanna(
             ci_low=float(lo),
             ci_high=float(hi),
             p_value=inf.p_value,
-            n_treatment=int(sum(r[2] for r in rows)),
+            n_treatment=int(sum(n for _key, n in rows)),
             n_control=0,
             mean_treatment=float("nan"),
             mean_control=float("nan"),

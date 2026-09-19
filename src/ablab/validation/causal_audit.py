@@ -154,6 +154,23 @@ class AggregationVarianceAudit:
     早就写过（"实测把 size 从 5% 抬到 11%"），但当时只用在了 lead 的联合检验上。
 
     这里把差别量出来：同一批仿真、同一个点估计，只换方差算法。
+
+    **两次排查的结果差别很大，如实记在这里**：
+
+    * **整体 ATT**：独立合成低估约 44%，H0 下越界率 0.22（应为 0.05）、
+      覆盖率 0.78（应为 0.95）。这是真 bug —— 它横跨 7 个相对期数，
+      而这些格子共用对照单元、相邻队列还共用基准期。
+    * **事件研究（逐个 k）**：同样的写法，但低估只有 **0~2%**。
+      原因不是"写法对了"，而是**结构不同**：单个 k 内往往只有 1~2 个格子
+      （处置前的 k 常常只有一个队列），彼此只共用对照组。
+      也就是说：**同一个错误的后果取决于相关性结构，不能按"公式看起来一样"外推。**
+      这一处仍然改了 —— 它更正确，而且让两条聚合路径共用同一个 `_se_from_influence`。
+
+    另外注意 ``pretrend_*_reject_rate`` **不该**被读成"处置前的 size"：
+    它统计的是"**至少有一个**处置前系数显著"，而各 k 之间高度相关、
+    又没做多重比较校正，所以它天然高于 α（实测约 0.12）。
+    逐个系数的 5% 是没问题的；要判断"整条处置前路径是否异常"，
+    该用 ``pretrend_test`` 那个**联合**检验，而不是数有几个星号。
     """
 
     n_trials: int
@@ -170,6 +187,14 @@ class AggregationVarianceAudit:
     #: 两种算法下 95% 区间覆盖 0 的比例（H0 下应当 ≈ 95%）
     influence_coverage: float
     naive_coverage: float
+    #: **处置前（placebo）**的越界率：取每个面板里所有 k<0 的系数，
+    #: 只要有一个在名义 5% 下"显著"就算一次越界。
+    #:
+    #: 这个数比整体 ATT 那个更要紧：处置前的系数正是"平行趋势看起来成立吗"
+    #: 的唯一依据。方差被低估 → 处置前的显著变多 → **平行趋势会被误判为不成立**
+    #: （或者反过来，使用者以为自己检验过了）。
+    pretrend_naive_reject_rate: float
+    pretrend_influence_reject_rate: float
 
     def summary(self) -> str:
         return "\n".join(
@@ -181,6 +206,11 @@ class AggregationVarianceAudit:
                 f"覆盖率 {self.naive_coverage:.4f}",
                 f"  平均 SE：{self.mean_se_influence:.4f} vs {self.mean_se_naive:.4f}"
                 f"（低估 {self.mean_se_understatement:.1%}）",
+                f"  处置前（placebo）越界率：{self.pretrend_influence_reject_rate:.4f}"
+                f" vs {self.pretrend_naive_reject_rate:.4f}"
+                "（两者通常相同 —— 同一 k 内往往只有一个队列，聚合本身没什么可差的；"
+                "而这个数**受多重比较影响**，不等于逐系数的 size，"
+                "要判断整条处置前路径请用 pretrend_test 的联合检验）",
             ]
         )
 
@@ -206,6 +236,7 @@ def run_aggregation_variance_audit(
     )
 
     inf_reject = naive_reject = inf_cov = naive_cov = 0
+    pre_naive = pre_inf = 0
     ses_inf: list[float] = []
     ses_naive: list[float] = []
     for i in range(n_trials):
@@ -224,6 +255,23 @@ def run_aggregation_variance_audit(
         inf_cov += int(abs(effect) <= z * se)
         naive_cov += int(abs(effect) <= z * se_naive)
 
+        # 处置前的系数：同一批点估计，只换 SE 的算法。
+        # naive 版的 SE 用 sqrt(Σ w² se²) 重算 —— 那是修之前的写法。
+        for k, est in cs.event_study.items():
+            if k >= 0:
+                continue
+            pre_inf += int(abs(est.absolute_effect) > z * est.std_error)
+            rows = [
+                e for (g, t), e in cs.group_time.items() if t - g == k
+            ]
+            if rows:
+                w = np.array([e.n_treatment for e in rows], dtype=float)
+                w = w / w.sum()
+                se_naive_k = float(
+                    np.sqrt(sum(wi**2 * e.std_error**2 for wi, e in zip(w, rows)))
+                )
+                pre_naive += int(abs(est.absolute_effect) > z * se_naive_k)
+
     se_inf = float(np.mean(ses_inf))
     se_naive = float(np.mean(ses_naive))
     return AggregationVarianceAudit(
@@ -239,6 +287,8 @@ def run_aggregation_variance_audit(
         ),
         influence_coverage=inf_cov / n_trials,
         naive_coverage=naive_cov / n_trials,
+        pretrend_naive_reject_rate=pre_naive / n_trials,
+        pretrend_influence_reject_rate=pre_inf / n_trials,
     )
 
 
