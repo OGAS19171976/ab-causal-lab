@@ -53,6 +53,9 @@ CLAIMS: list[tuple[str, str, str]] = [
     ("M6：单元级 I 类错误（错的那个）", "m6_validation.md", "0.6933"),
     ("M6：簇级 I 类错误（对的那个）", "m6_validation.md", "0.0633"),
     ("M6：MDE 与功效的自洽性", "m6_validation.md", "z_power(mde)="),
+    # 比值口径的 A/A 校准（"换了口径就要重跑审计"那一条的执行）
+    ("M6·比值口径：序贯 FWER", "m6_validation.md", "0.0700"),
+    ("M6·比值口径：95% 覆盖率", "m6_validation.md", "0.9250"),
     ("数仓：CUPED 与 DWD 明细一致", "warehouse_report.md", "一致"),
     ("数仓：ADS 判据写在报告里", "warehouse_report.md", "判据"),
     # 比值链路（06/07）的数字 —— 它们是"接通了"这件事唯一的实测证据

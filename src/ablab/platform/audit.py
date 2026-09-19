@@ -56,8 +56,14 @@ def _record(
     traffic_ratio: float = 1.0,
     true_lift: float = 0.0,
     metric: str = "metric",
+    metric_type: str = "mean",
+    estimator: str = "cuped",
 ) -> ExperimentRecord:
-    """直接构造一条记录（不经过注册表）——审计要的是分析管道，不是存储层。"""
+    """直接构造一条记录（不经过注册表）——审计要的是分析管道，不是存储层。
+
+    ``metric_type`` / ``estimator`` 是后加的：比值口径的校准要能被单独审，
+    而它**不能用 CUPED**（比值链路里没有前置协变量）——所以两者必须一起指定。
+    """
     names = ["control", "treatment"] if len(weights) == 2 else [f"arm{i}" for i in range(len(weights))]
     return ExperimentRecord(
         name=name,
@@ -66,6 +72,8 @@ def _record(
         traffic_ratio=traffic_ratio,
         true_lift=true_lift,
         primary_metric=metric,
+        metric_type=metric_type,
+        estimator=estimator,
     )
 
 
@@ -833,8 +841,111 @@ class UnitAwarenessResult:
         return 1.0 - 1.0 / self.se_ratio
 
 
-def run_unit_awareness_audit(
+@dataclass
+class RatioCalibrationAudit:
+    """比值口径（delta method）在**平台真实入口**上的校准。
+
+    为什么要单独审：比值指标的 SE 走的是 delta method，而序贯监控是按
+    "累计信息量"挑查看点的 —— 均值口径那套经验（CUPED 对齐后 FWER 仍守 5%）
+    不能直接搬过来，因为**信息量的定义变了**（比值指标的精度由分母驱动）。
+    这个仓库反复强调的规矩是"换了口径就要重跑审计"，这里就是那一次。
+
+    真值设为 0（H0），于是每一次拒绝都是假阳性。
+    """
+
+    n_salts: int
+    n_users: int
+    n_looks: int
+    alpha: float
+    metric_type: str
+    estimator: str
+    #: 固定样本口径（只看最后一次查看）的越界率
+    final_rate: float
+    #: 序贯口径（至少一次越界）= FWER
+    sequential_rate: float
+    #: Wilson 区间（盖住 alpha 才算守住）
+    sequential_interval: tuple[float, float]
+    #: 95% 区间覆盖真值 0 的比例
+    coverage: float
+    mean_z: float
+    sd_z: float
+
+    @property
+    def calibrated(self) -> bool:
+        lo, hi = self.sequential_interval
+        return lo <= self.alpha <= hi
+
+    def summary(self) -> str:
+        lo, hi = self.sequential_interval
+        return "\n".join(
+            [
+                f"比值口径（{self.estimator}）的 A/A 校准：{self.n_salts} 个 salt，"
+                f"每次 {self.n_users:,} 用户，{self.n_looks} 次查看",
+                f"  固定样本越界率 = {self.final_rate:.4f}"
+                f"（α={self.alpha}）",
+                f"  序贯越界率（FWER）= {self.sequential_rate:.4f}"
+                f"  Wilson 95% CI=[{lo:.4f}, {hi:.4f}]"
+                f"  {'盖住 α' if self.calibrated else '**没盖住 α**'}",
+                f"  95% 区间覆盖 0 的比例 = {self.coverage:.4f}",
+                f"  末次 z：均值 {self.mean_z:+.4f}，标准差 {self.sd_z:.4f}"
+                "（应当 ≈ 0 / 1）",
+            ]
+        )
+
+
+def run_ratio_calibration_audit(
     *,
+    n_salts: int = 200,
+    n_users: int = 8_000,
+    n_looks: int = 5,
+    alpha: float = 0.05,
+    metric: str = "post_metric_14d",
+    progress: Any = None,
+) -> RatioCalibrationAudit:
+    """比值口径在 H0 下的校准：多 salt、走平台真实入口 ``analyse_experiment``。
+
+    这是"换了口径就要重跑审计"那条规矩对比值链路的一次执行 ——
+    而且用的是**合成源**：只有它能换 salt 重复（数仓只有一份数据，
+    换 salt 不会得到新的实现），代价是它验证的是**平台管道**而不是那条 SQL 链路。
+    这个区别写在 README 的已知边界里，不含糊过去。
+    """
+    final_hits = seq_hits = coverage = 0
+    zs: list[float] = []
+    for i in range(n_salts):
+        rec = _record(
+            f"ratio_aa_{i}",
+            f"ratio_aa_{i}",
+            metric=metric,
+            metric_type="ratio",
+            estimator="post_only",  # 比值口径不能用 CUPED（没有前置协变量）
+        )
+        rep = analyse_experiment(rec, n_users=n_users, n_looks=n_looks, alpha=alpha)
+        primary = _require_estimate(rep.primary, "比值（ratio_delta）")
+        final_hits += int(primary.significant)
+        coverage += int(primary.ci_low <= 0.0 <= primary.ci_high)
+        seq_hits += int(any(m["crossed"] for m in rep.monitoring))
+        zs.append(float(rep.monitoring[-1]["z"]))
+        if progress is not None and (i + 1) % max(1, n_salts // 10) == 0:
+            progress(i + 1, n_salts)
+
+    z_arr = np.array(zs)
+    return RatioCalibrationAudit(
+        n_salts=n_salts,
+        n_users=n_users,
+        n_looks=n_looks,
+        alpha=alpha,
+        metric_type="ratio",
+        estimator="post_only",
+        final_rate=final_hits / n_salts,
+        sequential_rate=seq_hits / n_salts,
+        sequential_interval=_wilson(seq_hits, n_salts),
+        coverage=coverage / n_salts,
+        mean_z=float(z_arr.mean()),
+        sd_z=float(z_arr.std(ddof=1)) if z_arr.size > 1 else float("nan"),
+    )
+
+
+def run_unit_awareness_audit(    *,
     n_salts: int = 300,
     n_users: int = 10_000,
     n_looks: int = 5,

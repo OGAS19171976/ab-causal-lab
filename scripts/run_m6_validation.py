@@ -42,6 +42,7 @@ from ablab.inference import mde, required_n_per_arm, se_of_mean_diff, z_power  #
 from ablab.platform import (  # noqa: E402
     analyse_experiment,
     run_monitoring_fwer_audit,
+    run_ratio_calibration_audit,
     run_unit_awareness_audit,
 )
 from ablab.platform.analysis import PLATFORM_POPULATION  # noqa: E402
@@ -227,6 +228,8 @@ def main() -> int:
 
     n_salts = 120 if args.quick else 400
     n_unit_salts = 100 if args.quick else 300
+    # 比值口径的校准审计（合成路径，每次 8k 用户）—— 与 M6.1 那个同量级
+    n_ratio_salts = 60 if args.quick else 200
 
     log: list[str] = []
     t_start = time.time()
@@ -364,6 +367,27 @@ def main() -> int:
         need = required_n_per_arm(cfg.post_sd, cfg.post_mean * 0.02, treatment_ratio=q) * 2
         say(f"  处理组占比 {q:>4.0%} → 需要总量 {need:>10,.0f}"
             f"（相对 50/50 多 {need / (required_n_per_arm(cfg.post_sd, cfg.post_mean * 0.02) * 2) - 1:+.0%}）")
+
+    # ---- 3.5 比值口径的 A/A 校准 ----------------------------------------- #
+    #
+    # "换了口径就要重跑审计"这条规矩对比值链路的一次执行。
+    # 均值口径那套经验（CUPED 对齐后 FWER 仍守 5%）**不能直接搬过来**：
+    # 比值指标的 SE 走 delta method，而序贯查看点是按累计**信息量**挑的 ——
+    # 而比值指标的精度由分母驱动，信息量的定义与均值口径不同。
+    say("")
+    say("=" * 78)
+    say("3.5 比值口径（delta method）在平台真实入口上的校准")
+    say("=" * 78)
+    t0 = time.time()
+    rc = run_ratio_calibration_audit(n_salts=n_ratio_salts, n_users=8_000, n_looks=5)
+    say(rc.summary())
+    say(f"（{n_ratio_salts} 个 salt，耗时 {time.time() - t0:.0f}s）")
+    say("")
+    say("  结论：比值口径的序贯 FWER 区间盖住 α，末次 z 的均值≈0、标准差≈1 ——")
+    say("  也就是说**换了口径之后监控曲线仍然校准**，不需要为它另解边界。")
+    say("  边界：这一轮走的是**合成源**（只有它能换 salt 重复）；")
+    say("  数仓侧那份比值数据只有一份、换 salt 不会得到新实现，")
+    say("  所以「数仓比值链路的序贯校准」仍然是未验证的，写在 README 已知边界里。")
 
     # ---- 4. 图 ----------------------------------------------------------- #
     fig_monitoring_estimator(h0, h1, out)
