@@ -40,10 +40,12 @@ __all__ = [
     "CATEFormResult",
     "CATEModelComparison",
     "CateIntervalCoverage",
+    "ForestSeCalibration",
     "UpliftMetricAudit",
     "run_dml_audit",
     "run_cate_form_comparison",
     "run_cate_coverage_audit",
+    "run_forest_se_audit",
     "run_uplift_metric_audit",
 ]
 
@@ -301,7 +303,8 @@ class CateIntervalCoverage:
     n: int
     n_scenarios: int
     bootstrap_draws: int
-    #: 叶内方差 + 跨树独立合成
+    #: 叶内方差 + **跨树影响函数合成**（跨树协方差已并入；旧的"独立合成"
+    #: 仍留在 ``predict_with_se(combine="independent")`` 下，报告第 8c 节给了对照）
     analytic_coverage: float
     analytic_length: float
     #: 按单元 bootstrap
@@ -327,7 +330,7 @@ class CateIntervalCoverage:
             [
                 f"CATE 区间的覆盖率（{self.n_scenarios} 个场景 × n={self.n}，"
                 f"bootstrap B={self.bootstrap_draws}，名义 0.95）",
-                f"  叶内方差 + 独立合成：覆盖率 {self.analytic_coverage:.4f}，"
+                f"  叶内方差 + 跨树影响函数合成：覆盖率 {self.analytic_coverage:.4f}，"
                 f"长度 {self.analytic_length:.4f}",
                 f"  按单元 bootstrap　　：覆盖率 {self.bootstrap_coverage:.4f}，"
                 f"长度 {self.bootstrap_length:.4f}（长度差 {self.max_length_gap:.1%}）",
@@ -336,7 +339,10 @@ class CateIntervalCoverage:
                 f"  真 CATE 的 sd {self.true_cate_sd:.4f} vs τ̂ 的 sd "
                 f"{self.estimate_sd:.4f}；可给区间的单元 {self.finite_share:.1%}",
                 "  → 两条路线的覆盖率都远低于名义值，而**区间长度与真 CATE 的离散度"
-                "同量级**：所以盖不住的原因是**点估计有偏**，不是方差算错。",
+                "同量级**：所以盖不住的主因是**点估计有偏**。",
+                "     （方差本身也曾在跨树上按独立合成而偏小，修法见报告第 8c 节："
+                "SE 从真实抽样波动的 0.354 倍抬到 0.702 倍，覆盖率仍上不去 ——"
+                " 偏差是 SE 的 7.46 倍。）",
             ]
         )
 
@@ -422,6 +428,251 @@ def run_cate_coverage_audit(
         true_cate_sd=mean("true_sd"),
         estimate_sd=mean("est_sd"),
         finite_share=mean("finite"),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 二之二补、森林的 SE：跨树协方差到底差多少（这一轮修掉的第四处同族错误）
+# --------------------------------------------------------------------------- #
+@dataclass
+class ForestSeCalibration:
+    """把森林 SE 的两种合成方式放到**同一个靶子**前面量。
+
+    靶子是「τ̂(x) 的真实抽样波动」：同一个 x、换一批数据重抽 R 次，
+    τ̂(x) 的标准差。这个数不需要任何渐近论，是硬碰硬量出来的。
+
+    同时给 bootstrap 对照（同一份数据重抽 + 重新训练森林），
+    因为「跨 replication 的经验 sd」是**上帝视角**，产品路径上只有后者可用。
+    """
+
+    n: int
+    n_replications: int
+    n_grid: int
+    n_trees: int
+    max_depth: int
+    min_leaf: int
+    #: 跨 replication 的 τ̂ 经验 sd（真值口径），只在**所有 replication 都有限**的网格点上算
+    empirical_sd_mean: float
+    #: 影响函数相加（新）
+    influence_se_mean: float
+    #: 跨树独立合成（旧）
+    independent_se_mean: float
+    ratio_median: float
+    ratio_min: float
+    ratio_max: float
+    corr_influence: float
+    corr_independent: float
+    #: 对真实 CATE 的 95% 覆盖率，**只在有限 SE 的点上**（两种合成方式）。
+    #: 这是唯一说明问题的口径：``|τ̂−τ| ≤ z·inf`` 恒为真，把无穷区间算成
+    #: "覆盖"会让数字好看，但它什么都没证明。
+    coverage_influence_finite: float
+    coverage_independent_finite: float
+    #: 同上但把无穷区间也算作覆盖 —— **故意留着的反例**，说明为什么不能用它当口径。
+    coverage_influence_with_inf: float
+    #: 有限子集上的偏差/SE：解释"去掉 inf 点之后覆盖率反而更低"
+    finite_bias_over_se: float
+    #: 偏差诊断（覆盖率盖不住的真正原因）：全网格均值 / 有限子集均值
+    bias_mean: float
+    finite_bias_mean: float
+    #: 能给出有限 SE 的网格点占比
+    finite_share: float
+    #: bootstrap 对照
+    n_boot_reps: int
+    bootstrap_draws: int
+    bootstrap_sd_mean: float
+    boot_ratio_influence: float
+    boot_ratio_independent: float
+    boot_corr_influence: float
+    #: 深度敏感性：``(max_depth, 有限 SE 占比)``
+    depth_finite: tuple[tuple[int, float], ...]
+
+    @property
+    def influence_vs_truth(self) -> float:
+        """新 SE 与真实抽样波动的比值。1 附近才算校准，<1 就是反保守。"""
+        return self.influence_se_mean / self.empirical_sd_mean
+
+    @property
+    def independent_vs_truth(self) -> float:
+        """旧 SE 与真实抽样波动的比值（实测只有一半上下）。"""
+        return self.independent_se_mean / self.empirical_sd_mean
+
+    def summary(self) -> str:
+        return "\n".join(
+            [
+                f"森林 SE 的校准（{self.n_replications} 次重抽 × 网格 {self.n_grid} 点，"
+                f"n={self.n}，{self.n_trees} 棵 depth={self.max_depth} min_leaf={self.min_leaf}）",
+                f"  τ̂(x) 的真实抽样 sd（跨 replication 经验值）：{self.empirical_sd_mean:.4f}",
+                f"  影响函数相加（新）：SE 均值 {self.influence_se_mean:.4f}，"
+                f"比真实波动 {self.influence_vs_truth:.3f}",
+                f"  跨树独立合成（旧）：SE 均值 {self.independent_se_mean:.4f}，"
+                f"比真实波动 {self.independent_vs_truth:.3f}",
+                f"  逐点 新/旧 比值：中位 {self.ratio_median:.3f}，"
+                f"范围 [{self.ratio_min:.3f}, {self.ratio_max:.3f}]",
+                f"  与真实波动的逐点相关：新 {self.corr_influence:.3f}，"
+                f"旧 {self.corr_independent:.3f}",
+                f"  bootstrap 对照（{self.n_boot_reps} 次 × B={self.bootstrap_draws}）："
+                f"bootstrap sd 均值 {self.bootstrap_sd_mean:.4f}，"
+                f"新/它 {self.boot_ratio_influence:.3f}，旧/它 {self.boot_ratio_independent:.3f}",
+                f"  对真实 CATE 的 95% 覆盖率（只有限点）：新 {self.coverage_influence_finite:.4f}、"
+                f"旧 {self.coverage_independent_finite:.4f}",
+                f"  偏差 |τ̂−τ| 均值：全网格 {self.bias_mean:.4f}，"
+                f"有限子集 {self.finite_bias_mean:.4f}",
+                f"  有限子集上偏差 = SE 的 {self.finite_bias_over_se:.2f} 倍 —— "
+                "这就是「去掉 inf 点覆盖率反而更低」的原因"
+                "（那些点不是更可信，只是区间更窄）",
+                f"  能给出有限 SE 的点 {self.finite_share:.1%}，"
+                "其余只拿到无穷区间，等于没有区间",
+                f"  → 影响函数相加把 SE 从真实波动的 {self.independent_vs_truth:.3f} 倍"
+                f"推到 {self.influence_vs_truth:.3f} 倍，逐点比值恒 >1"
+                f"（{self.ratio_min:.2f}~{self.ratio_max:.2f}），不是碰巧几个点；",
+                "    但覆盖率几乎没动 —— 偏差是 SE 的 7 倍以上，"
+                "**这一轮修的是方差那一半，偏差那一半仍然没修**。",
+            ]
+        )
+
+
+def run_forest_se_audit(
+    *,
+    n: int = 1200,
+    n_grid: int = 300,
+    n_replications: int = 30,
+    n_trees: int = 40,
+    max_depth: int = 3,
+    min_leaf: int = 20,
+    bootstrap_reps: int = 6,
+    bootstrap_draws: int = 15,
+    depth_probe: tuple[int, ...] = (2, 3, 4, 5),
+    seed_start: int = 1,
+) -> ForestSeCalibration:
+    """量森林 SE 的两种合成方式（这一轮的核心证据）。
+
+    为什么必须量：旧写法把各棵树的方差按**独立**合成，而它们用同一份数据
+    训练 —— 这是本仓库在 CS 聚合、SA 聚合、事件研究上修过三次的同一个错误。
+    修法是把各棵树的**影响函数相加**。但"修好了"这句话不能靠推导，
+    只能靠在同一个靶子前量出来。
+
+    网格固定用第一个 replication 的 X 前 ``n_grid`` 行（``tau`` 是 X 的
+    确定性函数，所以真值可以直接取）。森林在每次重抽的数据上重新训练，
+    但**始终评估在同一个网格上** —— 不这样就没有"固定的 x"可言。
+
+    有限点集的取法：某个网格点只要在**任意一次** replication 里拿到过
+    ``inf``（有树切出了退化叶子），就整行剔除。宁可样本变小，也不混两种口径。
+    """
+    from ..causal.forest import CausalForest, ForestConfig
+
+    base = generate_hte_data(
+        HTEConfig(n=n, n_features=6, n_informative=3, cate_form="nonlinear", seed=seed_start - 1)
+    )
+    grid = base.X[:n_grid]
+    true = np.asarray(base.tau)[:n_grid]
+    cfg = ForestConfig(n_trees=n_trees, max_depth=max_depth, min_leaf=min_leaf, seed=0)
+    z = 1.959963984540054
+
+    taus = np.empty((n_replications, n_grid))
+    se_inf = np.empty((n_replications, n_grid))
+    se_ind = np.empty((n_replications, n_grid))
+    for r in range(n_replications):
+        data = generate_hte_data(
+            HTEConfig(
+                n=n, n_features=6, n_informative=3, cate_form="nonlinear",
+                seed=seed_start + r,
+            )
+        )
+        forest = CausalForest(cfg).fit(data.X, data.D, data.Y)
+        tau_r, se_new = forest.predict_with_se(grid, combine="influence")
+        _, se_old = forest.predict_with_se(grid, combine="independent")
+        taus[r], se_inf[r], se_ind[r] = tau_r, se_new, se_old
+
+    usable = ~(np.isinf(se_inf).any(axis=0) | np.isinf(se_ind).any(axis=0))
+    if usable.sum() < 10:
+        raise ValueError(
+            f"只有 {int(usable.sum())} 个网格点在所有 replication 里都拿到有限 SE —— "
+            "样本太小，量不出校准；请调大 min_leaf 或调小 max_depth"
+        )
+
+    tau_u = taus[:, usable]
+    inf_u = se_inf[:, usable]
+    ind_u = se_ind[:, usable]
+    truth = true[usable]
+    empirical = tau_u.std(axis=0, ddof=1)
+    mean_inf = inf_u.mean(axis=0)
+    mean_ind = ind_u.mean(axis=0)
+    ratio = mean_inf / mean_ind
+
+    # ---- bootstrap 对照：同一份数据重抽、重新训练 ------------------------- #
+    boot_sds = []
+    for r in range(min(bootstrap_reps, n_replications)):
+        data = generate_hte_data(
+            HTEConfig(
+                n=n, n_features=6, n_informative=3, cate_form="nonlinear",
+                seed=seed_start + r,
+            )
+        )
+        rng = np.random.default_rng(10_000 + r)
+        draws = np.empty((bootstrap_draws, n_grid))
+        for b in range(bootstrap_draws):
+            idx = rng.integers(0, n, size=n)
+            draws[b] = CausalForest(cfg).fit(data.X[idx], data.D[idx], data.Y[idx]).predict(grid)
+        boot_sds.append(draws[:, usable].std(axis=0, ddof=1))
+    boot_sd = np.mean(boot_sds, axis=0)
+
+    # ---- 深度敏感性：深树切出退化叶子，有限 SE 的点会变少 ----------------- #
+    depth_finite: list[tuple[int, float]] = []
+    for depth in depth_probe:
+        shares = []
+        for r in range(3):
+            data = generate_hte_data(
+                HTEConfig(
+                    n=n, n_features=6, n_informative=3, cate_form="nonlinear",
+                    seed=seed_start + r,
+                )
+            )
+            d_cfg = ForestConfig(n_trees=n_trees, max_depth=depth, min_leaf=min_leaf, seed=0)
+            _, se_d = CausalForest(d_cfg).fit(data.X, data.D, data.Y).predict_with_se(
+                grid, combine="influence"
+            )
+            shares.append(float(np.isfinite(se_d).mean()))
+        depth_finite.append((depth, float(np.mean(shares))))
+
+    mean_tau = tau_u.mean(axis=0)
+    finite_bias = float(np.abs(mean_tau - truth).mean())
+    finite_se = float(mean_inf.mean())
+    grid_bias = float(np.abs(taus.mean(axis=0) - true).mean())
+    return ForestSeCalibration(
+        n=n,
+        n_replications=n_replications,
+        n_grid=n_grid,
+        n_trees=n_trees,
+        max_depth=max_depth,
+        min_leaf=min_leaf,
+        empirical_sd_mean=float(empirical.mean()),
+        influence_se_mean=float(mean_inf.mean()),
+        independent_se_mean=float(mean_ind.mean()),
+        ratio_median=float(np.median(ratio)),
+        ratio_min=float(ratio.min()),
+        ratio_max=float(ratio.max()),
+        corr_influence=float(np.corrcoef(mean_inf, empirical)[0, 1]),
+        corr_independent=float(np.corrcoef(mean_ind, empirical)[0, 1]),
+        coverage_influence_finite=float(
+            np.mean(np.abs(tau_u - truth) <= z * inf_u)
+        ),
+        coverage_independent_finite=float(
+            np.mean(np.abs(tau_u - truth) <= z * ind_u)
+        ),
+        coverage_influence_with_inf=float(
+            np.mean(np.abs(taus - true) <= z * se_inf)
+        ),
+        finite_bias_over_se=finite_bias / finite_se,
+        bias_mean=grid_bias,
+        finite_bias_mean=finite_bias,
+        finite_share=float(usable.mean()),
+        n_boot_reps=min(bootstrap_reps, n_replications),
+        bootstrap_draws=bootstrap_draws,
+        bootstrap_sd_mean=float(boot_sd.mean()),
+        boot_ratio_influence=float(mean_inf.mean() / boot_sd.mean()),
+        boot_ratio_independent=float(mean_ind.mean() / boot_sd.mean()),
+        boot_corr_influence=float(np.corrcoef(mean_inf, boot_sd)[0, 1]),
+        depth_finite=tuple(depth_finite),
     )
 
 

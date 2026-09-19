@@ -31,6 +31,11 @@ import numpy as np
 
 __all__ = ["CausalTree", "CausalForest", "ForestConfig"]
 
+#: 影响函数合成能承受的 ψ 矩阵单元数上限（``n_pred × N``）。
+#: 约 1.6 GB（float64）—— 到这一步就不是"算得慢"，而是"内存没了"，
+#: 所以宁可在这里明确报错，也不要让它把机器拖死。
+_MAX_IF_CELLS = 2 * 10**8
+
 
 @dataclass
 class _Node:
@@ -45,6 +50,16 @@ class _Node:
     var: float = 0.0
     n_struct: int = 0
     n_est: int = 0
+    #: 该叶子的**影响函数原料**（在 estimation 半样本上算）：
+    #: 单元下标、是否处置、以及臂内残差 ``Y_i − 该臂均值``。
+    #:
+    #: 为什么要在叶子上留这三样：跨树方差的正确做法是把各棵树的**影响函数
+    #: 相加**（协方差自动进来），而不是把方差按独立合成。
+    #: 这与本仓库在 CS 聚合、SA 聚合、事件研究上修过三次的是同一个错误 ——
+    #: 森林是第四处，也是最后一处还活着的地方。
+    est_idx: np.ndarray | None = None
+    est_treated: np.ndarray | None = None
+    est_resid: np.ndarray | None = None
 
     @property
     def is_leaf(self) -> bool:
@@ -254,21 +269,42 @@ def _assign_leaves(node: _Node, X: np.ndarray, idx: np.ndarray, out: np.ndarray)
 
 
 def _fill_leaf_effects(
-    node: _Node, X: np.ndarray, D: np.ndarray, Y: np.ndarray, idx: np.ndarray
+    node: _Node,
+    X: np.ndarray,
+    D: np.ndarray,
+    Y: np.ndarray,
+    idx: np.ndarray,
+    index_map: np.ndarray | None = None,
 ) -> None:
-    """在 estimation 半样本上给叶子填效应值。"""
+    """在 estimation 半样本上给叶子填效应值。
+
+    ``index_map`` 把"树内部的下标"翻回**原始训练样本**的下标。森林里每棵树
+    只吃到 subsample，叶子里存的 ``est_idx`` 如果停留在本地坐标，各棵树的
+    影响函数就**没法相加**（同一个单元在不同树里编号不同）—— 而相加正是这
+    一轮要修的事。
+    """
     if node.is_leaf:
         tau, var, n1, n0 = _tau_of(D, Y, idx)
         node.tau = tau
         node.var = var
         node.n_est = n1 + n0
+        # 影响函数原料：臂内残差（保证按臂中心化，正是 IF 的定义）
+        treated = D[idx] > 0.5
+        resid = np.array(Y[idx], dtype=float)
+        if treated.any():
+            resid[treated] -= resid[treated].mean()
+        if (~treated).any():
+            resid[~treated] -= resid[~treated].mean()
+        node.est_idx = np.array(idx, dtype=int) if index_map is None else index_map[idx]
+        node.est_treated = treated
+        node.est_resid = resid
         return
     mask = X[idx, node.feature] <= node.threshold
     left, right = node.children
     if mask.any():
-        _fill_leaf_effects(left, X, D, Y, idx[mask])
+        _fill_leaf_effects(left, X, D, Y, idx[mask], index_map)
     if (~mask).any():
-        _fill_leaf_effects(right, X, D, Y, idx[~mask])
+        _fill_leaf_effects(right, X, D, Y, idx[~mask], index_map)
 
 
 def _predict_tree(node: _Node, X: np.ndarray, out: np.ndarray, idx: np.ndarray) -> None:
@@ -281,6 +317,62 @@ def _predict_tree(node: _Node, X: np.ndarray, out: np.ndarray, idx: np.ndarray) 
         _predict_tree(left, X, out, idx[mask])
     if (~mask).any():
         _predict_tree(right, X, out, idx[~mask])
+
+
+def _accumulate_tree_if(
+    node: _Node, X: np.ndarray, psi: np.ndarray, idx: np.ndarray
+) -> None:
+    """把**这棵树对预测值的影响函数**累加到 ``psi`` 上。
+
+    叶子 L 上的 τ̂ 就是两臂均值之差，所以单元 i 在 τ̂_L 里的**系数**就是
+    它那一臂在叶子里的个数分之一。逐树的贡献写成（在 L 的 estimation
+    半样本上按臂中心化）：
+
+        ψ_i = +(Y_i − Ȳ_{t,L}) / n_{t,L}     若 i 在 L 且是处置组
+        ψ_i = −(Y_i − Ȳ_{c,L}) / n_{c,L}     若 i 在 L 且是对照组
+        ψ_i = 0                               否则（没落进这棵树）
+
+    这就是 GRF 里的森林权重 ``α_i(x) = (1/B)Σ_b α_{b,i}(x)`` 乘上残差，
+    方差直接是 ``Σ_i ψ̄_i²`` —— **不除 N**（归一化已经藏在 ``1/n_臂`` 里）。
+
+    **踩过的坑（必须留着）**：第一版写成 ``(n_L/n_臂)·残差``，然后
+    ``SE = sqrt(Σψ̄²)/N``。单看一棵树它恰好等于
+    ``sqrt(Σψ̄²)/N = SE_真 · n_L/N``，也就是**每多切一层就凭空小一截**
+    （实测 16 片叶子 → 单树 SE 偏小约 20 倍）。量出来才发现，改回来。
+
+    于是"预测点在 x 处"的森林估计量是若干 τ̂_L 的平均，它的影响函数就是这些
+    ψ 的平均 —— **跨树协方差自动进来**，因为同一个单元会同时出现在多棵树的
+    ψ 里（而按独立合成的 ``Σ σ²_b`` 把它丢掉了）。
+
+    **两个下标空间必须分清**（这里踩过一次）：``idx`` 是**预测点**的行号
+    （``0..n_pred-1``），``node.est_idx`` 是**训练样本**的行号
+    （``0..N-1``，已经翻回原始坐标）。所以这里落笔的是一个
+    ``(n_pred, N)`` 矩阵里的**子块**：哪些预测点 × 哪些训练样本。
+    """
+    if node.is_leaf:
+        est_idx = node.est_idx
+        if est_idx is None or est_idx.size == 0 or idx.size == 0:
+            return
+        treated = node.est_treated
+        resid = node.est_resid
+        assert treated is not None and resid is not None
+        n_t = float(treated.sum())
+        n_c = float((~treated).sum())
+        contrib = np.zeros(est_idx.size)
+        if n_t > 0:
+            contrib[treated] = resid[treated] / n_t
+        if n_c > 0:
+            contrib[~treated] = -resid[~treated] / n_c
+        # 落进同一个叶子的预测点共享同一根 ψ；不同预测点之间**不会**互相污染，
+        # 因为第 0 维的 index 互不相同（`np.ix_` 的笛卡尔积正好是这个意思）。
+        psi[np.ix_(idx, est_idx)] += contrib[None, :]
+        return
+    mask = X[idx, node.feature] <= node.threshold
+    left, right = node.children
+    if mask.any():
+        _accumulate_tree_if(left, X, psi, idx[mask])
+    if (~mask).any():
+        _accumulate_tree_if(right, X, psi, idx[~mask])
 
 
 def _predict_tree_var(node: _Node, X: np.ndarray, out: np.ndarray, idx: np.ndarray) -> None:
@@ -308,8 +400,17 @@ class CausalTree:
         self.config = config or ForestConfig(n_trees=1)
         self.rng = rng or np.random.default_rng(0)
         self.root: _Node | None = None
+        #: 这棵树用到的样本在**原始训练集**里的下标（森林 subsample 时才有）。
+        #: 影响函数要跨树相加，就必须先说清"每棵树说的是谁的下标"。
+        self.obs_idx: np.ndarray | None = None
 
-    def fit(self, X: np.ndarray, D: np.ndarray, Y: np.ndarray) -> "CausalTree":
+    def fit(
+        self,
+        X: np.ndarray,
+        D: np.ndarray,
+        Y: np.ndarray,
+        obs_idx: np.ndarray | None = None,
+    ) -> "CausalTree":
         n = X.shape[0]
         idx = np.arange(n)
 
@@ -324,7 +425,8 @@ class CausalTree:
             X, D, Y, struct_idx,
             depth=0, config=self.config, rng=self.rng, n_features=X.shape[1],
         )
-        _fill_leaf_effects(self.root, X, D, Y, est_idx)
+        self.obs_idx = None if obs_idx is None else np.asarray(obs_idx, dtype=int)
+        _fill_leaf_effects(self.root, X, D, Y, est_idx, self.obs_idx)
         return self
 
     def predict(self, X: np.ndarray) -> np.ndarray:
@@ -342,6 +444,9 @@ class CausalForest:
     config: ForestConfig = field(default_factory=ForestConfig)
     trees: list[CausalTree] = field(default_factory=list)
     _fitted: bool = False
+    #: 训练样本量 N。影响函数的方差是 ``Var(ψ)/N``，这个 N 必须是**原始训练
+    #: 样本量**，不是某棵树 subsample 之后的大小。
+    _n_train: int = 0
 
     def fit(self, X: np.ndarray, D: np.ndarray, Y: np.ndarray) -> "CausalForest":
         X = np.asarray(X, dtype=float)
@@ -355,12 +460,13 @@ class CausalForest:
             size = max(int(n * self.config.subsample), 2 * self.config.min_leaf)
             idx = rng.choice(n, size=min(size, n), replace=False)
             tree = CausalTree(self.config, rng)
-            tree.fit(X[idx], D[idx], Y[idx])
+            tree.fit(X[idx], D[idx], Y[idx], obs_idx=idx)
             self.trees.append(tree)
 
         if self.config.shrinkage > 0:
             self._shrink(X, D, Y)
 
+        self._n_train = n
         self._fitted = True
         return self
 
@@ -397,36 +503,77 @@ class CausalForest:
         preds = np.vstack([t.predict(X) for t in self.trees])
         return preds.mean(axis=0)
 
-    def predict_with_se(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def predict_with_se(
+        self, X: np.ndarray, combine: str = "influence"
+    ) -> tuple[np.ndarray, np.ndarray]:
         """返回 ``(tau_hat, se)`` —— M4 从"排序"走到"水平"的那一步。
 
-        做法与 GRF 的精神一致、实现是其中最简单的一档：
+        ``combine`` 有两种：
 
-        * 每棵树走自己的路径，拿到该叶子的 τ̂ 与其**抽样方差**（在 honest 的
-          estimation 半样本上算，见 ``_tau_of``）；
-        * 跨树平均：``τ̂ = (1/B)Σ_b τ̂_b``；
-        * 方差按**独立**合成：``SE = sqrt(Σ_b σ²_b) / B``。
+        * ``"influence"``（默认）：把各棵树的**影响函数相加**再做方差。
+          ``ψ̄ = (1/B)Σ_b ψ_b``、``SE = sqrt(Σ_i ψ̄_i²)``。
+          各棵树用同一份数据训练、它们**不独立**，而影响函数一相加，
+          跨树协方差就自动进来了 —— 这正是 GRF 那套权重的方差写法。
+        * ``"independent"``：旧的 ``sqrt(Σ_b σ²_b)/B``，把各棵树当独立量。
+          **它是反保守的**（本仓库在 CS 聚合、SA 聚合、事件研究上已经修过
+          三次同一个错误，森林是第四处），保留它**只是为了量出差别**，
+          不要在产品路径上用它。
 
-        **这里有一处必须说清的近似**：各棵树用**同一份数据**训练，所以它们
-        并不独立 —— 按独立合成会**低估** SE（与 CS 聚合那个坑同一族错误）。
-        GRF 的完整做法要估计跨树的协方差项，本仓库没有做。
-        所以这个 SE 是**下界性质**的估计，它的真实覆盖率由
-        ``run_cate_coverage_audit`` 实测，**不靠这里的推导**。
+        仍然**没有**做到的：这个 SE 只覆盖"估计量的抽样变异"，
+        **不覆盖点估计本身的偏差**（叶子内部的效应异质性 + 平滑偏差）。
+        实测覆盖率仍远低于名义值，原因在偏差而不是方差
+        （见 ``run_cate_coverage_audit`` 与 ``cate_interval_report.md``）。
+        所以别把这个 SE 当成"校准好的区间"，它是"方差那一半修对了"。
+
+        代价：``"influence"`` 需要一张 ``(n_pred, N)`` 的 ψ 矩阵，
+        空间是 ``n_pred × N`` 个 float。这就是"跨树协方差不是免费的"——
+        超限时直接报错，而不是偷偷退回旧算法。
         """
         if not self._fitted:
             raise RuntimeError("先调用 fit")
+        if combine not in ("influence", "independent"):
+            raise ValueError(f"combine 只能是 influence / independent，收到 {combine!r}")
         X = np.atleast_2d(np.asarray(X, dtype=float))
-        n = X.shape[0]
-        taus = np.empty((len(self.trees), n))
-        vars_ = np.empty((len(self.trees), n))
-        idx = np.arange(n)
+        n_pred = X.shape[0]
+        n_trees = len(self.trees)
+        taus = np.empty((n_trees, n_pred))
+        vars_ = np.empty((n_trees, n_pred))
+        idx = np.arange(n_pred)
         for b, tree in enumerate(self.trees):
             assert tree.root is not None
             _predict_tree(tree.root, X, taus[b], idx)
             _predict_tree_var(tree.root, X, vars_[b], idx)
-        # inf 表示某个叶子样本太少、给不出方差 → 该单元的 SE 也应当是 inf
-        var_sum = np.where(np.isinf(vars_), np.inf, vars_).sum(axis=0)
-        se = np.sqrt(var_sum) / len(self.trees)
+
+        if combine == "independent":
+            var_sum = np.where(np.isinf(vars_), np.inf, vars_).sum(axis=0)
+            se = np.sqrt(var_sum) / n_trees
+        else:
+            n_train = self._n_train
+            if n_train <= 0:
+                raise RuntimeError("森林没有训练样本量（_n_train），无法做影响函数合成")
+            budget = n_pred * n_train
+            if budget > _MAX_IF_CELLS:
+                raise ValueError(
+                    f"影响函数合成要 (n_pred={n_pred} × N={n_train}) 的 ψ 矩阵，"
+                    f"共 {budget} 个单元，超过上限 {_MAX_IF_CELLS}。"
+                    "要么减少预测点、要么减小森林/样本，"
+                    "要么显式用 combine='independent'（反保守，只建议用于对照）。"
+                )
+            psi = np.zeros((n_pred, n_train))
+            for tree in self.trees:
+                assert tree.root is not None
+                _accumulate_tree_if(tree.root, X, psi, idx)
+            psi /= n_trees
+            # Σ_i ψ̄_i = 0 精确成立（每片叶子的残差按臂中心化），所以
+            # Var(ψ̄) 就是均方；而 1/n_臂 已经把"样本量"算进权重里了，
+            # 所以 Var(τ̂(x)) = Σ_i ψ̄_i²，**不再除 N**。
+            se = np.sqrt((psi**2).sum(axis=1))
+
+        # inf 表示某个叶子样本太少、给不出方差 → 该单元的 SE 也必须是 inf：
+        # 影响函数合成会给出一个**有限**的数，但那不是"有方差"，而是"没材料"。
+        # 这条判断必须保留，否则最不可靠的那批人反而拿到了最窄的区间。
+        any_inf = np.isinf(vars_).any(axis=0)
+        se = np.where(any_inf, np.inf, se)
         return taus.mean(axis=0), se
 
     @property

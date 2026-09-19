@@ -61,7 +61,18 @@ CLAIMS: list[tuple[str, str, str]] = [
     # 把数字写进清单就会让检查器在快速模式下随机变红（第 31 条那个坑）。
     ("M4·CATE 区间：结论是「校准不了」", "cate_interval_report.md", "但它校准不了"),
     ("M4·CATE 区间：结论并进了 M4 报告", "m4_validation.md", "CATE 的区间：两条路线的覆盖率"),
-    ("M4·CATE 区间：原因是偏差不是方差", "cate_interval_report.md", "而是**点估计有偏**"),
+    ("M4·CATE 区间：主因是点估计有偏（方差另有一处，见下）",
+     "cate_interval_report.md", "而是**点估计有偏**"),
+    # 森林的跨树方差（第 19 节）。同样只加文本类声明：8c 节的数值随
+    # --quick 变（重抽 8 vs 30 次、bootstrap 2×6 vs 6×15）。
+    ("M4·森林 SE：跨树协方差是第四处同族错误",
+     "cate_interval_report.md", "跨树协方差（第四处同族错误）"),
+    ("M4·森林 SE：改法是 GRF 的森林权重",
+     "cate_interval_report.md", "GRF 那套森林权重的写法"),
+    ("M4·森林 SE：只覆盖「给定树结构」的方差",
+     "cate_interval_report.md", "给定树结构**的方差"),
+    ("M4·森林 SE：inf 点等于没有区间",
+     "cate_interval_report.md", "其余只拿到无穷区间，等于没有区间"),
     # 组级校准（BLP/GATES）：同样只加文本类声明 —— 覆盖率与斜率会随
     # --quick（分裂次数 6 vs 30）变，把数字写进清单就是第 31 条那个假红灯。
     # SA 回归版：最后队列当基准（数值随面板固定，稳定）

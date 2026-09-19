@@ -561,26 +561,41 @@ class TestCateInterval:
         assert finite.mean() > 0.5, f"可给出区间的单元太少：{finite.mean():.2f}"
         assert (se[finite] > 0).all()
 
-    def test_interval_shrinks_with_larger_leaves(self):
-        """验收标准之一（**部分满足**，如实测）：叶子越大整体越短，但**不单调**。
+    def test_leaf_size_trades_bias_not_variance(self):
+        """验收标准「区间长度随 min_leaf 单调收缩」**在修正方差之后不成立了** ——
+        而这不是退步，是那条标准量错了东西。
 
-        实测 min_leaf = 10/20/40/80 的解析区间中位长度：
-        0.0824 / 0.0937 / 0.0720 / 0.0507 —— 80 比 10 短约 38%，
-        但 20 处反而比 10 长。原因是**两个效应叠在一起**：min_leaf 变大既让
-        叶子内样本更多（区间变短），又改变"能给出区间的叶子"的比例
-        （纯叶子变多 → 有限 SE 的子集变了）。
-        所以断言的是**整体方向**（80 < 10），不是逐点单调 ——
-        把逐点单调写成断言，就是让标准去迁就一个不成立的说法。
+        旧 SE（跨树独立合成）确实随叶子变大单调变小，因为它测的其实只是
+        **叶内**噪声（约 ``1/sqrt(n_叶子)``）—— 叶子越大它越小，几乎是同义反复。
+        改成长短的**影响函数相加**之后，方差由整份样本的有效样本量决定：
+        实测中位 SE 在 min_leaf = 10/20/40/80/160 上是
+        0.1679 / 0.1675 / 0.1836 / 0.1684 / 0.1583（基本持平，10→160 只降 5.7%），
+        而旧口径同期是 0.0980 → 0.0830 → 0.0601（160 比 10 低 38.7%）。
+
+        所以叶子大小换的主要是**偏差**，不是方差；它真正决定的是
+        **能不能给出有限 SE**（实测有限点占比 0.641 → 1.000）。
+        这条测试因此钉两件事：新口径持平、旧口径仍单调下降（对照要留着）。
         """
         import numpy as np
 
-        medians = []
-        for ml in (10, 80):
+        if_se: list[float] = []
+        ind_se: list[float] = []
+        finite: list[float] = []
+        for ml in (10, 160):
             data, forest = self._fitted(min_leaf=ml)
-            _, se = forest.predict_with_se(data.X)
-            finite = np.isfinite(se)
-            medians.append(float(np.median(se[finite])))
-        assert medians[1] < medians[0], medians
+            _, se_if = forest.predict_with_se(data.X, combine="influence")
+            _, se_ind = forest.predict_with_se(data.X, combine="independent")
+            ok = np.isfinite(se_if) & np.isfinite(se_ind)
+            if_se.append(float(np.median(se_if[ok])))
+            ind_se.append(float(np.median(se_ind[ok])))
+            finite.append(float(ok.mean()))
+
+        # 新口径：叶子放大 16 倍，中位 SE 基本不动（允许 ±20% 的抖动）
+        assert 0.8 <= if_se[1] / if_se[0] <= 1.2, if_se
+        # 旧口径：同一组数据上明显变小 —— 它测的是叶内噪声，不是估计误差
+        assert ind_se[1] < 0.8 * ind_se[0], ind_se
+        # 叶子变大真正的收益：能给出有限 SE 的单元更多
+        assert finite[1] > finite[0], finite
 
     def test_coverage_is_far_below_nominal_and_that_is_the_point(self):
         """**覆盖率远低于 95%** —— 这条断言是"水平仍不可用"的证据。
@@ -601,6 +616,120 @@ class TestCateInterval:
             f"覆盖率 {coverage:.3f} —— 如果它真的接近 95%，"
             "那说明点估计变了，README 的已知边界要跟着改"
         )
+
+
+class TestForestInfluenceSe:
+    """跨树协方差：影响函数相加，而不是把各棵树的方差按独立合成。
+
+    这是本仓库第四次修同一个错误（CS 聚合、SA 聚合、事件研究 leads，见
+    README 第 16 节与设计决策 41）。前三次都栽在"看起来非常合理的
+    ``sqrt(Σ w² se²)``"上，所以这一组测试的重点不是"新写法能用"，
+    而是**把新写法的归一化钉死**：单棵树时它必须回到叶子方差本身。
+    """
+
+    @staticmethod
+    def _fitted(seed: int = 3, *, n_trees: int = 30, max_depth: int = 4, min_leaf: int = 20):
+        from ablab.causal.forest import CausalForest, ForestConfig
+        from ablab.causal.hte import HTEConfig, generate_hte_data
+
+        data = generate_hte_data(HTEConfig(n=1200, n_features=6, n_informative=3, seed=seed))
+        forest = CausalForest(
+            ForestConfig(n_trees=n_trees, max_depth=max_depth, min_leaf=min_leaf)
+        )
+        forest.fit(data.X, data.D, data.Y)
+        return data, forest
+
+    def test_single_tree_influence_se_equals_leaf_variance(self):
+        """单棵树时，影响函数版必须回到 ``S1²/n1 + S0²/n0``。
+
+        **这是本轮的回归测试。** 第一版把叶子 IF 写成
+        ``(n_L / n_臂)·残差`` 再 ``SE = sqrt(Σψ²)/N``，单棵树时它等于
+        ``SE_真 · n_L/N`` —— 叶子越细就凭空越小（16 片叶子时偏小约 20 倍）。
+        两种口径在这里必须落在同一个量级：比值上界 1（IF 用的是 n 而不是
+        n−1，所以略小），下界 0.85（叶子至少 min_leaf 个单元）。
+        """
+        import numpy as np
+
+        data, forest = self._fitted(n_trees=1)
+        _, se_if = forest.predict_with_se(data.X, combine="influence")
+        _, se_ind = forest.predict_with_se(data.X, combine="independent")
+        ok = np.isfinite(se_if) & np.isfinite(se_ind)
+        assert ok.sum() > 100, f"有限点太少：{int(ok.sum())}"
+        ratio = se_if[ok] / se_ind[ok]
+        assert 0.85 <= ratio.min() and ratio.max() <= 1.0, (
+            f"单棵树时影响函数 SE 与叶子方差 SE 之比为 [{ratio.min():.3f}, "
+            f"{ratio.max():.3f}] —— 归一化错了才会偏出这个区间"
+        )
+
+    def test_forest_influence_se_is_larger_than_independent(self):
+        """多棵树时，跨树协方差把 SE 抬上去（实测中位约 1.7~2.0 倍）。
+
+        只断言中位数与"绝大多数点 >1"，**不逐点断言**：README 第 16 节记过
+        一次教训 —— 影响函数版并不保证在每一个点上都 ≥ 独立合成版。
+        """
+        import numpy as np
+
+        data, forest = self._fitted()
+        _, se_if = forest.predict_with_se(data.X, combine="influence")
+        _, se_ind = forest.predict_with_se(data.X, combine="independent")
+        ok = np.isfinite(se_if) & np.isfinite(se_ind)
+        ratio = se_if[ok] / se_ind[ok]
+        assert float(np.median(ratio)) > 1.2, float(np.median(ratio))
+        assert float((ratio > 1.0).mean()) > 0.9, float((ratio > 1.0).mean())
+
+    def test_combine_argument_is_validated(self):
+        """``combine`` 拼错就直接报错，不静默退回旧算法。"""
+        import pytest
+
+        data, forest = self._fitted(n_trees=2)
+        with pytest.raises(ValueError, match="combine"):
+            forest.predict_with_se(data.X, combine="independant")
+
+    def test_psi_matrix_guard_fails_loudly(self, monkeypatch):
+        """ψ 矩阵超预算时报错，而不是悄悄退回反保守的旧算法。"""
+        import numpy as np
+        import pytest
+
+        from ablab.causal import forest as forest_mod
+
+        data, forest = self._fitted(n_trees=2)
+        monkeypatch.setattr(forest_mod, "_MAX_IF_CELLS", 10)
+        with pytest.raises(ValueError, match="影响函数合成"):
+            forest.predict_with_se(data.X[:50], combine="influence")
+        # 显式要求旧算法时仍然能跑（它的偏小是**已知且要留着对照**的）
+        _, se = forest.predict_with_se(data.X[:50], combine="independent")
+        assert se.shape == (50,)
+        assert np.isfinite(se).any()
+
+    def test_leaf_indices_are_original_training_rows(self):
+        """叶子里的 ``est_idx`` 必须是**原始训练样本**的下标。
+
+        森林里每棵树只吃到 subsample，如果叶子停在自己的本地坐标，
+        各棵树的影响函数就没法相加（同一个单元在不同树里编号不同）。
+        """
+        data, forest = self._fitted(n_trees=5)
+        n = data.X.shape[0]
+        assert forest._n_train == n
+        seen: set[int] = set()
+        for tree in forest.trees:
+            assert tree.obs_idx is not None
+            assert tree.obs_idx.size < n, "subsample 应当小于全样本"
+            assert int(tree.obs_idx.max()) < n
+            stack = [tree.root]
+            while stack:
+                node = stack.pop()
+                assert node is not None
+                if node.is_leaf:
+                    idx = node.est_idx
+                    assert idx is not None
+                    assert idx.size > 0
+                    assert int(idx.max()) < n, "叶子下标越界 —— 没有翻回原始坐标"
+                    # 叶子里的单元必须真的属于这棵树吃到的 subsample
+                    assert set(idx.tolist()) <= set(tree.obs_idx.tolist())
+                    seen.update(idx.tolist())
+                else:
+                    stack.extend([node.left, node.right])
+        assert len(seen) > n // 2, f"叶子只覆盖了 {len(seen)}/{n} 个单元"
 
 
 class TestConformalITE:
