@@ -19,6 +19,8 @@ from ablab.platform.registry import ExperimentRecord, ExperimentRegistry, Regist
 ROOT = Path(__file__).resolve().parents[1]
 
 VARIANTS = [{"name": "control", "weight": 0.5}, {"name": "treatment", "weight": 0.5}]
+#: 审计里的操作者现在是**必填**的具名参数（忘了记是谁会在调用点报错）。
+ACTOR = "tester"
 
 
 @pytest.fixture()
@@ -29,7 +31,9 @@ def registry():
 
 
 def make(reg: ExperimentRegistry, name: str = "audit_demo", **kwargs) -> ExperimentRecord:
-    return reg.create(name=name, variants=VARIANTS, salt=f"{name}_v1", **kwargs)
+    return reg.create(
+        actor=ACTOR, name=name, variants=VARIANTS, salt=f"{name}_v1", **kwargs
+    )
 
 
 class TestAuditTrail:
@@ -43,9 +47,9 @@ class TestAuditTrail:
 
     def test_every_mutation_is_recorded_with_before_and_after(self, registry):
         rec = make(registry)
-        registry.set_status(rec.id, "running")
-        registry.set_estimator(rec.id, "post_only")
-        registry.bind_warehouse(rec.id, "exp_rank_v2")
+        registry.set_status(rec.id, "running", actor=ACTOR)
+        registry.set_estimator(rec.id, "post_only", actor=ACTOR)
+        registry.bind_warehouse(rec.id, "exp_rank_v2", actor=ACTOR)
 
         events = registry.events(rec.id)
         assert [e.action for e in events] == [
@@ -63,15 +67,15 @@ class TestAuditTrail:
     def test_estimator_change_is_marked_as_a_judgement_rule_change(self, registry):
         """改判定口径是最需要留痕的一类改动 —— 备注里必须说清后果。"""
         rec = make(registry)
-        registry.set_estimator(rec.id, "post_only")
+        registry.set_estimator(rec.id, "post_only", actor=ACTOR)
         event = next(e for e in registry.events(rec.id) if e.action == "set_estimator")
         assert "判定规则" in event.note, event.note
 
     def test_audit_survives_deletion(self, registry):
         """删掉实验之后审计必须还在 —— 那正是最需要回答"谁删的"的时候。"""
         rec = make(registry)
-        registry.set_status(rec.id, "stopped")
-        registry.delete(rec.id)
+        registry.set_status(rec.id, "stopped", actor=ACTOR)
+        registry.delete(rec.id, actor=ACTOR)
 
         with pytest.raises(RegistryError):
             registry.get(rec.id)  # 实验确实没了
@@ -82,7 +86,7 @@ class TestAuditTrail:
     def test_recent_events_are_newest_first(self, registry):
         a = make(registry, "exp_a")
         b = make(registry, "exp_b")
-        registry.set_status(b.id, "running")
+        registry.set_status(b.id, "running", actor=ACTOR)
         recent = registry.recent_events(limit=3)
         assert recent[0].experiment_id == b.id
         assert recent[0].action == "set_status"
@@ -110,7 +114,7 @@ class TestAuditTrail:
         """
         rec = make(registry)
         with pytest.raises(RegistryError):
-            registry.set_estimator(rec.id, "not_an_estimator")
+            registry.set_estimator(rec.id, "not_an_estimator", actor=ACTOR)
         assert [e.action for e in registry.events(rec.id)] == ["create"]
 
     def test_events_survive_reopening_the_database(self, tmp_path):
@@ -118,7 +122,7 @@ class TestAuditTrail:
         path = tmp_path / "registry.db"
         reg = ExperimentRegistry(path)
         rec = make(reg)
-        reg.set_status(rec.id, "running")
+        reg.set_status(rec.id, "running", actor=ACTOR)
         reg.close()
 
         reopened = ExperimentRegistry(path)
@@ -134,22 +138,32 @@ class TestAuditAPI:
         """走真实的建应用路径（``create_app(库路径)``），而不是自己拼一个 registry。
 
         这样接口测的是**产品里那套装配**，不是测试自己接的一根线。
+        返回 ``(client, auth)``：写接口现在需要凭据，``auth`` 是一个 admin 的请求头。
         """
         from fastapi.testclient import TestClient
 
-        return TestClient(create_app(tmp_path / "audit_api.db"))
+        client = TestClient(create_app(tmp_path / "audit_api.db"))
+        token = client.app.state.registry.add_user("api_admin", role="admin")
+        return client, {"Authorization": f"Bearer {token}"}
 
     def test_events_endpoint_lists_history(self, tmp_path):
-        client = self._client(tmp_path)
+        client, auth = self._client(tmp_path)
         rec = client.post(
             "/api/experiments",
             json={"name": "api_audit", "variants": VARIANTS, "salt": "api_audit_v1"},
+            headers=auth,
         ).json()
-        client.patch(f"/api/experiments/{rec['id']}/status", json={"status": "running"})
+        client.patch(
+            f"/api/experiments/{rec['id']}/status",
+            json={"status": "running"},
+            headers=auth,
+        )
 
         payload = client.get(f"/api/experiments/{rec['id']}/events").json()
         assert payload["count"] == 2
         assert [e["action"] for e in payload["events"]] == ["create", "set_status"]
+        # 审计里现在有操作者，而且来自凭据（api_admin 这个用户），不是请求里写的
+        assert {e["actor"] for e in payload["events"]} == {"api_admin"}
 
         recent = client.get("/api/events?limit=1").json()
         assert recent["count"] == 1
@@ -157,16 +171,240 @@ class TestAuditAPI:
 
     def test_events_endpoint_still_works_after_delete(self, tmp_path):
         """删掉之后审计接口要还能用 —— 不能因为"实验不存在"就 404。"""
-        client = self._client(tmp_path)
+        client, auth = self._client(tmp_path)
         rec = client.post(
             "/api/experiments",
             json={"name": "api_audit_del", "variants": VARIANTS, "salt": "api_audit_del_v1"},
+            headers=auth,
         ).json()
-        assert client.delete(f"/api/experiments/{rec['id']}").status_code == 204
+        assert (
+            client.delete(f"/api/experiments/{rec['id']}", headers=auth).status_code == 204
+        )
 
         resp = client.get(f"/api/experiments/{rec['id']}/events")
         assert resp.status_code == 200
         assert [e["action"] for e in resp.json()["events"]] == ["create", "delete"]
+
+
+class TestAuthAndActor:
+    """身份：**服务端从凭据推导**，请求里说的名字一律不算数。
+
+    这一组测试要钉的不是"能不能登录"，而是三件更要紧的事：
+
+    1. 审计里的操作者**不可能被请求方指定**（伪造尝试必须无效）；
+    2. 被拒绝的操作**不写审计**（否则审计会被失败的尝试淹没）；
+    3. **每一个写路由都要凭据** —— 而这件事由"自动枚举路由"来保证，
+       而不是靠人记得在新增端点时加一行（那种保证迟早会漏）。
+    """
+
+    @staticmethod
+    def _app(tmp_path: Path):
+        from fastapi.testclient import TestClient
+
+        client = TestClient(create_app(tmp_path / "auth.db"))
+        reg = client.app.state.registry
+        tokens = {
+            "admin": reg.add_user("boss", role="admin"),
+            "editor": reg.add_user("alice", role="editor"),
+            "viewer": reg.add_user("bob", role="viewer"),
+        }
+        return client, tokens
+
+    @staticmethod
+    def _auth(token: str) -> dict[str, str]:
+        return {"Authorization": f"Bearer {token}"}
+
+    def test_missing_or_wrong_credentials_get_401(self, tmp_path):
+        client, tokens = self._app(tmp_path)
+        body = {"name": "e_auth", "variants": VARIANTS, "salt": "e_auth_v1"}
+        assert client.post("/api/experiments", json=body).status_code == 401
+        for header in (
+            "Bearer nope",
+            tokens["editor"],  # 少了 Bearer 前缀
+            "Basic YWxpY2U6cHc=",  # 换了认证方案
+        ):
+            resp = client.post(
+                "/api/experiments", json=body, headers={"Authorization": header}
+            )
+            assert resp.status_code == 401, header
+
+    def test_viewer_cannot_write_and_editor_cannot_delete(self, tmp_path):
+        client, tokens = self._app(tmp_path)
+        rec = client.post(
+            "/api/experiments",
+            json={"name": "e_roles", "variants": VARIANTS, "salt": "e_roles_v1"},
+            headers=self._auth(tokens["editor"]),
+        ).json()
+        # viewer：连建实验都不行
+        assert (
+            client.post(
+                "/api/experiments",
+                json={"name": "e_viewer", "variants": VARIANTS, "salt": "e_viewer_v1"},
+                headers=self._auth(tokens["viewer"]),
+            ).status_code
+            == 403
+        )
+        # editor：能改状态，但不能删（删是 admin 的事）
+        assert (
+            client.patch(
+                f"/api/experiments/{rec['id']}/status",
+                json={"status": "running"},
+                headers=self._auth(tokens["editor"]),
+            ).status_code
+            == 200
+        )
+        assert (
+            client.delete(
+                f"/api/experiments/{rec['id']}", headers=self._auth(tokens["editor"])
+            ).status_code
+            == 403
+        )
+        assert (
+            client.delete(
+                f"/api/experiments/{rec['id']}", headers=self._auth(tokens["admin"])
+            ).status_code
+            == 204
+        )
+
+    def test_disabled_user_is_locked_out_immediately(self, tmp_path):
+        client, tokens = self._app(tmp_path)
+        client.app.state.registry.disable_user("alice")
+        resp = client.post(
+            "/api/experiments",
+            json={"name": "e_dis", "variants": VARIANTS, "salt": "e_dis_v1"},
+            headers=self._auth(tokens["editor"]),
+        )
+        assert resp.status_code == 401
+
+    def test_actor_cannot_be_spoofed_by_the_request(self, tmp_path):
+        """**伪造尝试必须无效**：请求里写谁都不算数，只认凭据。
+
+        这一条是这一整轮存在的理由。如果 actor 能从请求体里读，
+        审计表就会变成"看起来权威的假证据"—— 比没有更糟。
+        所以这里同时试三种伪造：请求体里的字段、附加 header、query 参数。
+        """
+        client, tokens = self._app(tmp_path)
+        # 1) 请求体里塞一个 actor 字段：_Strict 直接 422，根本进不了审计
+        assert (
+            client.post(
+                "/api/experiments",
+                json={
+                    "name": "e_spoof",
+                    "variants": VARIANTS,
+                    "salt": "e_spoof_v1",
+                    "owner": "boss",
+                    "actor": "boss",
+                },
+                headers={**self._auth(tokens["editor"]), "X-Actor": "boss"},
+            ).status_code
+            == 422
+        )
+        # 2) query 参数 + 附加 header 都写 boss：审计里仍然必须是 alice
+        rec = client.post(
+            "/api/experiments?actor=boss",
+            json={
+                "name": "e_spoof2",
+                "variants": VARIANTS,
+                "salt": "e_spoof2_v1",
+                "owner": "boss",
+            },
+            headers={**self._auth(tokens["editor"]), "X-Actor": "boss"},
+        ).json()
+        events = client.get(f"/api/experiments/{rec['id']}/events").json()["events"]
+        assert [e["actor"] for e in events] == ["alice"], events
+
+    def test_rejected_writes_leave_no_audit_row(self, tmp_path):
+        """被拒的操作不写审计 —— 否则"谁改了什么"要翻十页失败的尝试才看得见。"""
+        client, tokens = self._app(tmp_path)
+        body = {"name": "e_rej", "variants": VARIANTS, "salt": "e_rej_v1"}
+        assert client.post("/api/experiments", json=body).status_code == 401
+        assert (
+            client.post(
+                "/api/experiments",
+                json={**body, "name": "e_rej2"},
+                headers=self._auth(tokens["viewer"]),
+            ).status_code
+            == 403
+        )
+        assert client.get("/api/events").json()["count"] == 0
+
+    def test_every_mutating_route_needs_a_token(self, tmp_path):
+        """**自动枚举所有写路由**，逐个断言无凭据时是 401。
+
+        这是防"新加了一个端点但忘了鉴权"的唯一可靠办法：
+        人会在新增端点时忘记加校验，但这条测试会在 CI 上直接红。
+        免检名单为空 —— 本仓库没有"本来就该公开"的写接口。
+        """
+        client, _tokens = self._app(tmp_path)
+        exempt: set[str] = set()
+        checked = 0
+        for route in client.app.routes:
+            methods = getattr(route, "methods", set()) or set()
+            path = getattr(route, "path", "")
+            mutating = methods & {"POST", "PATCH", "PUT", "DELETE"}
+            if not mutating or path in exempt or not path.startswith("/api"):
+                continue
+            for method in sorted(mutating):
+                resp = client.request(
+                    method, path.replace("{experiment_id}", "x"), json={}
+                )
+                assert resp.status_code == 401, (method, path, resp.status_code)
+                checked += 1
+        assert checked >= 5, f"只检查到 {checked} 个写路由，枚举逻辑可能失效了"
+
+    def test_stored_credentials_are_hashes_not_tokens(self, tmp_path):
+        """库里存的是 sha256，不是 token —— 库文件泄露不等于凭据泄露。"""
+        client, tokens = self._app(tmp_path)
+        reg = client.app.state.registry
+        rows = reg._conn.execute("SELECT id, token_hash FROM users").fetchall()
+        assert rows
+        for row in rows:
+            assert len(row["token_hash"]) == 64
+        for token in tokens.values():
+            hits = reg._conn.execute(
+                "SELECT COUNT(*) AS c FROM users WHERE token_hash = ?", (token,)
+            ).fetchone()["c"]
+            assert hits == 0
+        # list_users 也不能把哈希漏出去
+        assert all("token" not in u for u in reg.list_users())
+
+    def test_pre_migration_events_show_unknown_actor(self, tmp_path):
+        """老库（事件表没有 actor 列）迁移之后：**旧行写"未知"，绝不猜名字**。
+
+        `experiment_events` 是 append-only，触发器禁止 UPDATE ——
+        所以迁移只能是 `ADD COLUMN` + 默认值。想"回填"就得先关掉触发器，
+        那等于毁掉审计的卖点。这里手工造一个老结构的库来验证。
+        """
+        path = tmp_path / "old.db"
+        conn = sqlite3.connect(path)
+        conn.executescript(
+            """
+            CREATE TABLE experiment_events (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                experiment_id TEXT NOT NULL, at TEXT NOT NULL, action TEXT NOT NULL,
+                field TEXT, before TEXT, after TEXT, note TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TRIGGER experiment_events_no_update BEFORE UPDATE ON experiment_events
+            BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+            """
+        )
+        conn.execute(
+            "INSERT INTO experiment_events (experiment_id, at, action, note) "
+            "VALUES ('old_exp', '2026-01-01T00:00:00+00:00', 'create', '迁移前的老记录')"
+        )
+        conn.commit()
+        conn.close()
+
+        reg = ExperimentRegistry(path)
+        try:
+            events = reg.events("old_exp")
+            assert len(events) == 1
+            assert events[0].actor == "（迁移前未知）"
+            # 新写入的行则必须带真实操作者
+            rec = make(reg, "after_migration")
+            assert reg.events(rec.id)[0].actor == ACTOR
+        finally:
+            reg.close()
 
 
 class TestGuardrailVisibility:

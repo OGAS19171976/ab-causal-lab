@@ -45,6 +45,11 @@ from ablab.reporting import for_report  # noqa: E402
 
 VARIANTS = [{"name": "control", "weight": 0.5}, {"name": "treatment", "weight": 0.5}]
 
+#: 本报告脚本自己就是"操作者"。用一个具名用户，而不是空字符串 ——
+#: 审计里的操作者现在是必填的具名参数，忘了记谁会在调用点直接报错。
+OP = "gov-validator"
+OP2 = "gov-reviewer"
+
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="治理验证：审计 + 护栏")
@@ -73,6 +78,7 @@ def main() -> int:
     emit("\n### 1. 操作审计：谁改了什么，留痕")
     reg = ExperimentRegistry(db)
     rec = reg.create(
+        actor=OP,
         name="gov_demo",
         variants=VARIANTS,
         salt="gov_demo_v1",
@@ -83,25 +89,100 @@ def main() -> int:
     emit(f"  创建实验 {rec.name}，并依次改状态 / 改判定口径 / 绑数仓")
     emit("  （实验 id 是 uuid4，每次入库都变 —— 刻意不打印它，"
          "否则这份报告每次都不一样；审计本身按 seq 排序，不依赖 id。）")
-    reg.set_status(rec.id, "running")
-    reg.set_estimator(rec.id, "post_only")
-    reg.bind_warehouse(rec.id, "exp_rank_v2")
+    reg.set_status(rec.id, "running", actor=OP)
+    reg.set_estimator(rec.id, "post_only", actor=OP)
+    reg.bind_warehouse(rec.id, "exp_rank_v2", actor=OP)
 
     emit("")
-    emit(f"  {'seq':>4}  {'action':<16} {'field':<22} before -> after")
+    emit(f"  {'seq':>4}  {'操作者':<14} {'action':<16} {'field':<22} before -> after")
     for e in reg.events(rec.id):
         change = ""
         if e.field:
             change = f"{e.before or '（空）'} -> {e.after or '（空）'}"
-        emit(f"  {e.seq:>4}  {e.action:<16} {e.field or '':<22} {change}")
+        emit(f"  {e.seq:>4}  {e.actor:<14} {e.action:<16} {e.field or '':<22} {change}")
     emit("")
     emit("  改判定口径那条的备注（它改变的是**判定规则**，不只是元数据）：")
     est_event = next(e for e in reg.events(rec.id) if e.action == "set_estimator")
     emit(f"    {est_event.note}")
 
+    # ---- 1.5 身份：操作者从凭据来，不从请求来 ----------------------------- #
+    emit("\n### 1.5 身份：操作者**只能**来自凭据")
+    emit("  审计里的 `actor` 一列现在是必填的（忘了记谁会在调用点报错），")
+    emit("  而它的值**只**由服务端从凭据推导。三种伪造尝试实测：")
+    emit("")
+    admin_token = reg.add_user("gov_admin", role="admin", note="治理验证用")
+    editor_token = reg.add_user("gov_editor", role="editor")
+    reg.add_user("gov_viewer", role="viewer")
+    emit(f"  {'用户':<12}{'角色':<9}{'库里存的是':<14}明文 token 可读?")
+    for u in reg.list_users():
+        row = reg._conn.execute(
+            "SELECT token_hash FROM users WHERE id = ?", (u["id"],)
+        ).fetchone()
+        emit(f"  {u['id']:<12}{u['role']:<9}{'sha256 前 12 位':<14}"
+             f"{'否（只存哈希）' if row['token_hash'][:12] else ''}")
+    emit("")
+    emit("  认证结果（真值来自凭据，伪造一律无效）：")
+    emit(f"    正确 token            -> {reg.authenticate(admin_token)!r}")
+    emit(f"    错误 token            -> {reg.authenticate('not-a-token')!r}")
+    emit(f"    空凭据                -> {reg.authenticate(None)!r}")
+    reg.disable_user("gov_editor")
+    emit(f"    被停用的用户          -> {reg.authenticate(editor_token)!r}"
+         "（停用立即生效）")
+    reg.disable_user("gov_editor", disabled=False)
+    emit("")
+    emit("  **请求里写的名字不算数** —— 这一条走真实 HTTP 接口实测：")
+    from fastapi.testclient import TestClient as _TC
+
+    auth_app = create_app(tmpdir / "auth_api.db")
+    auth_reg = auth_app.state.registry
+    a_admin = auth_reg.add_user("http_admin", role="admin")
+    a_editor = auth_reg.add_user("http_alice", role="editor")
+    a_viewer = auth_reg.add_user("http_bob", role="viewer")
+    ac = _TC(auth_app)
+    body = {"name": "gov_auth", "variants": VARIANTS, "salt": "gov_auth_v1"}
+    no_cred = ac.post("/api/experiments", json=body).status_code
+    bad_cred = ac.post(
+        "/api/experiments", json=body, headers={"Authorization": "Bearer nope"}
+    ).status_code
+    viewer = ac.post(
+        "/api/experiments", json=body,
+        headers={"Authorization": f"Bearer {a_viewer}"},
+    ).status_code
+    spoof = ac.post(
+        "/api/experiments?actor=http_admin",
+        json={**body, "owner": "http_admin"},
+        headers={
+            "Authorization": f"Bearer {a_editor}",
+            "X-Actor": "http_admin",
+        },
+    )
+    made = spoof.json()
+    events = ac.get(f"/api/experiments/{made['id']}/events").json()["events"]
+    editor_cannot_delete = ac.delete(
+        f"/api/experiments/{made['id']}",
+        headers={"Authorization": f"Bearer {a_editor}"},
+    ).status_code
+    admin_can_delete = ac.delete(
+        f"/api/experiments/{made['id']}",
+        headers={"Authorization": f"Bearer {a_admin}"},
+    ).status_code
+    emit(f"    无凭据 POST                      -> {no_cred}")
+    emit(f"    错 token POST                    -> {bad_cred}")
+    emit(f"    viewer POST                      -> {viewer}（角色不够）")
+    emit(f"    伪造（query+header 都写 http_admin）-> 审计记为 "
+         f"{[e['actor'] for e in events]}（凭据是 http_alice）")
+    emit(f"    editor DELETE                    -> {editor_cannot_delete}（删是 admin 的权限）")
+    emit(f"    admin DELETE                     -> {admin_can_delete}")
+    emit(f"    被拒的三次尝试留下审计条数        -> "
+         f"{ac.get('/api/events').json()['count'] - 2}（只记成功的那两条）")
+    emit("    另外 `actor` 也不是请求体字段（`_Strict` 直接 422），见 "
+         "`tests/test_governance.py::TestAuthAndActor`：")
+    emit("    · 有一条测试**自动枚举所有写路由**逐个断言 401，")
+    emit("      所以「新加了端点忘了鉴权」会在 CI 上直接红。")
+
     # ---- 2. 删掉实验之后审计仍在 ------------------------------------------ #
     emit("\n### 2. 删掉实验之后，审计必须还在")
-    reg.delete(rec.id)
+    reg.delete(rec.id, actor=OP)
     gone = False
     try:
         reg.get(rec.id)
@@ -138,11 +219,11 @@ def main() -> int:
     emit("\n### 5. 失败的写入**不能**留下审计")
     before = len(reopened.recent_events(limit=100))
     try:
-        reopened.set_estimator(rec.id, "not_an_estimator")
+        reopened.set_estimator(rec.id, "not_an_estimator", actor=OP)
     except RegistryError as exc:
         emit(f"  非法口径被拒：{exc}")
     try:
-        reopened.set_estimator("不存在的实验", "cuped")
+        reopened.set_estimator("不存在的实验", "cuped", actor=OP)
     except RegistryError as exc:
         emit(f"  不存在的实验被拒：{exc}")
     after = len(reopened.recent_events(limit=100))
@@ -154,7 +235,9 @@ def main() -> int:
     from fastapi.testclient import TestClient
 
     app = create_app(tmpdir / "api.db")
+    api_token = app.state.registry.add_user("gov_api_admin", role="admin")
     client = TestClient(app)
+    client.headers.update({"Authorization": f"Bearer {api_token}"})
     api_rec = client.post(
         "/api/experiments",
         json={"name": "gov_api", "variants": VARIANTS, "salt": "gov_api_v1"},
@@ -215,8 +298,12 @@ def main() -> int:
     emit("  * 删除实验不会删除审计 —— 那正是最需要它的时刻。")
     emit("  * 护栏的「未分析」状态出现在每一份相关报告里，并说清了原因。")
     emit("  * 仍未做的（写在这里而不是留着让人误会）：")
-    emit("    - 审计没有「操作者」字段。平台上还没有鉴权，写上去也只是个空字段；")
-    emit("      真上线要先有身份，再谈「谁做的」。")
+    emit("    - ~~审计没有「操作者」字段~~ **已补**：静态 token 鉴权 + `actor` 列，")
+    emit("      见第 1.5 节与 README 设计决策第 45 条。")
+    emit("      **边界**：静态 token 无过期、无轮换、无限速，token 泄露即冒充；")
+    emit("      读接口仍然匿名；迁移前的老记录操作者是「（迁移前未知）」。")
+    emit("    - 注册表仍然**没有并发控制**：两个人同时改同一个实验会互相覆盖。")
+    emit("      身份解决「谁改的」，不解决「同时改」—— 那是乐观锁的事。")
     emit("    - 护栏**仍然没有被分析**：数据模型只有主指标一条时间序列。")
     emit("      要做需要数仓里另建指标表 + 停实验的判据，那是另一件事。")
 

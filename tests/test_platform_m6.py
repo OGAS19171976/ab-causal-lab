@@ -17,10 +17,25 @@ from ablab.platform import ExperimentRegistry, RegistryError, analyse_experiment
 from ablab.platform.audit import run_monitoring_fwer_audit, run_unit_awareness_audit
 from ablab.platform.datasource import build_synthetic_data
 
+#: 审计里的操作者（现在是必填的具名参数）。
+ACTOR = "tester"
+
 TWO_ARM = [
     {"name": "control", "weight": 0.5},
     {"name": "treatment", "weight": 0.5},
 ]
+
+
+#: 写接口现在需要凭据。测试里统一用这个助手：建一个 admin 用户，
+#: 把 token 挂到 client 上（`client.headers`），这样各测试的调用点不用逐个改。
+def authed_client(app):
+    """给 TestClient 装上 admin 凭据。返回 client 本身。"""
+    from fastapi.testclient import TestClient
+
+    token = app.state.registry.add_user("test_admin", role="admin")
+    client = TestClient(app)
+    client.headers.update({"Authorization": f"Bearer {token}"})
+    return client
 
 
 @pytest.fixture
@@ -37,7 +52,7 @@ class TestEstimatorAlignment:
     def test_last_look_equals_primary(self, registry):
         """**核心不变量**：监控右端点 == 头条结论，逐位相同。"""
         for est in ("cuped", "post_only"):
-            rec = registry.create(name=f"al_{est}", variants=TWO_ARM, true_lift=0.3, estimator=est)
+            rec = registry.create(actor=ACTOR, name=f"al_{est}", variants=TWO_ARM, true_lift=0.3, estimator=est)
             rep = analyse_experiment(rec, n_users=6000, seed=1)
             last = rep.monitoring[-1]
             assert rep.primary_estimator_name == est
@@ -46,7 +61,7 @@ class TestEstimatorAlignment:
             assert last["std_error"] == rep.primary.std_error
 
     def test_alt_is_the_other_estimator(self, registry):
-        rec = registry.create(name="al2", variants=TWO_ARM, true_lift=0.3)
+        rec = registry.create(actor=ACTOR, name="al2", variants=TWO_ARM, true_lift=0.3)
         rep = analyse_experiment(rec, n_users=6000, seed=2)
         assert rep.alt_estimator_name == "post_only"
         # 同一个数据、同一个效应，只换了标准误
@@ -58,14 +73,14 @@ class TestEstimatorAlignment:
 
     def test_crossed_matches_declared_estimator(self, registry):
         """``crossed`` 必须由**声明口径**的 z 决定，不能顺手用另一个。"""
-        rec = registry.create(name="al3", variants=TWO_ARM, true_lift=0.3, estimator="post_only")
+        rec = registry.create(actor=ACTOR, name="al3", variants=TWO_ARM, true_lift=0.3, estimator="post_only")
         rep = analyse_experiment(rec, n_users=6000, seed=3)
         for m in rep.monitoring:
             assert m["crossed"] == (abs(m["z"]) >= m["boundary"])
             assert m["estimator"] == "post_only"
 
     def test_monitoring_carries_both_paths(self, registry):
-        rec = registry.create(name="al4", variants=TWO_ARM)
+        rec = registry.create(actor=ACTOR, name="al4", variants=TWO_ARM)
         rep = analyse_experiment(rec, n_users=4000, n_looks=4, seed=4)
         for m in rep.monitoring:
             assert {"z", "alt_z", "alt_effect", "alt_std_error"} <= set(m)
@@ -73,13 +88,13 @@ class TestEstimatorAlignment:
 
     def test_estimator_declaration_validated(self, registry):
         with pytest.raises(RegistryError, match="estimator"):
-            registry.create(name="al5", variants=TWO_ARM, estimator="nope")
+            registry.create(actor=ACTOR, name="al5", variants=TWO_ARM, estimator="nope")
 
     def test_set_estimator(self, registry):
-        rec = registry.create(name="al6", variants=TWO_ARM)
-        assert registry.set_estimator(rec.id, "post_only").estimator == "post_only"
+        rec = registry.create(actor=ACTOR, name="al6", variants=TWO_ARM)
+        assert registry.set_estimator(rec.id, "post_only", actor=ACTOR).estimator == "post_only"
         with pytest.raises(RegistryError, match="estimator"):
-            registry.set_estimator(rec.id, "nope")
+            registry.set_estimator(rec.id, "nope", actor=ACTOR)
 
 
 # --------------------------------------------------------------------------- #
@@ -87,7 +102,7 @@ class TestEstimatorAlignment:
 # --------------------------------------------------------------------------- #
 class TestAnalysisUnit:
     def test_cluster_path_uses_cluster_level(self, registry):
-        rec = registry.create(
+        rec = registry.create(actor=ACTOR, 
             name="cl1", variants=TWO_ARM, analysis_unit="cluster",
             estimator="post_only", true_lift=2.0,
         )
@@ -104,7 +119,7 @@ class TestAnalysisUnit:
 
     def test_cluster_srm_uses_cluster_counts(self, registry):
         """SRM 的检验对象是**随机化单元**。簇设计下就是簇数，不是用户数。"""
-        rec = registry.create(
+        rec = registry.create(actor=ACTOR, 
             name="cl2", variants=TWO_ARM, analysis_unit="cluster", estimator="post_only"
         )
         rep = analyse_experiment(rec, n_users=10_000, seed=6)
@@ -114,7 +129,7 @@ class TestAnalysisUnit:
         assert rep.n_analysis_units < 0.05 * rep.n_users
 
     def test_cluster_monitoring_is_cluster_level(self, registry):
-        rec = registry.create(
+        rec = registry.create(actor=ACTOR, 
             name="cl3", variants=TWO_ARM, analysis_unit="cluster", estimator="post_only"
         )
         rep = analyse_experiment(rec, n_users=10_000, n_looks=5, seed=7)
@@ -128,7 +143,7 @@ class TestAnalysisUnit:
     def test_cluster_with_cuped_is_rejected(self, registry):
         """整簇路径没有簇级前置指标，CUPED 不可用 —— 创建时就拦住。"""
         with pytest.raises(RegistryError, match="cluster"):
-            registry.create(
+            registry.create(actor=ACTOR, 
                 name="cl4", variants=TWO_ARM, analysis_unit="cluster", estimator="cuped"
             )
 
@@ -148,7 +163,7 @@ class TestAnalysisUnit:
     def test_ratio_uses_delta_method(self, registry):
         # estimator 必须**显式**写 post_only：CUPED 需要前置协变量，比值口径没有它，
         # 注册表会在创建时拦住 ratio+cuped 这个组合 —— **不替用户猜口径**。
-        rec = registry.create(
+        rec = registry.create(actor=ACTOR, 
             name="r1", variants=TWO_ARM, metric_type="ratio",
             estimator="post_only", true_lift=0.02,
         )
@@ -166,7 +181,7 @@ class TestAnalysisUnit:
 
     def test_metric_type_validated(self, registry):
         with pytest.raises(RegistryError, match="metric_type"):
-            registry.create(name="r2", variants=TWO_ARM, metric_type="nope")
+            registry.create(actor=ACTOR, name="r2", variants=TWO_ARM, metric_type="nope")
 
 
 # --------------------------------------------------------------------------- #
@@ -203,7 +218,7 @@ class TestPowerAndMDE:
             required_n_per_arm(1.0, 0.1, treatment_ratio=1.0)
 
     def test_report_power_block(self, registry):
-        rec = registry.create(name="p1", variants=TWO_ARM, true_lift=0.35)
+        rec = registry.create(actor=ACTOR, name="p1", variants=TWO_ARM, true_lift=0.35)
         rep = analyse_experiment(rec, n_users=20_000, seed=9)
         pw = rep.power
         assert {"mde_abs", "mde_relative", "power_at_observed", "se"} <= set(pw)
@@ -216,7 +231,7 @@ class TestPowerAndMDE:
         assert any(c.name == "功效 / MDE" for c in rep.checks)
 
     def test_power_block_is_none_for_non_unit_mean(self, registry):
-        rec = registry.create(
+        rec = registry.create(actor=ACTOR, 
             name="p2", variants=TWO_ARM, analysis_unit="cluster", estimator="post_only"
         )
         rep = analyse_experiment(rec, n_users=8000, seed=10)
@@ -252,12 +267,11 @@ class TestM6Audits:
 class TestDeclarationsThroughAPI:
     @pytest.fixture
     def client(self, work_dir):
-        from fastapi.testclient import TestClient
 
         from ablab.platform.api import create_app
 
         app = create_app(work_dir / "m6_api.db")
-        with TestClient(app) as c:
+        with authed_client(app) as c:
             yield c
         app.state.registry.close()
 

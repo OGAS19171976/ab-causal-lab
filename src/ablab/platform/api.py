@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any, Iterator, Literal
 
 import numpy as np
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -39,7 +39,7 @@ from .analysis import (
     run_aa_validation,
 )
 from .datasource import list_warehouse_experiments
-from .registry import STATUSES, ExperimentRegistry, RegistryError
+from .registry import ROLES, STATUSES, ExperimentRegistry, RegistryError
 
 __all__ = ["create_app", "default_registry_path", "default_warehouse_path"]
 
@@ -175,6 +175,61 @@ class DesignIn(_Strict):
 
 
 # --------------------------------------------------------------------------- #
+# 身份：凭据 -> 操作者
+# --------------------------------------------------------------------------- #
+#
+# 三条不可动摇的规则（都在测试里钉着）：
+#   1. **操作者只从凭据推导**，永远不从请求体里读 —— 客户端能填的名字不是身份，
+#      只是声明。审计字段一旦可以被请求方指定，它就比没有更糟（看起来权威）。
+#   2. **认不出来就是 401，角色不够就是 403**，而且被拒绝的操作**不写审计** ——
+#      否则审计会被失败的尝试淹没，"谁改了什么"要翻十页才看得见。
+#   3. **读接口匿名**。这是单机实验平台的取舍，不是遗漏；说出来，别让人以为
+#      "做了鉴权 = 什么都挡住了"。
+#: 不需要凭据的写路径。**目前为空** —— 将来加"登录接口"时放这里，
+#: 并且测试会读同一个常量，不会出现"测试名单和实现名单不一致"。
+PUBLIC_WRITE_PATHS: frozenset[str] = frozenset()
+
+#: 哪些方法算"写"。读（GET/HEAD/OPTIONS）不受影响：本平台读接口是匿名的，
+#: 这是单机实验平台的取舍，写在这里以免被当成遗漏。
+WRITE_METHODS = ("POST", "PUT", "PATCH", "DELETE")
+
+_BEARER_PREFIX = "bearer "
+_READ_ROLES = {"viewer", "editor", "admin"}
+
+
+def bearer_token(authorization: str | None) -> str | None:
+    """从 `Authorization: Bearer <token>` 里取出 token；格式不对返回 None。"""
+    if not authorization:
+        return None
+    scheme, _, value = authorization.partition(" ")
+    if scheme.strip().lower() != "bearer" or not value.strip():
+        return None
+    return value.strip()
+
+
+def require_role(app: FastAPI, authorization: str | None, minimum: str) -> str:
+    """校验凭据与角色，返回**用户 id**（而不是请求里声称的名字）。
+
+    `app` 走参数而不是闭包：`create_app` 里定义的依赖解析不到注解（见那里的注释）。
+    """
+    registry: ExperimentRegistry = app.state.registry
+    user_id = registry.authenticate(bearer_token(authorization))
+    if user_id is None:
+        raise HTTPException(
+            status_code=401,
+            detail="需要凭据：Authorization: Bearer <token>",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    role = registry.role_of(user_id)
+    if role not in _READ_ROLES or ROLES.index(role) < ROLES.index(minimum):
+        raise HTTPException(
+            status_code=403,
+            detail=f"该操作需要 {minimum} 及以上角色，当前是 {role}",
+        )
+    return user_id
+
+
+# --------------------------------------------------------------------------- #
 # 应用
 # --------------------------------------------------------------------------- #
 def create_app(
@@ -221,6 +276,48 @@ def create_app(
     def _handle(exc: RegistryError) -> HTTPException:
         return HTTPException(status_code=400, detail=str(exc))
 
+    # ---- 身份：**服务端从凭据推导，绝不相信请求体里的名字** -------------- #
+    #
+    # 这里刻意**不用** `Depends(...)` 注解：本模块有
+    # `from __future__ import annotations`，而 FastAPI 求值注解时只用
+    # **模块全局**命名空间 —— 定义在 `create_app` 里的依赖（闭包）解析不到，
+    # 会被当成普通参数（实测：`actor` 变成了必填的 query 参数，直接 422）。
+    # 所以身份校验写成"模块级函数 + 端点内显式调用"；"忘记加"这件事由
+    # `tests/test_governance.py::TestAuthAndActor` 自动枚举所有写路由来兜底。
+    def actor_of(request: Request) -> str:
+        """取中间件已经校验并放好的操作者。
+
+        中间件在**解析请求体之前**就完成了校验（见 `_guard_mutations`），
+        所以这里不会再抛 401/403；但**失败要关闭**：状态上没有 actor 时仍然
+        拒绝，而不是写一条没有操作者的审计（那正是这一列以前一直是空的原因）。
+        """
+        user_id = getattr(request.state, "actor", None)
+        if not user_id:
+            raise HTTPException(401, "这条写路径没有经过身份校验（内部错误，已拒绝）")
+        return str(user_id)
+
+    # ---- 身份中间件：在**请求体校验之前**拦下无凭据的写请求 -------------- #
+    #
+    # 为什么必须是中间件而不是"在端点里调用一次"：FastAPI 先校验请求体、
+    # 再进入函数体，所以匿名调用者会先拿到 422（还附带了 schema 详情），
+    # 而不是 401 —— 实测就是这样，被自动枚举路由的测试抓出来了。
+    # 放在中间件里，顺序就变成"先认证、再校验"，也顺带保证**没有哪个写端点
+    # 能绕过它**（包括将来新加的）。
+    @app.middleware("http")
+    async def _guard_mutations(request: Request, call_next: Any) -> Any:
+        path = request.url.path
+        if request.method in WRITE_METHODS and path.startswith("/api") and path not in PUBLIC_WRITE_PATHS:
+            minimum = "admin" if request.method == "DELETE" else "editor"
+            try:
+                request.state.actor = require_role(
+                    app, request.headers.get("authorization"), minimum
+                )
+            except HTTPException as exc:
+                return JSONResponse(
+                    status_code=exc.status_code, content={"detail": exc.detail}
+                )
+        return await call_next(request)
+
     # ---- 基础 ------------------------------------------------------------ #
     @app.get("/healthz", tags=["基础"])
     def healthz() -> dict[str, Any]:
@@ -238,9 +335,11 @@ def create_app(
         return [r.to_dict() for r in registry.list(status=status)]
 
     @app.post("/api/experiments", status_code=201, tags=["注册表"])
-    def create_experiment(payload: ExperimentIn) -> dict[str, Any]:
+    def create_experiment(payload: ExperimentIn, request: Request) -> dict[str, Any]:
+        # 身份来自凭据；payload 里的 owner 只是业务字段，不参与审计
+        actor = actor_of(request)
         try:
-            record = registry.create(**payload.model_dump())
+            record = registry.create(actor=actor, **payload.model_dump())
         except RegistryError as exc:
             raise _handle(exc) from exc
         return record.to_dict()
@@ -253,24 +352,33 @@ def create_app(
             raise HTTPException(404, str(exc)) from exc
 
     @app.patch("/api/experiments/{experiment_id}/status", tags=["注册表"])
-    def set_status(experiment_id: str, payload: StatusIn) -> dict[str, Any]:
+    def set_status(
+        experiment_id: str, payload: StatusIn, request: Request
+    ) -> dict[str, Any]:
+        actor = actor_of(request)
         try:
-            return registry.set_status(experiment_id, payload.status).to_dict()
+            return registry.set_status(experiment_id, payload.status, actor=actor).to_dict()
         except RegistryError as exc:
             raise HTTPException(404 if "找不到" in str(exc) else 400, str(exc)) from exc
 
     @app.delete("/api/experiments/{experiment_id}", status_code=204, tags=["注册表"])
-    def delete_experiment(experiment_id: str) -> JSONResponse:
+    def delete_experiment(experiment_id: str, request: Request) -> JSONResponse:
+        actor = actor_of(request)
         try:
-            registry.delete(experiment_id)
+            registry.delete(experiment_id, actor=actor)
         except RegistryError as exc:
             raise HTTPException(404, str(exc)) from exc
         return JSONResponse(status_code=204, content=None)
 
     @app.post("/api/experiments/{experiment_id}/estimator", tags=["注册表"])
-    def set_estimator(experiment_id: str, payload: EstimatorIn) -> dict[str, Any]:
+    def set_estimator(
+        experiment_id: str, payload: EstimatorIn, request: Request
+    ) -> dict[str, Any]:
+        actor = actor_of(request)
         try:
-            return registry.set_estimator(experiment_id, payload.estimator).to_dict()
+            return registry.set_estimator(
+                experiment_id, payload.estimator, actor=actor
+            ).to_dict()
         except RegistryError as exc:
             raise HTTPException(404 if "找不到" in str(exc) else 400, str(exc)) from exc
 
@@ -314,9 +422,14 @@ def create_app(
         }
 
     @app.post("/api/experiments/{experiment_id}/bind", tags=["数仓"])
-    def bind_experiment(experiment_id: str, payload: BindIn) -> dict[str, Any]:
+    def bind_experiment(
+        experiment_id: str, payload: BindIn, request: Request
+    ) -> dict[str, Any]:
+        actor = actor_of(request)
         try:
-            record = registry.bind_warehouse(experiment_id, payload.warehouse_experiment)
+            record = registry.bind_warehouse(
+                experiment_id, payload.warehouse_experiment, actor=actor
+            )
         except RegistryError as exc:
             raise HTTPException(404 if "找不到" in str(exc) else 400, str(exc)) from exc
         # 绑定的目标必须真的存在，否则用户要到点"分析"时才发现 —— 那是更晚、更贵的反馈
@@ -324,7 +437,8 @@ def create_app(
             with warehouse_connection() as con:
                 known = {e["experiment"] for e in list_warehouse_experiments(con)}
             if record.warehouse_experiment not in known:
-                registry.bind_warehouse(experiment_id, None)
+                # 回滚也用同一个 actor：这条审计记的是"同一个人绑定失败并回滚"
+                registry.bind_warehouse(experiment_id, None, actor=actor)
                 raise HTTPException(
                     400,
                     f"数仓里没有实验 {record.warehouse_experiment!r}；"

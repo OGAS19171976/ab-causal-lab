@@ -9,14 +9,41 @@ ab-causal-lab · 治理验证：操作审计（append-only）+ 护栏指标显�
   创建实验 gov_demo，并依次改状态 / 改判定口径 / 绑数仓
   （实验 id 是 uuid4，每次入库都变 —— 刻意不打印它，否则这份报告每次都不一样；审计本身按 seq 排序，不依赖 id。）
 
-   seq  action           field                  before -> after
-     1  create
-     2  set_status       status                 draft -> running
-     3  set_estimator    estimator              cuped -> post_only
-     4  bind_warehouse   warehouse_experiment   （空） -> exp_rank_v2
+   seq  操作者            action           field                  before -> after
+     1  gov-validator  create
+     2  gov-validator  set_status       status                 draft -> running
+     3  gov-validator  set_estimator    estimator              cuped -> post_only
+     4  gov-validator  bind_warehouse   warehouse_experiment   （空） -> exp_rank_v2
 
   改判定口径那条的备注（它改变的是**判定规则**，不只是元数据）：
     判定口径变更：历史结论的判定规则会随之改变
+
+### 1.5 身份：操作者**只能**来自凭据
+  审计里的 `actor` 一列现在是必填的（忘了记谁会在调用点报错），
+  而它的值**只**由服务端从凭据推导。三种伪造尝试实测：
+
+  用户          角色       库里存的是         明文 token 可读?
+  gov_admin   admin    sha256 前 12 位 否（只存哈希）
+  gov_editor  editor   sha256 前 12 位 否（只存哈希）
+  gov_viewer  viewer   sha256 前 12 位 否（只存哈希）
+
+  认证结果（真值来自凭据，伪造一律无效）：
+    正确 token            -> 'gov_admin'
+    错误 token            -> None
+    空凭据                -> None
+    被停用的用户          -> None（停用立即生效）
+
+  **请求里写的名字不算数** —— 这一条走真实 HTTP 接口实测：
+    无凭据 POST                      -> 401
+    错 token POST                    -> 401
+    viewer POST                      -> 403（角色不够）
+    伪造（query+header 都写 http_admin）-> 审计记为 ['http_alice']（凭据是 http_alice）
+    editor DELETE                    -> 403（删是 admin 的权限）
+    admin DELETE                     -> 204
+    被拒的三次尝试留下审计条数        -> 0（只记成功的那两条）
+    另外 `actor` 也不是请求体字段（`_Strict` 直接 422），见 `tests/test_governance.py::TestAuthAndActor`：
+    · 有一条测试**自动枚举所有写路由**逐个断言 401，
+      所以「新加了端点忘了鉴权」会在 CI 上直接红。
 
 ### 2. 删掉实验之后，审计必须还在
   实验本身已删除：True
@@ -63,8 +90,12 @@ ab-causal-lab · 治理验证：操作审计（append-only）+ 护栏指标显�
   * 删除实验不会删除审计 —— 那正是最需要它的时刻。
   * 护栏的「未分析」状态出现在每一份相关报告里，并说清了原因。
   * 仍未做的（写在这里而不是留着让人误会）：
-    - 审计没有「操作者」字段。平台上还没有鉴权，写上去也只是个空字段；
-      真上线要先有身份，再谈「谁做的」。
+    - ~~审计没有「操作者」字段~~ **已补**：静态 token 鉴权 + `actor` 列，
+      见第 1.5 节与 README 设计决策第 45 条。
+      **边界**：静态 token 无过期、无轮换、无限速，token 泄露即冒充；
+      读接口仍然匿名；迁移前的老记录操作者是「（迁移前未知）」。
+    - 注册表仍然**没有并发控制**：两个人同时改同一个实验会互相覆盖。
+      身份解决「谁改的」，不解决「同时改」—— 那是乐观锁的事。
     - 护栏**仍然没有被分析**：数据模型只有主指标一条时间序列。
       要做需要数仓里另建指标表 + 停实验的判据，那是另一件事。
 ```

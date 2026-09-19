@@ -22,7 +22,9 @@ salt 决定了每一个用户的分组。改 salt 等于把所有用户重新分
 
 from __future__ import annotations
 
+import hashlib
 import json
+import secrets
 import sqlite3
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -86,11 +88,28 @@ CREATE TABLE IF NOT EXISTS experiment_events (
     field         TEXT,
     before        TEXT,
     after         TEXT,
-    note          TEXT NOT NULL DEFAULT ''
+    note          TEXT NOT NULL DEFAULT '',
+    -- 操作者。**由服务端从凭据推导，永远不从请求体里读** ——
+    -- 客户端能填的名字不是身份，只是声明（见 README 设计决策第 45 条）。
+    -- 老库迁移时这一列取默认值：宁可写"未知"，也不拿一个猜出来的名字
+    -- 冒充历史记录（`experiment_events` 是 append-only，回填就是改写历史）。
+    actor         TEXT NOT NULL DEFAULT '（迁移前未知）'
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_experiment
     ON experiment_events(experiment_id, seq);
+
+-- 用户与凭据。**存 token 的 sha256，不存 token 本身**：
+-- 库文件泄露不应该等于凭据泄露。token 是高熵随机串（`secrets.token_urlsafe`），
+-- 所以直接哈希就够，不需要抗暴力破解的口令哈希 —— 没有"猜口令"这条捷径。
+CREATE TABLE IF NOT EXISTS users (
+    id            TEXT PRIMARY KEY,
+    token_hash    TEXT NOT NULL UNIQUE,
+    role          TEXT NOT NULL CHECK (role IN ('viewer', 'editor', 'admin')),
+    created_at    TEXT NOT NULL,
+    disabled      INTEGER NOT NULL DEFAULT 0,
+    note          TEXT NOT NULL DEFAULT ''
+);
 
 CREATE TRIGGER IF NOT EXISTS experiment_events_no_update
 BEFORE UPDATE ON experiment_events
@@ -116,6 +135,17 @@ _MIGRATIONS: dict[str, str] = {
     "analysis_unit": "TEXT NOT NULL DEFAULT 'unit'",
     "metric_type": "TEXT NOT NULL DEFAULT 'mean'",
 }
+
+#: 审计表新增的列。单独一张表，因为它的迁移规则不一样：
+#: ``experiment_events`` 上的触发器禁止 UPDATE，所以**只能用
+#: ``ALTER TABLE ADD COLUMN`` + 默认值**，绝不能用"先加列再 UPDATE 回填"——
+#: 那样会被自己的触发器拒绝，或者（更糟）逼着人去关掉触发器，等于毁掉审计。
+_EVENT_MIGRATIONS: dict[str, str] = {
+    "actor": "TEXT NOT NULL DEFAULT '（迁移前未知）'",
+}
+
+#: 角色。最小三分法：读 / 写 / 删。
+ROLES = ("viewer", "editor", "admin")
 
 #: 判定口径。**必须与头条结论同一个估计量**，否则监控曲线与结论卡会互相打架。
 ESTIMATORS = ("cuped", "post_only")
@@ -146,6 +176,8 @@ class ExperimentEvent:
     before: str | None = None
     after: str | None = None
     note: str = ""
+    #: 操作者（由服务端从凭据推导）。老库里迁移过来的行是"（迁移前未知）"。
+    actor: str = "（迁移前未知）"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -232,6 +264,9 @@ class ExperimentRegistry:
 
         ``CREATE TABLE IF NOT EXISTS`` 只管"表不存在"，管不了"表少一列"。
         没有这一步，给老库加列之后第一次写入就会 no such column。
+
+        审计表单独处理：它只能用 ``ADD COLUMN`` + 默认值（触发器禁止 UPDATE，
+        回填历史等于改写历史）。见 ``_EVENT_MIGRATIONS``。
         """
         existing = {
             row["name"] for row in self._conn.execute("PRAGMA table_info(experiments)")
@@ -240,8 +275,115 @@ class ExperimentRegistry:
             if column not in existing:
                 self._conn.execute(f"ALTER TABLE experiments ADD COLUMN {column} {decl}")
 
+        event_cols = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(experiment_events)")
+        }
+        for column, decl in _EVENT_MIGRATIONS.items():
+            if column not in event_cols:
+                self._conn.execute(
+                    f"ALTER TABLE experiment_events ADD COLUMN {column} {decl}"
+                )
+
     def close(self) -> None:
         self._conn.close()
+
+    # -- 用户与凭据 ---------------------------------------------------------- #
+    #
+    # 这一节的边界（写在代码里，不是只写在 README 里）：
+    #   * 这是**静态 token** 鉴权：没有过期、没有轮换、没有限速。
+    #     token 泄露 = 该用户被冒充，且只有 `disable_user` 能止损。
+    #   * 它只解决"写操作记谁"，不解决"两个人同时改会互相覆盖"（那是并发控制）。
+    #   * 读接口仍然匿名（单机实验平台，读不是威胁面）—— 这一点必须说出来，
+    #     否则"平台做了鉴权"会被理解成"什么都挡住了"。
+    @staticmethod
+    def hash_token(token: str) -> str:
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    def add_user(
+        self,
+        user_id: str,
+        *,
+        role: str = "editor",
+        note: str = "",
+        token: str | None = None,
+    ) -> str:
+        """建用户并返回**明文 token（只此一次）**。
+
+        库里只留哈希，所以这个返回值是拿到凭据的唯一机会 ——
+        丢了只能重新发一个（`rotate_token`），不能"再查一次"。
+        """
+        if role not in ROLES:
+            raise RegistryError(f"角色必须是 {ROLES} 之一，收到 {role!r}")
+        if not user_id.strip():
+            raise RegistryError("user_id 不能为空")
+        raw = token if token is not None else secrets.token_urlsafe(32)
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO users (id, token_hash, role, created_at, disabled, note) "
+                "VALUES (?,?,?,?,0,?)",
+                (user_id, self.hash_token(raw), role, _now(), note),
+            )
+        return raw
+
+    def rotate_token(self, user_id: str) -> str:
+        """换发 token（旧 token 立即失效）。用户不存在时抛错。"""
+        raw = secrets.token_urlsafe(32)
+        with self._conn:
+            cur = self._conn.execute(
+                "UPDATE users SET token_hash = ? WHERE id = ?",
+                (self.hash_token(raw), user_id),
+            )
+            if cur.rowcount == 0:
+                raise RegistryError(f"用户不存在：{user_id}")
+        return raw
+
+    def disable_user(self, user_id: str, *, disabled: bool = True) -> None:
+        with self._conn:
+            cur = self._conn.execute(
+                "UPDATE users SET disabled = ? WHERE id = ?",
+                (1 if disabled else 0, user_id),
+            )
+            if cur.rowcount == 0:
+                raise RegistryError(f"用户不存在：{user_id}")
+
+    def list_users(self) -> list[dict[str, Any]]:
+        """用户清单。**永不返回 token 或哈希** —— 连哈希也没必要给人看。"""
+        return [
+            {
+                "id": row["id"],
+                "role": row["role"],
+                "created_at": row["created_at"],
+                "disabled": bool(row["disabled"]),
+                "note": row["note"],
+            }
+            for row in self._conn.execute(
+                "SELECT id, role, created_at, disabled, note FROM users ORDER BY id"
+            )
+        ]
+
+    def authenticate(self, token: str | None) -> str | None:
+        """凭据 -> 用户 id。认不出来、被停用、或没给，都返回 ``None``。
+
+        **这是身份的唯一起点**：调用方（API 层）只能从这里拿 actor，
+        绝不允许把请求体里的名字当身份传进 ``_record_event``。
+        """
+        if not token:
+            return None
+        row = self._conn.execute(
+            "SELECT id, disabled FROM users WHERE token_hash = ?",
+            (self.hash_token(token),),
+        ).fetchone()
+        if row is None or row["disabled"]:
+            return None
+        return str(row["id"])
+
+    def role_of(self, user_id: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT role, disabled FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+        if row is None or row["disabled"]:
+            return None
+        return str(row["role"])
 
     # -- 审计（append-only） ------------------------------------------------ #
     def _record_event(
@@ -249,6 +391,7 @@ class ExperimentRegistry:
         experiment_id: str,
         action: str,
         *,
+        actor: str,
         field: str | None = None,
         before: Any = None,
         after: Any = None,
@@ -259,12 +402,15 @@ class ExperimentRegistry:
         **故意不 commit**：调用方把业务变更和这一条放在同一个 ``with self._conn``
         里，要么都落盘、要么都不落。分开写就会出现"改了但没记"——
         而审计表里"没有这条"与"这件事没发生"长得一模一样，是最难发现的那种缺失。
+
+        ``actor`` 是**必填的具名参数**：这样"忘了记是谁"在调用点就报错，
+        而不是静默写进一个空字符串（那正是这一列以前一直是空的原因）。
         """
         self._conn.execute(
             """
             INSERT INTO experiment_events
-            (experiment_id, at, action, field, before, after, note)
-            VALUES (?,?,?,?,?,?,?)
+            (experiment_id, at, action, field, before, after, note, actor)
+            VALUES (?,?,?,?,?,?,?,?)
             """,
             (
                 experiment_id,
@@ -274,6 +420,7 @@ class ExperimentRegistry:
                 None if before is None else str(before),
                 None if after is None else str(after),
                 note,
+                actor,
             ),
         )
 
@@ -301,6 +448,7 @@ class ExperimentRegistry:
                 before=row["before"],
                 after=row["after"],
                 note=row["note"],
+                actor=row["actor"],
             )
             for row in self._conn.execute(sql, params)
         ]
@@ -320,6 +468,7 @@ class ExperimentRegistry:
                 before=row["before"],
                 after=row["after"],
                 note=row["note"],
+                actor=row["actor"],
             )
             for row in rows
         ]
@@ -361,6 +510,7 @@ class ExperimentRegistry:
     def create(
         self,
         *,
+        actor: str,
         name: str,
         variants: Sequence[dict[str, Any]],
         salt: str | None = None,
@@ -469,13 +619,16 @@ class ExperimentRegistry:
         self._record_event(
             record.id,
             "create",
+            actor=actor,
             after=record.name,
             note=f"salt={record.salt}；口径={record.estimator}；单元={record.analysis_unit}",
         )
         self._conn.commit()
         return record
 
-    def set_status(self, experiment_id: str, status: str) -> ExperimentRecord:
+    def set_status(
+        self, experiment_id: str, status: str, *, actor: str
+    ) -> ExperimentRecord:
         """只允许改状态 —— 分流定义一旦上线就不能动。"""
         if status not in STATUSES:
             raise RegistryError(f"status 必须是 {STATUSES} 之一，收到 {status!r}")
@@ -485,13 +638,15 @@ class ExperimentRegistry:
                 "UPDATE experiments SET status = ? WHERE id = ?", (status, experiment_id)
             )
             self._record_event(
-                experiment_id, "set_status", field="status",
+                experiment_id, "set_status", actor=actor, field="status",
                 before=record.status, after=status,
             )
         record.status = status
         return record
 
-    def set_estimator(self, experiment_id: str, estimator: str) -> ExperimentRecord:
+    def set_estimator(
+        self, experiment_id: str, estimator: str, *, actor: str
+    ) -> ExperimentRecord:
         """切换判定口径。
 
         允许改 —— 口径是**策略**不是数据，改了不会让任何人的分组失效。
@@ -507,14 +662,16 @@ class ExperimentRegistry:
                 "UPDATE experiments SET estimator = ? WHERE id = ?", (estimator, experiment_id)
             )
             self._record_event(
-                experiment_id, "set_estimator", field="estimator",
+                experiment_id, "set_estimator", actor=actor, field="estimator",
                 before=record.estimator, after=estimator,
                 note="判定口径变更：历史结论的判定规则会随之改变",
             )
         record.estimator = estimator
         return record
 
-    def bind_warehouse(self, experiment_id: str, warehouse_experiment: str | None) -> ExperimentRecord:
+    def bind_warehouse(
+        self, experiment_id: str, warehouse_experiment: str | None, *, actor: str
+    ) -> ExperimentRecord:
         """绑定/解绑数仓实验。
 
         **允许后置修改，而且不影响任何已有结论的正确性** —— 因为这个字段
@@ -530,21 +687,21 @@ class ExperimentRegistry:
                 (binding, experiment_id),
             )
             self._record_event(
-                experiment_id, "bind_warehouse", field="warehouse_experiment",
+                experiment_id, "bind_warehouse", actor=actor, field="warehouse_experiment",
                 before=record.warehouse_experiment, after=binding,
                 note="数据源绑定变更：改变读哪份数据，不改变任何用户的分组",
             )
         record.warehouse_experiment = binding
         return record
 
-    def delete(self, experiment_id: str) -> None:
+    def delete(self, experiment_id: str, *, actor: str) -> None:
         if self.get(experiment_id) is None:
             raise RegistryError(f"找不到实验 {experiment_id!r}")
         with self._conn:
             self._conn.execute("DELETE FROM experiments WHERE id = ?", (experiment_id,))
             # 审计**不删**：删掉实验之后，"谁删的、删之前是什么状态"正是要回答的问题。
             self._record_event(
-                experiment_id, "delete",
+                experiment_id, "delete", actor=actor,
                 before=experiment_id, after=None,
                 note="实验已删除；这条审计保留（append-only，无级联）",
             )

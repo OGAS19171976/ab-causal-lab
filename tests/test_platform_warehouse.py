@@ -28,6 +28,9 @@ from ablab.platform.api import create_app
 from ablab.platform.datasource import build_warehouse_data, list_warehouse_experiments
 from ablab.platform.demo import WAREHOUSE_DEMO, seed_demo
 
+#: 审计里的操作者（现在是必填的具名参数）。
+ACTOR = "tester"
+
 TWO_ARM = [
     {"name": "control", "weight": 0.5},
     {"name": "treatment", "weight": 0.5},
@@ -36,6 +39,16 @@ NINE_ONE = [
     {"name": "control", "weight": 0.9},
     {"name": "treatment", "weight": 0.1},
 ]
+
+
+#: 写接口现在需要凭据。测试里统一用这个助手：建一个 admin 用户，
+#: 把 token 挂到 client 上（`client.headers`），这样各测试的调用点不用逐个改。
+def authed_client(app):
+    """给 TestClient 装上 admin 凭据。返回 client 本身。"""
+    token = app.state.registry.add_user("test_admin", role="admin")
+    client = TestClient(app)
+    client.headers.update({"Authorization": f"Bearer {token}"})
+    return client
 
 
 @pytest.fixture(scope="session")
@@ -91,7 +104,7 @@ class TestSyntheticSource:
         默认口径是 CUPED，所以最后一次查看要等于 ``primary``（CUPED），
         而 ``alt``（post-only）是另一个口径、不该被拿来比。
         """
-        rec = registry.create(name="ds1", variants=TWO_ARM, true_lift=0.3)
+        rec = registry.create(actor=ACTOR, name="ds1", variants=TWO_ARM, true_lift=0.3)
         rep = analyse_experiment(rec, n_users=6000, seed=1)
         last = rep.monitoring[-1]
         assert rep.primary_estimator_name == "cuped"
@@ -109,7 +122,7 @@ class TestSyntheticSource:
         如果按"两臂都取 min(n_t, n_c) 的前缀"来构造查看，小臂永远取不到全量，
         最后一次查看就不等于全量分析了。正确做法是**每臂内部**各自按比例取前缀。
         """
-        rec = registry.create(name="ds2", variants=NINE_ONE)
+        rec = registry.create(actor=ACTOR, name="ds2", variants=NINE_ONE)
         rep = analyse_experiment(rec, n_users=8000, seed=2)
         last = rep.monitoring[-1]
         assert last["n_treatment"] == rep.primary.n_treatment
@@ -117,20 +130,20 @@ class TestSyntheticSource:
         assert last["std_error"] == rep.primary.std_error
 
     def test_information_fractions_are_uniform(self, registry):
-        rec = registry.create(name="ds3", variants=TWO_ARM)
+        rec = registry.create(actor=ACTOR, name="ds3", variants=TWO_ARM)
         rep = analyse_experiment(rec, n_users=4000, n_looks=8, seed=3)
         fracs = [m["information_fraction"] for m in rep.monitoring]
         assert fracs == [round(i / 8, 10) for i in range(1, 9)]
 
     def test_n_per_arm_is_monotone(self, registry):
-        rec = registry.create(name="ds4", variants=NINE_ONE)
+        rec = registry.create(actor=ACTOR, name="ds4", variants=NINE_ONE)
         rep = analyse_experiment(rec, n_users=6000, n_looks=5, seed=4)
         sizes = [m["n_per_arm"] for m in rep.monitoring]
         assert sizes == sorted(sizes)
         assert all(s >= 2 for s in sizes)
 
     def test_source_is_marked(self, registry):
-        rec = registry.create(name="ds5", variants=TWO_ARM)
+        rec = registry.create(actor=ACTOR, name="ds5", variants=TWO_ARM)
         rep = analyse_experiment(rec, n_users=2000, seed=5)
         assert rep.source == "synthetic"
         assert rep.population_size == 2000
@@ -141,22 +154,22 @@ class TestSyntheticSource:
 # --------------------------------------------------------------------------- #
 class TestBinding:
     def test_create_with_binding(self, registry):
-        rec = registry.create(name="b1", variants=TWO_ARM, warehouse_experiment="exp_rank_v2")
+        rec = registry.create(actor=ACTOR, name="b1", variants=TWO_ARM, warehouse_experiment="exp_rank_v2")
         assert rec.warehouse_experiment == "exp_rank_v2"
         assert registry.get(rec.id).warehouse_experiment == "exp_rank_v2"
 
     def test_bind_and_unbind(self, registry):
-        rec = registry.create(name="b2", variants=TWO_ARM)
+        rec = registry.create(actor=ACTOR, name="b2", variants=TWO_ARM)
         assert rec.warehouse_experiment is None
-        assert registry.bind_warehouse(rec.id, "  exp_rec_emb  ").warehouse_experiment == "exp_rec_emb"
-        assert registry.bind_warehouse(rec.id, None).warehouse_experiment is None
+        assert registry.bind_warehouse(rec.id, "  exp_rec_emb  ", actor=ACTOR).warehouse_experiment == "exp_rec_emb"
+        assert registry.bind_warehouse(rec.id, None, actor=ACTOR).warehouse_experiment is None
 
     def test_blank_binding_rejected(self, registry):
-        rec = registry.create(name="b3", variants=TWO_ARM)
+        rec = registry.create(actor=ACTOR, name="b3", variants=TWO_ARM)
         with pytest.raises(RegistryError, match="空白"):
-            registry.bind_warehouse(rec.id, "   ")
+            registry.bind_warehouse(rec.id, "   ", actor=ACTOR)
         with pytest.raises(RegistryError, match="空白"):
-            registry.create(name="b3b", variants=TWO_ARM, warehouse_experiment="  ")
+            registry.create(actor=ACTOR, name="b3b", variants=TWO_ARM, warehouse_experiment="  ")
 
     def test_binding_is_mutable_but_salt_is_not(self, registry):
         """绑定可变、salt 不可变 —— 两者的区别必须清晰。
@@ -164,10 +177,10 @@ class TestBinding:
         salt 决定了每个用户的分组，改它等于让已有数据报废；
         ``warehouse_experiment`` 只决定"从哪里读数"，不影响任何分组。
         """
-        rec = registry.create(name="b4", variants=TWO_ARM)
+        rec = registry.create(actor=ACTOR, name="b4", variants=TWO_ARM)
         salt_before = rec.salt
-        registry.bind_warehouse(rec.id, "exp_rank_v2")
-        registry.bind_warehouse(rec.id, "exp_rec_emb")
+        registry.bind_warehouse(rec.id, "exp_rank_v2", actor=ACTOR)
+        registry.bind_warehouse(rec.id, "exp_rec_emb", actor=ACTOR)
         after = registry.get(rec.id)
         assert after.salt == salt_before, "绑定不该碰到 salt"
         assert after.warehouse_experiment == "exp_rec_emb"
@@ -206,9 +219,9 @@ class TestBinding:
             # 老行读得出来，新列取默认值
             assert reg.get("old1").warehouse_experiment is None
             # 新行写得进去
-            rec = reg.create(name="new_after_migration", variants=TWO_ARM)
+            rec = reg.create(actor=ACTOR, name="new_after_migration", variants=TWO_ARM)
             assert rec.warehouse_experiment is None
-            assert reg.bind_warehouse(rec.id, "exp_rank_v2").warehouse_experiment == "exp_rank_v2"
+            assert reg.bind_warehouse(rec.id, "exp_rank_v2", actor=ACTOR).warehouse_experiment == "exp_rank_v2"
         finally:
             reg.close()
 
@@ -280,7 +293,7 @@ class TestWarehouseSource:
 def wh_client(work_dir, warehouse_path):
     app = create_app(work_dir / "wh_api.db", warehouse_path=warehouse_path)
     seed_demo(app.state.registry, warehouse_available=True)
-    with TestClient(app) as c:
+    with authed_client(app) as c:
         yield c
     app.state.registry.close()
 
@@ -290,7 +303,7 @@ def plain_client(work_dir):
     """没配数仓的平台 —— 必须优雅退化，不是崩掉。"""
     app = create_app(work_dir / "plain_api.db")
     seed_demo(app.state.registry)
-    with TestClient(app) as c:
+    with authed_client(app) as c:
         yield c
     app.state.registry.close()
 
@@ -522,7 +535,7 @@ class TestWarehouseRatioMetric:
 
         reg = ExperimentRegistry(work_dir / "ratio_gate.db")
         with pytest.raises(RegistryError, match="ratio"):
-            reg.create(
+            reg.create(actor=ACTOR, 
                 name="bad_ratio",
                 variants=[{"name": "control", "weight": 0.5}, {"name": "treatment", "weight": 0.5}],
                 salt="bad_ratio_v1",

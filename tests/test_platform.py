@@ -21,10 +21,23 @@ from ablab.platform import (
 from ablab.platform.api import create_app
 from ablab.platform.demo import DEMO_EXPERIMENTS, seed_demo
 
+#: 审计里的操作者（现在是必填的具名参数）。
+ACTOR = "tester"
+
 TWO_ARM = [
     {"name": "control", "weight": 0.5},
     {"name": "treatment", "weight": 0.5},
 ]
+
+
+#: 写接口现在需要凭据。测试里统一用这个助手：建一个 admin 用户，
+#: 把 token 挂到 client 上（`client.headers`），这样各测试的调用点不用逐个改。
+def authed_client(app):
+    """给 TestClient 装上 admin 凭据。返回 client 本身。"""
+    token = app.state.registry.add_user("test_admin", role="admin")
+    client = TestClient(app)
+    client.headers.update({"Authorization": f"Bearer {token}"})
+    return client
 
 
 @pytest.fixture
@@ -38,7 +51,7 @@ def registry(work_dir):
 def client(work_dir):
     app = create_app(work_dir / "api.db")
     seed_demo(app.state.registry)
-    with TestClient(app) as c:
+    with authed_client(app) as c:
         yield c
 
 
@@ -47,7 +60,7 @@ def client(work_dir):
 # --------------------------------------------------------------------------- #
 class TestRegistry:
     def test_create_and_get(self, registry):
-        rec = registry.create(name="exp_a", variants=TWO_ARM, true_lift=0.3)
+        rec = registry.create(actor=ACTOR, name="exp_a", variants=TWO_ARM, true_lift=0.3)
         assert rec.id and rec.salt == "exp_a_v1"
         assert registry.get(rec.id).name == "exp_a"
         assert registry.count() == 1
@@ -55,39 +68,39 @@ class TestRegistry:
     def test_weights_must_sum_to_one(self, registry):
         """校验复用 M0 的 ExperimentSpec —— 不是在这层另写一遍。"""
         with pytest.raises(RegistryError, match="权重之和"):
-            registry.create(
+            registry.create(actor=ACTOR, 
                 name="bad", variants=[{"name": "a", "weight": 0.5}, {"name": "b", "weight": 0.4}]
             )
         assert registry.count() == 0, "校验失败时不应写入任何记录"
 
     def test_duplicate_name_rejected(self, registry):
-        registry.create(name="dup", variants=TWO_ARM)
+        registry.create(actor=ACTOR, name="dup", variants=TWO_ARM)
         with pytest.raises(RegistryError, match="已存在"):
-            registry.create(name="dup", variants=TWO_ARM)
+            registry.create(actor=ACTOR, name="dup", variants=TWO_ARM)
 
     def test_invalid_traffic_ratio(self, registry):
         with pytest.raises(RegistryError, match="traffic_ratio"):
-            registry.create(name="bad", variants=TWO_ARM, traffic_ratio=1.5)
+            registry.create(actor=ACTOR, name="bad", variants=TWO_ARM, traffic_ratio=1.5)
 
     def test_default_salt_is_stable(self, registry):
         """salt 由名字派生，必须是确定的（否则每次重启都会重新分组）。"""
-        a = registry.create(name="s1", variants=TWO_ARM)
+        a = registry.create(actor=ACTOR, name="s1", variants=TWO_ARM)
         assert a.salt == "s1_v1"
 
     def test_explicit_salt_used(self, registry):
-        rec = registry.create(name="s2", variants=TWO_ARM, salt="my_salt_v9")
+        rec = registry.create(actor=ACTOR, name="s2", variants=TWO_ARM, salt="my_salt_v9")
         assert rec.salt == "my_salt_v9"
 
     def test_empty_salt_rejected(self, registry):
         with pytest.raises(RegistryError, match="salt 不能为空"):
-            registry.create(name="s3", variants=TWO_ARM, salt="   ")
+            registry.create(actor=ACTOR, name="s3", variants=TWO_ARM, salt="   ")
 
     def test_status_transitions(self, registry):
-        rec = registry.create(name="s4", variants=TWO_ARM)
+        rec = registry.create(actor=ACTOR, name="s4", variants=TWO_ARM)
         assert rec.status == "draft"
-        assert registry.set_status(rec.id, "running").status == "running"
+        assert registry.set_status(rec.id, "running", actor=ACTOR).status == "running"
         with pytest.raises(RegistryError, match="status"):
-            registry.set_status(rec.id, "nope")
+            registry.set_status(rec.id, "nope", actor=ACTOR)
 
     def test_no_update_method_for_spec(self, registry):
         """**刻意不提供**修改分流定义的方法 —— 那会让已有数据报废。"""
@@ -95,8 +108,8 @@ class TestRegistry:
         assert not hasattr(registry, "update_spec")
 
     def test_delete(self, registry):
-        rec = registry.create(name="s5", variants=TWO_ARM)
-        registry.delete(rec.id)
+        rec = registry.create(actor=ACTOR, name="s5", variants=TWO_ARM)
+        registry.delete(rec.id, actor=ACTOR)
         with pytest.raises(RegistryError, match="找不到"):
             registry.get(rec.id)
 
@@ -105,13 +118,13 @@ class TestRegistry:
             registry.get("nope")
 
     def test_list_filter_by_status(self, registry):
-        registry.create(name="a", variants=TWO_ARM, status="draft")
-        registry.create(name="b", variants=TWO_ARM, status="running")
+        registry.create(actor=ACTOR, name="a", variants=TWO_ARM, status="draft")
+        registry.create(actor=ACTOR, name="b", variants=TWO_ARM, status="running")
         assert len(registry.list()) == 2
         assert [r.name for r in registry.list(status="running")] == ["b"]
 
     def test_to_spec_roundtrip(self, registry):
-        rec = registry.create(name="s6", variants=TWO_ARM, traffic_ratio=0.4, layer="L")
+        rec = registry.create(actor=ACTOR, name="s6", variants=TWO_ARM, traffic_ratio=0.4, layer="L")
         spec = rec.to_spec()
         assert spec.traffic_ratio == 0.4
         assert spec.layer == "L"
@@ -120,7 +133,7 @@ class TestRegistry:
     def test_persistence_across_connections(self, work_dir):
         p = work_dir / "persist.db"
         r1 = ExperimentRegistry(p)
-        r1.create(name="keepme", variants=TWO_ARM)
+        r1.create(actor=ACTOR, name="keepme", variants=TWO_ARM)
         r1.close()
         r2 = ExperimentRegistry(p)
         assert r2.count() == 1
@@ -147,7 +160,7 @@ class TestDemoSeed:
 # --------------------------------------------------------------------------- #
 class TestAnalysis:
     def test_report_shape(self, registry):
-        rec = registry.create(name="an1", variants=TWO_ARM, true_lift=0.4)
+        rec = registry.create(actor=ACTOR, name="an1", variants=TWO_ARM, true_lift=0.4)
         rep = analyse_experiment(rec, n_users=3000, seed=1)
         assert rep.cuped is not None and rep.naive is not None
         assert rep.sequential is not None and len(rep.monitoring) == 5
@@ -155,14 +168,14 @@ class TestAnalysis:
 
     def test_srm_appears_exactly_once(self, registry):
         """回归测试：曾经显式加一次、CUPED 自己又加一次，导致重复。"""
-        rec = registry.create(name="an2", variants=TWO_ARM, true_lift=0.3)
+        rec = registry.create(actor=ACTOR, name="an2", variants=TWO_ARM, true_lift=0.3)
         rep = analyse_experiment(rec, n_users=3000, seed=2)
         names = [c.name for c in rep.checks]
         assert names.count("SRM") == 1
         assert names[0] == "SRM", "SRM 必须排第一位"
 
     def test_cuped_beats_naive_se(self, registry):
-        rec = registry.create(name="an3", variants=TWO_ARM, true_lift=0.4)
+        rec = registry.create(actor=ACTOR, name="an3", variants=TWO_ARM, true_lift=0.4)
         rep = analyse_experiment(rec, n_users=6000, seed=3)
         assert rep.cuped.std_error < rep.naive.std_error
         assert rep.cuped_fit.variance_reduction > 0.3
@@ -173,7 +186,7 @@ class TestAnalysis:
         前提是平台用的是**业务量纲**而不是验证台的 100/30 抽象量纲：
         若 post_sd=30，0.4 只有 0.013σ，再多样本也检不出来。
         """
-        rec = registry.create(name="an4", variants=TWO_ARM, true_lift=0.4)
+        rec = registry.create(actor=ACTOR, name="an4", variants=TWO_ARM, true_lift=0.4)
         rep = analyse_experiment(rec, n_users=12_000, seed=4)
         assert rep.cuped.significant
         assert rep.cuped.absolute_effect > 0
@@ -182,7 +195,7 @@ class TestAnalysis:
         """回归测试：默认种子曾经用内置 ``hash()``，它每个进程都加盐，
         于是"重启一次演示的数字就全变了"。必须由 murmur3 确定性派生，
         而且要挂在 **salt**（不可变）上而不是 uuid 形式的 id 上。"""
-        rec = registry.create(name="an5b", variants=TWO_ARM, true_lift=0.2)
+        rec = registry.create(actor=ACTOR, name="an5b", variants=TWO_ARM, true_lift=0.2)
         expected = murmur3_32(rec.salt.encode("utf-8"))
         a = analyse_experiment(rec, n_users=1500, seed=None)
         b = analyse_experiment(rec, n_users=1500, seed=expected)
@@ -194,11 +207,11 @@ class TestAnalysis:
         p = work_dir / "rebuild.db"
         r1 = ExperimentRegistry(p)
         first = analyse_experiment(
-            r1.create(name="rb", variants=TWO_ARM, true_lift=0.3), n_users=1500
+            r1.create(actor=ACTOR, name="rb", variants=TWO_ARM, true_lift=0.3), n_users=1500
         )
-        r1.delete(r1.get_by_name("rb").id)
+        r1.delete(r1.get_by_name("rb").id, actor=ACTOR)
         second = analyse_experiment(
-            r1.create(name="rb", variants=TWO_ARM, true_lift=0.3), n_users=1500
+            r1.create(actor=ACTOR, name="rb", variants=TWO_ARM, true_lift=0.3), n_users=1500
         )
         r1.close()
         assert first.cuped.absolute_effect == second.cuped.absolute_effect
@@ -209,7 +222,7 @@ class TestAnalysis:
         单次运行当然可能显著（那就是 5% 的 I 类错误），
         所以这里跑 24 个种子看整体比例，而不是断言某一次的结果。
         """
-        rec = registry.create(name="an5", variants=TWO_ARM, true_lift=0.0)
+        rec = registry.create(actor=ACTOR, name="an5", variants=TWO_ARM, true_lift=0.0)
         hits = 0
         ratios = []
         trials = 24
@@ -224,7 +237,7 @@ class TestAnalysis:
         assert 0.60 < mean_ratio < 0.82, f"SE 收缩比 {mean_ratio:.3f} 偏离理论值 0.714"
 
     def test_sequential_path_is_consistent(self, registry):
-        rec = registry.create(name="an6", variants=TWO_ARM, true_lift=0.3)
+        rec = registry.create(actor=ACTOR, name="an6", variants=TWO_ARM, true_lift=0.3)
         rep = analyse_experiment(rec, n_users=4000, seed=6, n_looks=5)
         fracs = [m["information_fraction"] for m in rep.monitoring]
         assert fracs == sorted(fracs)
@@ -242,13 +255,13 @@ class TestAnalysis:
         前端的 ``JSON.parse`` 遇到就直接炸 —— 这里必须严格。"""
         import json
 
-        rec = registry.create(name="an7", variants=TWO_ARM, true_lift=0.2)
+        rec = registry.create(actor=ACTOR, name="an7", variants=TWO_ARM, true_lift=0.2)
         rep = analyse_experiment(rec, n_users=2000, seed=7)
         json.dumps(rep.to_dict(), allow_nan=False)
 
     def test_small_sample_raises_clear_error(self, registry):
         """回归测试：每组样本太少时 (n-1)=0 会算出 nan 而不是报错。"""
-        rec = registry.create(
+        rec = registry.create(actor=ACTOR, 
             name="an9",
             variants=[{"name": "control", "weight": 0.9}, {"name": "treatment", "weight": 0.1}],
             traffic_ratio=0.3,
@@ -261,7 +274,7 @@ class TestAnalysis:
         于是三臂实验会把**中间臂和未进组的人**也算进对照组，
         而主口径是"最后一臂 vs 第一臂" —— 两条路径看的不是同一件事。
         """
-        rec = registry.create(
+        rec = registry.create(actor=ACTOR, 
             name="an13",
             variants=[
                 {"name": "control", "weight": 0.4},
@@ -287,7 +300,7 @@ class TestAnalysis:
         """
         import numpy as np
 
-        rec = registry.create(
+        rec = registry.create(actor=ACTOR, 
             name="an12",
             variants=[{"name": "control", "weight": 0.9}, {"name": "treatment", "weight": 0.1}],
             traffic_ratio=0.3,
@@ -315,7 +328,7 @@ class TestAnalysis:
         这个恒等式是平台上"显著效应里有多少只是处置前就不平衡"的唯一依据，
         算错了整个分解就没有意义。
         """
-        rec = registry.create(name="an10", variants=TWO_ARM, true_lift=0.3)
+        rec = registry.create(actor=ACTOR, name="an10", variants=TWO_ARM, true_lift=0.3)
         rep = analyse_experiment(rec, n_users=5000, seed=11)
         assert rep.residual_component == rep.cuped.absolute_effect
         assert rep.imbalance_component + rep.residual_component == pytest.approx(
@@ -330,7 +343,7 @@ class TestAnalysis:
     def test_decomposition_sign_matches_balance_check(self, registry):
         """失衡贡献的方向必须和协变量平衡诊断给出的方向一致 ——
         两者同号才说明分解与体检说的是同一件事，而不是各算各的。"""
-        rec = registry.create(name="an11", variants=TWO_ARM, true_lift=0.0)
+        rec = registry.create(actor=ACTOR, name="an11", variants=TWO_ARM, true_lift=0.0)
         for s in range(6):
             rep = analyse_experiment(rec, n_users=4000, seed=500 + s)
             balance = next(c for c in rep.checks if c.name == "协变量平衡")
@@ -339,7 +352,7 @@ class TestAnalysis:
             assert (rep.imbalance_component > 0) == (balance.statistic > 0)
 
     def test_traffic_ratio_respected(self, registry):
-        rec = registry.create(name="an8", variants=TWO_ARM, traffic_ratio=0.5)
+        rec = registry.create(actor=ACTOR, name="an8", variants=TWO_ARM, traffic_ratio=0.5)
         rep = analyse_experiment(rec, n_users=4000, seed=8)
         total = rep.cuped.n_treatment + rep.cuped.n_control
         assert total < 4000 * 0.6, "半流量实验不应把所有人都收进来"

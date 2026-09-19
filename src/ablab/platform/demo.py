@@ -147,7 +147,7 @@ def seed_demo(
         if existing is not None:
             if not force:
                 continue
-            registry.delete(existing.id)
-        registry.create(**spec)
+            registry.delete(existing.id, actor="demo.seed")
+        registry.create(actor="demo.seed", **spec)
         added += 1
     return added

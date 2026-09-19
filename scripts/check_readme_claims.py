@@ -82,6 +82,10 @@ CLAIMS: list[tuple[str, str, str]] = [
     ("数仓·比值：末次查看 == 主结论", "warehouse_report.md", "末次查看 == 主结论：True"),
     ("治理：审计删不掉", "governance_report.md", "append-only"),
     ("治理：护栏未分析", "governance_report.md", "尚不分析护栏指标"),
+    # 身份与审计操作者（静态 token）：用户 id 与角色是稳定的字符串，可以进清单
+    ("治理·身份：静态 token + 角色", "governance_report.md", "静态 token"),
+    ("治理·身份：凭据只存哈希", "governance_report.md", "sha256"),
+    ("治理·身份：伪造无效", "governance_report.md", "http_alice"),
 ]
 
 
