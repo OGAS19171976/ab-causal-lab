@@ -37,9 +37,11 @@ from .causal_audit import (
 )
 from .hte_audit import (
     CATEFormResult,
+    CateIntervalCoverage,
     CATEModelComparison,
     DMLEstimationAudit,
     UpliftMetricAudit,
+    run_cate_coverage_audit,
     run_cate_form_comparison,
     run_dml_audit,
     run_uplift_metric_audit,
@@ -138,6 +140,8 @@ __all__ = [
     "run_sensitivity_audit",
     "run_staggered_estimator_comparison",
     "CATEModelComparison",
+    "CateIntervalCoverage",
+    "run_cate_coverage_audit",
     "CATEFormResult",
     "DMLEstimationAudit",
     "UpliftMetricAudit",

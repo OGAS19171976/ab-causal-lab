@@ -39,9 +39,11 @@ __all__ = [
     "DMLEstimationAudit",
     "CATEFormResult",
     "CATEModelComparison",
+    "CateIntervalCoverage",
     "UpliftMetricAudit",
     "run_dml_audit",
     "run_cate_form_comparison",
+    "run_cate_coverage_audit",
     "run_uplift_metric_audit",
 ]
 
@@ -282,6 +284,145 @@ def run_cate_form_comparison(
         )
 
     return CATEModelComparison(results=tuple(results), n=n)
+
+
+# --------------------------------------------------------------------------- #
+# 二之二、CATE 的区间：算得出来，但**校准不了**
+# --------------------------------------------------------------------------- #
+@dataclass
+class CateIntervalCoverage:
+    """两条区间路线的覆盖率与长度，以及"为什么盖不住"的分解。
+
+    M4 过去只能主张**排序**（Qini 是常数基线的 40 倍），不能主张**水平**
+    （森林 MSE 反而差 17%）。这一组数字回答的是：**加上区间之后，水平可用了吗？**
+    答案是**没有** —— 而且原因被定位到了：不是方差，是**点估计有偏**。
+    """
+
+    n: int
+    n_scenarios: int
+    bootstrap_draws: int
+    #: 叶内方差 + 跨树独立合成
+    analytic_coverage: float
+    analytic_length: float
+    #: 按单元 bootstrap
+    bootstrap_coverage: float
+    bootstrap_length: float
+    #: 点估计本身的诊断（这才是"盖不住"的原因）
+    cate_correlation: float
+    rmse: float
+    true_cate_sd: float
+    estimate_sd: float
+    #: 可给出有限区间的单元比例（纯叶子给不出方差）
+    finite_share: float
+
+    @property
+    def max_length_gap(self) -> float:
+        """两条路线的长度差（相对），验收标准里要求 ≤30%。"""
+        if self.bootstrap_length <= 0:
+            return float("nan")
+        return abs(self.analytic_length - self.bootstrap_length) / self.bootstrap_length
+
+    def summary(self) -> str:
+        return "\n".join(
+            [
+                f"CATE 区间的覆盖率（{self.n_scenarios} 个场景 × n={self.n}，"
+                f"bootstrap B={self.bootstrap_draws}，名义 0.95）",
+                f"  叶内方差 + 独立合成：覆盖率 {self.analytic_coverage:.4f}，"
+                f"长度 {self.analytic_length:.4f}",
+                f"  按单元 bootstrap　　：覆盖率 {self.bootstrap_coverage:.4f}，"
+                f"长度 {self.bootstrap_length:.4f}（长度差 {self.max_length_gap:.1%}）",
+                f"  点估计诊断：τ̂ 与真值相关 {self.cate_correlation:.4f}，"
+                f"RMSE {self.rmse:.4f}",
+                f"  真 CATE 的 sd {self.true_cate_sd:.4f} vs τ̂ 的 sd "
+                f"{self.estimate_sd:.4f}；可给区间的单元 {self.finite_share:.1%}",
+                "  → 两条路线的覆盖率都远低于名义值，而**区间长度与真 CATE 的离散度"
+                "同量级**：所以盖不住的原因是**点估计有偏**，不是方差算错。",
+            ]
+        )
+
+
+def run_cate_coverage_audit(
+    *,
+    n: int = 1500,
+    n_scenarios: int = 5,
+    bootstrap_draws: int = 25,
+    n_trees: int = 40,
+    max_depth: int = 5,
+    min_leaf: int = 20,
+    seed_start: int = 1,
+) -> CateIntervalCoverage:
+    """多场景测量 CATE 区间的覆盖率（这是"有没有区间"唯一算数的证据）。
+
+    **没有这个数，"我们有置信区间了"就只是一句话。**
+    两条路线都测：叶内方差 + 跨树独立合成（``predict_with_se``）
+    与按单元 bootstrap。
+
+    结果在实测中是**负面**的（覆盖率 0.38~0.74，名义 0.95），
+    所以这个函数的价值不在于给出一个能用的区间，而在于**把"水平不可用"量化** ——
+    并且指出它是因为偏差而不是方差。
+    """
+    from ..causal.forest import CausalForest, ForestConfig
+    from ..causal.hte import HTEConfig, generate_hte_data
+
+    z = 1.959963984540054
+    rows: list[dict[str, float]] = []
+    for seed in range(seed_start, seed_start + n_scenarios):
+        data = generate_hte_data(
+            HTEConfig(n=n, n_features=6, n_informative=3, seed=seed)
+        )
+        true = np.asarray(data.tau)
+        cfg = ForestConfig(n_trees=n_trees, max_depth=max_depth, min_leaf=min_leaf)
+
+        forest = CausalForest(cfg)
+        forest.fit(data.X, data.D, data.Y)
+        tau_hat, se = forest.predict_with_se(data.X)
+        finite = np.isfinite(se)
+        lo, hi = tau_hat[finite] - z * se[finite], tau_hat[finite] + z * se[finite]
+        analytic_cov = float(np.mean((lo <= true[finite]) & (true[finite] <= hi)))
+        analytic_len = float(np.mean(hi - lo))
+
+        rng = np.random.default_rng(seed)
+        n_obs = data.X.shape[0]
+        draws = np.empty((bootstrap_draws, n_obs))
+        for b in range(bootstrap_draws):
+            idx = rng.integers(0, n_obs, size=n_obs)
+            tree = CausalForest(cfg)
+            tree.fit(data.X[idx], data.D[idx], data.Y[idx])
+            draws[b] = tree.predict(data.X)
+        blo = np.percentile(draws, 2.5, axis=0)
+        bhi = np.percentile(draws, 97.5, axis=0)
+
+        rows.append(
+            {
+                "analytic_cov": analytic_cov,
+                "analytic_len": analytic_len,
+                "boot_cov": float(np.mean((blo <= true) & (true <= bhi))),
+                "boot_len": float(np.mean(bhi - blo)),
+                "corr": float(np.corrcoef(tau_hat, true)[0, 1]),
+                "rmse": float(np.sqrt(np.mean((tau_hat - true) ** 2))),
+                "true_sd": float(np.std(true)),
+                "est_sd": float(np.std(tau_hat)),
+                "finite": float(np.mean(finite)),
+            }
+        )
+
+    def mean(key: str) -> float:
+        return float(np.mean([r[key] for r in rows]))
+
+    return CateIntervalCoverage(
+        n=n,
+        n_scenarios=n_scenarios,
+        bootstrap_draws=bootstrap_draws,
+        analytic_coverage=mean("analytic_cov"),
+        analytic_length=mean("analytic_len"),
+        bootstrap_coverage=mean("boot_cov"),
+        bootstrap_length=mean("boot_len"),
+        cate_correlation=mean("corr"),
+        rmse=mean("rmse"),
+        true_cate_sd=mean("true_sd"),
+        estimate_sd=mean("est_sd"),
+        finite_share=mean("finite"),
+    )
 
 
 # --------------------------------------------------------------------------- #

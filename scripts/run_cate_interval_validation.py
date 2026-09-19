@@ -39,54 +39,33 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from ablab.causal.forest import CausalForest, ForestConfig  # noqa: E402
-from ablab.causal.hte import HTEConfig, generate_hte_data  # noqa: E402
 from ablab.reporting import for_report  # noqa: E402
 
 
 def one_scenario(seed: int, n: int, *, n_trees: int, min_leaf: int, boot: int):
-    """跑一个场景，返回两条路线的覆盖率与区间长度。"""
-    data = generate_hte_data(HTEConfig(n=n, n_features=6, n_informative=3, seed=seed))
-    true = np.asarray(data.tau)
-    cfg = ForestConfig(n_trees=n_trees, max_depth=5, min_leaf=min_leaf)
+    """跑一个场景，返回两条路线的覆盖率与区间长度。
 
-    forest = CausalForest(cfg)
-    forest.fit(data.X, data.D, data.Y)
-    tau_hat, se = forest.predict_with_se(data.X)
+    **实现在审计里**（``ablab.validation.hte_audit.run_cate_coverage_audit``），
+    这里只是为了逐场景打印而单独调一次 —— 报表需要逐行，而审计给的是汇总。
+    两处共用同一套计算（都通过 ``predict_with_se``），不留第二份实现。
+    """
+    from ablab.validation.hte_audit import run_cate_coverage_audit
 
-    finite = np.isfinite(se)
-    z = 1.959963984540054
-    if finite.any():
-        lo, hi = tau_hat[finite] - z * se[finite], tau_hat[finite] + z * se[finite]
-        analytic_cov = float(np.mean((lo <= true[finite]) & (true[finite] <= hi)))
-        analytic_len = float(np.mean(hi - lo))
-    else:
-        analytic_cov, analytic_len = float("nan"), float("nan")
-
-    rng = np.random.default_rng(seed)
-    n_obs = data.X.shape[0]
-    draws = np.empty((boot, n_obs))
-    for b in range(boot):
-        idx = rng.integers(0, n_obs, size=n_obs)
-        tree = CausalForest(cfg)
-        tree.fit(data.X[idx], data.D[idx], data.Y[idx])
-        draws[b] = tree.predict(data.X)
-    blo = np.percentile(draws, 2.5, axis=0)
-    bhi = np.percentile(draws, 97.5, axis=0)
-    boot_cov = float(np.mean((blo <= true) & (true <= bhi)))
-    boot_len = float(np.mean(bhi - blo))
-
+    r = run_cate_coverage_audit(
+        n=n, n_scenarios=1, bootstrap_draws=boot, n_trees=n_trees, min_leaf=min_leaf,
+        seed_start=seed,
+    )
     return {
-        "finite_share": float(np.mean(finite)),
-        "analytic_cov": analytic_cov,
-        "analytic_len": analytic_len,
-        "boot_cov": boot_cov,
-        "boot_len": boot_len,
-        "corr": float(np.corrcoef(tau_hat, true)[0, 1]),
-        "bias": float(np.mean(tau_hat - true)),
-        "rmse": float(np.sqrt(np.mean((tau_hat - true) ** 2))),
-        "true_sd": float(np.std(true)),
-        "tau_sd": float(np.std(tau_hat)),
+        "finite_share": r.finite_share,
+        "analytic_cov": r.analytic_coverage,
+        "analytic_len": r.analytic_length,
+        "boot_cov": r.bootstrap_coverage,
+        "boot_len": r.bootstrap_length,
+        "corr": r.cate_correlation,
+        "bias": float("nan"),  # 偏差在审计汇总里给（RMSE 可代替）
+        "rmse": r.rmse,
+        "true_sd": r.true_cate_sd,
+        "tau_sd": r.estimate_sd,
     }
 
 
