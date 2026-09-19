@@ -59,6 +59,7 @@ CLAIMS: list[tuple[str, str, str]] = [
     # CATE 区间：**只加文本类声明**。这份报告的数值会随 --quick 变，
     # 把数字写进清单就会让检查器在快速模式下随机变红（第 31 条那个坑）。
     ("M4·CATE 区间：结论是「校准不了」", "cate_interval_report.md", "但它校准不了"),
+    ("M4·CATE 区间：结论并进了 M4 报告", "m4_validation.md", "CATE 的区间：两条路线的覆盖率"),
     ("M4·CATE 区间：原因是偏差不是方差", "cate_interval_report.md", "而是**点估计有偏**"),
     ("数仓：CUPED 与 DWD 明细一致", "warehouse_report.md", "一致"),
     ("数仓：ADS 判据写在报告里", "warehouse_report.md", "判据"),

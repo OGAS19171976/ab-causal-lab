@@ -43,6 +43,7 @@ from ablab.causal import (  # noqa: E402
 from ablab.plotting import label, plt, save, setup_style  # noqa: E402
 from ablab.reporting import for_report  # noqa: E402
 from ablab.validation import (  # noqa: E402
+    run_cate_coverage_audit,
     run_cate_form_comparison,
     run_dml_audit,
     run_uplift_metric_audit,
@@ -202,6 +203,11 @@ def main() -> int:
     n_hte = 1500 if args.quick else 3000
     n_uplift = 2500 if args.quick else 5000
     sizes = (1000, 2500) if args.quick else (1000, 4000)
+    # CATE 区间的覆盖率审计：完整档位与独立报告（reports/cate_interval_report.md）一致，
+    # 快速档位刻意缩小 —— 它只为"跑得动"，不作为证据。
+    n_cate = 1200 if args.quick else 1500
+    n_cate_scen = 2 if args.quick else 5
+    boot_cate = 8 if args.quick else 25
 
     setup_style()
     log: list[str] = []
@@ -235,6 +241,28 @@ def main() -> int:
     emit(f"\n### 3. 排序指标与水平指标（n={n_uplift}）")
     uplift = run_uplift_metric_audit(n=n_uplift, forest_config=FOREST_CONFIG(), seed=0)
     emit(uplift.summary())
+
+    # ---- 3b. CATE 的区间：水平到底可不可用 ---------------------------------- #
+    #
+    # 第 3 节说的是"排序准、水平不准"。这一节回答的是**加了区间之后水平可用了吗** ——
+    # 答案是"没有"，而且原因被定位成**点估计有偏**而不是方差算错。
+    # 把它放进 M4 报告（而不是只留在独立报告里），是因为这一节的结论
+    # 直接决定了第 3 节那句话还算不算数。
+    emit(f"\n### 3b. CATE 的区间：两条路线的覆盖率（n={n_cate}，{n_cate_scen} 个场景）")
+    cov = run_cate_coverage_audit(
+        n=n_cate, n_scenarios=n_cate_scen, bootstrap_draws=boot_cate
+    )
+    emit(cov.summary())
+    emit("")
+    emit("  验收标准逐条对照（写到报告里，而不是留在脑子里）：")
+    emit(f"    · 覆盖率 ≈95%（同质 ≥90%）：**不满足** —— 解析 {cov.analytic_coverage:.4f}、"
+         f"bootstrap {cov.bootstrap_coverage:.4f}")
+    emit(f"    · 与 bootstrap 的长度差 ≤30%：**不满足** —— 实测 {cov.max_length_gap:.1%}")
+    emit("    · 区间长度随 min_leaf 单调收缩：**部分满足** —— 整体方向对，"
+         "但不单调（见 reports/cate_interval_report.md 第 3 节）")
+    emit("    · 明确回答「水平仍不可靠」是否成立：**成立**，且原因已量化")
+    emit("  → 所以第 3 节那句「森林 MSE 反而更差」在加了区间之后依然是结论，")
+    emit("    而现在它多了一个解释：区间盖不住是因为**点估计有偏**，不是方差没算对。")
 
     # ---- 4. 图表 ------------------------------------------------------------ #
     emit("\n### 4. 生成图表")
