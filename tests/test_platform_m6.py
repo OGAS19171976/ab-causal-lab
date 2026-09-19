@@ -146,7 +146,12 @@ class TestAnalysisUnit:
         assert data.analysis_unit == "cluster"
 
     def test_ratio_uses_delta_method(self, registry):
-        rec = registry.create(name="r1", variants=TWO_ARM, metric_type="ratio", true_lift=0.02)
+        # estimator 必须**显式**写 post_only：CUPED 需要前置协变量，比值口径没有它，
+        # 注册表会在创建时拦住 ratio+cuped 这个组合 —— **不替用户猜口径**。
+        rec = registry.create(
+            name="r1", variants=TWO_ARM, metric_type="ratio",
+            estimator="post_only", true_lift=0.02,
+        )
         rep = analyse_experiment(rec, n_users=20_000, seed=8)
         assert rep.metric_type == "ratio"
         assert rep.primary_estimator_name == "ratio_delta"
@@ -297,6 +302,7 @@ class TestDeclarationsThroughAPI:
             "name": "api_ratio",
             "variants": [{"name": "control", "weight": 0.5}, {"name": "treatment", "weight": 0.5}],
             "metric_type": "ratio",
+            "estimator": "post_only",
             "true_lift": 0.02,
         })
         eid = created.json()["id"]

@@ -686,12 +686,8 @@ def analyse_experiment_from_warehouse(
     """
     if not record.warehouse_experiment:
         raise ValueError(f"实验 {record.name!r} 没有绑定数仓实验")
-    if record.metric_type != "mean":
-        raise ValueError(
-            "数仓路径目前只支持人均指标（metric_type='mean'）。"
-            "比值指标需要 ADS 里有一列**分母**，而当前 ADS 的 x 是前置指标，"
-            "语义不同不能混用：那要么新增一张比值 ADS，要么改这一层的读取口径"
-        )
+    if record.metric_type not in ("mean", "ratio"):
+        raise ValueError(f"数仓路径不支持 metric_type={record.metric_type!r}")
     data = build_warehouse_data(
         con,
         record.warehouse_experiment,
@@ -699,6 +695,11 @@ def analyse_experiment_from_warehouse(
         n_looks=n_looks,
         primary_estimator=record.estimator,
         analysis_unit=record.analysis_unit,
+        # **必须把口径传下去**：这条链路曾经因为漏传 analysis_unit 而把
+        # "整簇随机化"的实验静默按单元级分析（M6 的 01 节）。
+        # metric_type 是同一个坑的第二次入口 —— 漏了它，比值实验会被
+        # 当成人均指标读，而两条链路的列名与含义都不同，数字会**静默错**。
+        metric_type=record.metric_type,
     )
     data = _with_record_metadata(data, record)
     return analyse_data(data, alpha=alpha)

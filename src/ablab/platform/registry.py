@@ -400,6 +400,16 @@ class ExperimentRegistry:
                 "请把 estimator 设为 'post_only'"
             )
 
+        if metric_type == "ratio" and estimator == "cuped":
+            # 同一个理由、同一个位置：CUPED 需要**前置协变量**，
+            # 而比值链路（DWS/ADS 06/07）里落下的是分子与分母，没有前置指标。
+            # 比值指标只能用 delta method。
+            raise RegistryError(
+                "metric_type='ratio' 与 estimator='cuped' 不能同时选："
+                "CUPED 需要前置协变量，而比值 ADS 里只有分子/分母两列；"
+                "请把 estimator 设为 'post_only'（比值指标用 delta method）"
+            )
+
         # 未指定 salt 时派生一个**不随改名变化**的稳定 salt
         resolved_salt = salt or f"{name.strip()}_v1"
         self._validate(

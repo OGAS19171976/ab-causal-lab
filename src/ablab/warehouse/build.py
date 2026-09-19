@@ -63,6 +63,11 @@ SQL_ORDER: tuple[str, ...] = (
     # 排在 ADS 之后是有意的 —— 它不属于主链路，而是"换个分析单元"的旁路，
     # 谁需要谁读。这样主链路的依赖关系保持清晰。
     "05_dws_experiment_cluster_daily.sql",
+    # 比值指标口径：与 02/03 并列的第二条链路（分子=值之和、分母=次数之和）。
+    # 独立成表而不是给 02/03 加列 —— 已发布层的内容一改动，
+    # README 里所有已引用的数仓数字就全变了。
+    "06_dws_experiment_ratio_daily.sql",
+    "07_ads_experiment_ratio_result.sql",
 )
 
 

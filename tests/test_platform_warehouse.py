@@ -453,6 +453,114 @@ class TestWarehouseAnalysisUnit:
         assert "不是整簇随机化" in r.json()["detail"]
 
 
+class TestWarehouseRatioMetric:
+    """比值指标在**数仓侧**也要走对口径（M1 的独立实现当裁判）。
+
+    比值链路的 ADS（07）落的是分子/分母两列可加量，与均值口径那张 ADS（03）
+    的六个可加量语义不同。所以这一组测试的判据不是"平台自己前后一致"，
+    而是**平台读数仓 == M1 的 `ratio_delta_method` 直接吃明细** ——
+    前者是 M5 写的编排，后者是 M1 写的独立实现。
+    """
+
+    @staticmethod
+    def _stats(y, x):
+        import numpy as np
+
+        from ablab.inference.aggregates import AggregateStats
+
+        y = np.asarray(y, dtype=float)
+        x = np.asarray(x, dtype=float)
+        return AggregateStats.from_sums(
+            n=int(y.size),
+            sum_x=float(x.sum()),
+            sum_y=float(y.sum()),
+            sum_xx=float((x * x).sum()),
+            sum_yy=float((y * y).sum()),
+            sum_xy=float((x * y).sum()),
+        )
+
+    def test_ratio_path_matches_detail(self, warehouse_con):
+        from ablab.inference import ratio_delta_method
+        from ablab.platform.analysis import analyse_experiment_from_warehouse
+        from ablab.platform.registry import ExperimentRecord
+
+        con = warehouse_con
+        detail = con.execute(
+            """
+            SELECT variant, post_metric, post_cnt FROM dwd_experiment_user
+            WHERE experiment = 'exp_rank_v2'
+            """
+        ).df()
+        t = detail[detail["variant"] == "treatment"]
+        c = detail[detail["variant"] == "control"]
+        # 分子 = 互动值之和，分母 = 互动次数之和 —— 与 06/07 两张表的口径一致
+        ref = ratio_delta_method(
+            self._stats(t["post_metric"], t["post_cnt"]),
+            self._stats(c["post_metric"], c["post_cnt"]),
+        )
+
+        rec = ExperimentRecord(
+            name="wh_ratio",
+            variants=[{"name": "control", "weight": 0.5}, {"name": "treatment", "weight": 0.5}],
+            salt="wh_ratio_v1",
+            primary_metric="post_metric_14d",
+            warehouse_experiment="exp_rank_v2",
+            estimator="post_only",
+            metric_type="ratio",
+        )
+        rep = analyse_experiment_from_warehouse(rec, con, n_looks=5)
+
+        assert rep.primary is not None
+        assert rep.primary.absolute_effect == pytest.approx(
+            ref.absolute_effect, abs=1e-9
+        ), f"平台 {rep.primary.absolute_effect} vs 明细 {ref.absolute_effect}"
+        assert rep.primary.std_error == pytest.approx(ref.std_error, abs=1e-9)
+
+    def test_ratio_and_cuped_are_refused_at_creation(self, work_dir):
+        """CUPED 需要前置协变量，而比值链路里只有分子/分母 —— 创建时就拦住。"""
+        from ablab.platform.registry import ExperimentRegistry, RegistryError
+
+        reg = ExperimentRegistry(work_dir / "ratio_gate.db")
+        with pytest.raises(RegistryError, match="ratio"):
+            reg.create(
+                name="bad_ratio",
+                variants=[{"name": "control", "weight": 0.5}, {"name": "treatment", "weight": 0.5}],
+                salt="bad_ratio_v1",
+                metric_type="ratio",
+                estimator="cuped",
+            )
+        reg.close()
+
+    def test_ratio_link_is_additive_not_a_column(self, warehouse_con):
+        """比值链路必须是**新表**，不能往均值链路里加列。
+
+        这是硬约束的守卫：README 里所有已引用的数仓数字都挂在 02/03 上，
+        给它们加列（哪怕不改值）也会让下游按位置取列的代码错位。
+        断言只用**结构不变式** —— 第一版这里写了两个我现编的数字
+        （16033 之类），一跑就红：**测试里不能出现没量过的数**，
+        这和 README 里"每个数字都能在 reports/ 里找到"是同一条纪律。
+        """
+        con = warehouse_con
+        mean_cols = {
+            r[1] for r in con.execute("PRAGMA table_info(dws_experiment_variant_daily)").fetchall()
+        }
+        assert "sum_y" not in mean_cols and "sum_x" not in mean_cols, mean_cols
+
+        ratio_cols = {
+            r[1] for r in con.execute("PRAGMA table_info(dws_experiment_ratio_daily)").fetchall()
+        }
+        assert {"sum_y", "sum_x", "sum_xx", "sum_yy", "sum_xy"} <= ratio_cols, ratio_cols
+        assert "user_cnt" in ratio_cols
+
+        tables = {r[0] for r in con.execute("SHOW TABLES").fetchall()}
+        assert {"dws_experiment_ratio_daily", "ads_experiment_ratio_result"} <= tables
+
+        # 两张 DWS 出自同一张 DWD、同一组分组键 → 行数必须相同
+        mean_rows = con.execute("SELECT COUNT(*) FROM dws_experiment_variant_daily").fetchone()[0]
+        ratio_rows = con.execute("SELECT COUNT(*) FROM dws_experiment_ratio_daily").fetchone()[0]
+        assert mean_rows == ratio_rows, (mean_rows, ratio_rows)
+
+
 class TestWarehouseAPI:
     def test_lists_warehouse_experiments(self, wh_client):
         body = wh_client.get("/api/warehouse/experiments").json()

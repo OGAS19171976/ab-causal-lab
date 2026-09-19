@@ -720,6 +720,7 @@ def build_warehouse_data(
     n_looks: int = 5,
     primary_estimator: str = "cuped",
     analysis_unit: str = "unit",
+    metric_type: str = "mean",
 ) -> ExperimentData:
     """从数仓读取一个实验，返回与合成源同构的 ``ExperimentData``。
 
@@ -744,6 +745,18 @@ def build_warehouse_data(
             metric=metric,
             n_looks=n_looks,
             primary_estimator=primary_estimator,
+        )
+
+    if metric_type == "ratio":
+        # 比值指标走**另一条 ADS 链路**（07）：那一层落的是
+        # sum_y / sum_x / sum_xx / sum_yy / sum_xy，与 03 的六个可加量语义不同。
+        # 从这里分派而不是在下面那张表的查询里加分支 ——
+        # 两条链路的列名与含义都不同，混在一段 SQL 里迟早会串。
+        return _warehouse_ratio_data(
+            con,
+            experiment,
+            metric=metric,
+            n_looks=n_looks,
         )
 
     ads = con.execute(_WAREHOUSE_QUERY.format(where="WHERE experiment = ?"), [experiment]).df()
@@ -811,6 +824,135 @@ def build_warehouse_data(
                 f"{name} 的 DWS 累计样本量 {lk.n} 与 ADS 的 {counts[name]} 不一致 —— "
                 "两次读取走了不同口径"
             )
+    return data
+
+
+def _warehouse_ratio_data(
+    con,
+    experiment: str,
+    *,
+    metric: str,
+    n_looks: int,
+) -> ExperimentData:
+    """比值指标口径的数仓读取：读 ``06/07`` 两张**比值链路**的表。
+
+    与簇级那条（``_warehouse_cluster_data``）同一个套路，差别只在读哪张表、
+    以及充分统计量的含义：这里 ``x`` 是**分母**（互动次数），``y`` 是分子（互动值之和），
+    估计量是 ``Σy/Σx`` —— 不是"人均比值的均值" ``mean(y_i/x_i)``（M1 实测口径差 12.6%）。
+
+    信息比例用**累计分母**（Σx）之比：比值指标的精度由分母驱动，
+    用天数比会高估早期信息量（与均值路径用样本量之比是同一个道理）。
+    """
+    ads = con.execute(_WAREHOUSE_QUERY.format(where="WHERE experiment = ?"), [experiment]).df()
+    if ads.empty:
+        raise ValueError(f"数仓 ADS 里找不到实验 {experiment!r}")
+    variants = {str(r["variant"]): r for _, r in ads.iterrows()}
+    if len(variants) < 2:
+        raise ValueError(f"实验 {experiment!r} 只有一个分支，无法对比")
+    control_name, treated_name = sorted(variants)[0], sorted(variants)[-1]
+
+    daily = con.execute(
+        """
+        SELECT variant, ds, user_cnt, sum_y, sum_x, sum_yy, sum_xx, sum_xy
+        FROM dws_experiment_ratio_daily WHERE experiment = ? ORDER BY variant, ds
+        """,
+        [experiment],
+    ).df()
+    if daily.empty:
+        raise ValueError(
+            f"比值链路里找不到实验 {experiment!r} 的日汇总 —— "
+            "确认这一轮建仓跑过 06/07，且该实验在 DWD 里有数据"
+        )
+
+    cols = ("user_cnt", "sum_y", "sum_x", "sum_yy", "sum_xx", "sum_xy")
+    cumulative: dict[str, list[dict[str, float]]] = {}
+    labels: dict[str, list[str]] = {}
+    for variant in (control_name, treated_name):
+        rows = daily[daily["variant"] == variant]
+        if rows.empty:
+            raise ValueError(f"比值链路里 {experiment!r}/{variant!r} 没有日汇总")
+        acc = {k: 0.0 for k in cols}
+        series: list[dict[str, float]] = []
+        tags: list[str] = []
+        for _, r in rows.iterrows():
+            for col in cols:
+                acc[col] += float(r[col])
+            series.append(dict(acc))
+            tags.append(str(r["ds"]))
+        cumulative[variant] = series
+        labels[variant] = tags
+
+    n_days = len(cumulative[control_name])
+    if len(cumulative[treated_name]) != n_days:
+        raise ValueError("两个分支的日期数不同，比值累计无法对齐")
+
+    # 信息量 = 累计分母（两臂合计）；严格递增，最后一次必须是全量
+    info: list[float] = [
+        float(cumulative[control_name][d]["sum_x"] + cumulative[treated_name][d]["sum_x"])
+        for d in range(n_days)
+    ]
+    total = info[-1]
+    if total <= 0:
+        raise ValueError(f"实验 {experiment!r} 的分母合计为 0，比值指标无定义")
+    info = [v / total for v in info]
+
+    picks: list[int] = []
+    for k in range(1, n_looks):
+        target = k / n_looks
+        picks.append(min(range(n_days), key=lambda d: abs(info[d] - target)))
+    picks.append(n_days - 1)
+    ordered: list[int] = []
+    for d in sorted(set(picks)):
+        if not ordered or info[d] > info[ordered[-1]]:
+            ordered.append(d)
+        elif d == n_days - 1:
+            ordered[-1] = d
+    if len(ordered) < 2:
+        raise ValueError(f"实验 {experiment!r} 的可选查看点不足 2 个（只有 {n_days} 天）")
+
+    looks: list[LookData] = []
+    for pos, d in enumerate(ordered):
+        ct = cumulative[treated_name][d]
+        cc = cumulative[control_name][d]
+        frac = 1.0 if pos == len(ordered) - 1 else float(info[d])
+        looks.append(
+            LookData(
+                label=f"{labels[treated_name][d][:10]}（累计）",
+                information_fraction=frac,
+                treatment=AggregateStats.from_sums(
+                    n=int(ct["user_cnt"]), sum_x=ct["sum_x"], sum_y=ct["sum_y"],
+                    sum_xx=ct["sum_xx"], sum_yy=ct["sum_yy"], sum_xy=ct["sum_xy"],
+                ),
+                control=AggregateStats.from_sums(
+                    n=int(cc["user_cnt"]), sum_x=cc["sum_x"], sum_y=cc["sum_y"],
+                    sum_xx=cc["sum_xx"], sum_yy=cc["sum_yy"], sum_xy=cc["sum_xy"],
+                ),
+            )
+        )
+
+    data = ExperimentData(
+        experiment=experiment,
+        metric=metric,
+        source="warehouse",
+        treated=treated_name,
+        control=control_name,
+        counts={name: int(row["user_cnt"]) for name, row in variants.items()},
+        all_weights=_weight_map(
+            {name: float(row["design_weight"]) for name, row in variants.items()}
+        ),
+        design_weights=_weight_map(
+            {
+                control_name: float(variants[control_name]["design_weight"]),
+                treated_name: float(variants[treated_name]["design_weight"]),
+            }
+        ),
+        looks=tuple(looks),
+        # 比值指标只能用 delta method；CUPED 需要前置协变量，而比值链路里没有。
+        primary_estimator="post_only",
+        analysis_unit="unit",
+        metric_type="ratio",
+    )
+    data.validate()
     return data
 
 
