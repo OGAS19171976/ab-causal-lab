@@ -429,6 +429,52 @@ def main() -> int:
     emit(f"    异质效应面板 BJS−CS = {_gaps[1]:+.8f}")
     emit("    两者**逐位相同** -> 差异来自加权而不是效应异质（有测试钉着）。")
 
+    emit("")
+    emit("  **第四种估计量：dCDH 换手估计量**（比较「同一批人相邻两期的变化」，")
+    emit("  处置组 = 刚好换手的单元，对照组 = 还没换手的单元）。")
+    from ablab.causal import de_chaisemartin_dhaultfoeuille as _dcdh
+
+    dcdh_ok = _dcdh(panel)
+    # **口径要说清**：dCDH 估的是"换手那一刻"的即时效应（相当于 k=0），
+    # 而 truth.overall_att 是所有处置后各期的**平均**。这份 DGP 的效应逐期递增
+    # （1,2,3,4），两者本来就不该相等 —— 所以对照的是 CS 的 k=0 那一格。
+    cs_k0 = cs.event_study.get(0)
+    emit(f"    平行趋势成立时：DID+ {dcdh_ok.overall.absolute_effect:+.4f}"
+         f"（SE {dcdh_ok.overall.std_error:.4f}）")
+    emit("    逐队列核对（dCDH 的 DID+ vs CS 的同一格 g,t=g，base=g−1，"
+         "not_yet_treated）：")
+    from ablab.causal.did import cs_att_with_influence as _cell
+
+    for _g in sorted(dcdh_ok.effects):
+        _ref = _cell(panel, _g, _g, _g - 1, "not_yet_treated")
+        _ref_val = _ref[0] if _ref else float("nan")
+        emit(f"      g={_g}: dCDH {dcdh_ok.effects[_g].absolute_effect:+.6f}"
+             f"  CS {_ref_val:+.6f}"
+             f"  差 {dcdh_ok.effects[_g].absolute_effect - _ref_val:+.1e}")
+    if cs_k0 is not None:
+        emit(f"    聚合后：dCDH {dcdh_ok.overall.absolute_effect:+.4f} vs "
+             f"CS k=0 {cs_k0.absolute_effect:+.4f}")
+    emit("    **差别不在加权，而在「能用哪些队列」**：dCDH 要多一个前置期做安慰剂，")
+    emit("    所以**最早那个队列被排除**；这份 DGP 的效应逐队列异质，")
+    emit("    少一个队列就会改变加权平均。逐队列上两者是**逐位相同**的。")
+    emit(f"    安慰剂 DID- = {dcdh_ok.placebo_overall.absolute_effect:+.4f}"
+         f"（p={dcdh_ok.placebo_overall.p_value:.3f}）-> 安静")
+    cfg_viol = StaggeredPanelConfig(
+        n_units=800, n_periods=9, cohorts=(3, 5, 7), cohort_weights=(1 / 3, 1 / 3, 1 / 3),
+        never_treated_share=0.25, effects=(2.0, 2.0, 2.0, 2.0), noise_sd=1.0,
+        trend_violation=1.5, seed=7,
+    )
+    panel_viol, truth_viol = generate_staggered_panel(cfg_viol)
+    dcdh_bad = _dcdh(panel_viol)
+    emit(f"    平行趋势**被违反**时：DID+ {dcdh_bad.overall.absolute_effect:+.4f}"
+         f"（真值 {truth_viol.overall_att:+.4f} —— **同样会偏**）")
+    emit(f"    安慰剂 DID- = {dcdh_bad.placebo_overall.absolute_effect:+.4f}"
+         f"（p={dcdh_bad.placebo_overall.p_value:.2g}）-> **报警**")
+    emit("    这就是这一族估计量真正的价值：点估计并不比别的更抗违反，")
+    emit("    但它**自带一个直接指向违反的安慰剂**（同一批人、同一次比较，")
+    emit("    只把时间往前挪一期）。TWFE 在同样的数据上也会给一个偏的数，")
+    emit("    但不会告诉你假设坏了。")
+
     emit("  一句话口径：**有未处置组 -> 默认（1e-14 量级一致）；")
     emit("  没有 -> base_cohort='last_treated'（差 2.39 -> 0.047）**。")
 

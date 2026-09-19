@@ -930,6 +930,159 @@ def _absorb_two_way(
     return resid
 
 
+@dataclass
+class DCDHResult:
+    """de Chaisemartin & D'Haultfœuille (2020) 的"换手"估计量结果。
+
+    它估的不是"处置后的动态效应"，而是**处置状态刚刚改变那一期的即时效应**：
+
+        DID⁺_t = E[ΔY_t | 在 t 期换了手] − E[ΔY_t | t 期还没换手]
+
+    以及一个**安慰剂** DID⁻_t：同样两批人，但在**换手之前**那一期比较。
+    平行趋势成立时 DID⁻ 应当≈0；它不为零就是平行趋势被违反的**直接证据**。
+    这个安慰剂是这一族估计量最有价值的部分 —— 其它估计量要靠处置前的
+    事件研究系数去间接判断，而它是"拿同一批人的同一次比较"直接对照。
+    """
+
+    #: 逐期的 DID⁺（换手期 -> 即时效应）
+    effects: dict[int, Estimate]
+    #: 逐期的 DID⁻（换手**前一期** -> 安慰剂）
+    placebos: dict[int, Estimate]
+    #: 按换手人数加权的整体即时效应
+    overall: Estimate
+    #: 安慰剂合在一起（同样加权）—— 平行趋势的体检指标
+    placebo_overall: Estimate
+    control_group: str
+
+    def summary(self) -> str:
+        lines = [
+            f"de Chaisemartin-D'Haultfœuille 换手估计量（对照组 = {self.control_group}）",
+            f"  即时效应（加权）= {self.overall.absolute_effect:+.4f} "
+            f"(SE {self.overall.std_error:.4f}, p={self.overall.p_value:.4g})",
+            f"  安慰剂（换手前一期）= {self.placebo_overall.absolute_effect:+.4f} "
+            f"(SE {self.placebo_overall.std_error:.4f}, "
+            f"p={self.placebo_overall.p_value:.4g})",
+            "  逐期：",
+        ]
+        for t in sorted(self.effects):
+            eff = self.effects[t]
+            plc = self.placebos.get(t)
+            plc_text = (
+                f"，安慰剂 {plc.absolute_effect:+.4f}" if plc is not None else ""
+            )
+            lines.append(
+                f"    t={t:>3}: DID+ {eff.absolute_effect:+.4f} (SE {eff.std_error:.4f})"
+                f"{plc_text}"
+            )
+        return "\n".join(lines)
+
+
+def de_chaisemartin_dhaultfoeuille(
+    panel: Panel,
+    *,
+    control_group: ControlGroup = "not_yet_treated",
+    alpha: float = 0.05,
+) -> DCDHResult:
+    """de Chaisemartin & D'Haultfœuille（2020）的**换手**估计量。
+
+    与 CS/SA/BJS 的区别在于**比较的是"同一批人相邻两期之间的变化"**：
+
+    * 处置组 = 在 t 期**刚好换上处置**的单元（本仓库的吸收型处理下就是 ``cohort == t``）；
+    * 对照组 = 在 t 期**还没换上处置**的单元（``cohort > t``，或未处置组）；
+    * 效应 = 两组在 ``Y_t − Y_{t−1}`` 上的差。
+
+    好处有两个，都不靠"效应同质"：
+
+    1. **不依赖处置后的动态形状**：只看换手那一刻，异质动态不会渗进来；
+    2. **自带安慰剂**：把同一比较往前挪一期（``Y_{t−1} − Y_{t−2}``），
+       平行趋势成立时它应当≈0。
+
+    本仓库的吸收型处理下，DID⁺ 就是 CS 的 ``k=0`` 分格（基准期 ``t−1``）的加权版；
+    所以它也能当一次交叉验证 —— 但**加权不同**（按换手人数），
+    与 CS/SA 不会逐位相同（这一点与 BJS 那条一样，实测见报告）。
+    """
+    n_units = panel.n_units
+
+    effects: dict[int, Estimate] = {}
+    placebos: dict[int, Estimate] = {}
+    # 加权用的换手人数
+    weights: dict[int, int] = {}
+    psi_plus: dict[int, np.ndarray] = {}
+    psi_minus: dict[int, np.ndarray] = {}
+
+    for g in panel.cohorts():
+        g = int(g)
+        if g - 1 < 1 or g - 2 < 1:
+            continue  # 没有"前一期/前两期"就没有换手比较
+        g_mask = panel.cohort == g
+        c_mask = _control_mask(panel, g, g - 1, control_group) & ~g_mask
+        if c_mask.sum() < 2:
+            continue
+        # 换手期：ΔY = Y_g − Y_{g−1}
+        d_plus = panel.outcome[:, g - 1] - panel.outcome[:, g - 2]
+        effect_plus, psi_plus_g = _att_influence(d_plus, g_mask, c_mask)
+        # 安慰剂：换手**前一期**：ΔY = Y_{g−1} − Y_{g−2}
+        d_minus = panel.outcome[:, g - 2] - panel.outcome[:, g - 3]
+        effect_minus, psi_minus_g = _att_influence(d_minus, g_mask, c_mask)
+
+        se_plus, inf_plus = _se_from_influence(effect_plus, psi_plus_g, alpha)
+        lo, hi = inf_plus.interval(effect_plus)
+        effects[g] = Estimate(
+            metric=f"DID+({g})", variant="switchers", control="not_yet_switchers",
+            method="de Chaisemartin & D'Haultfœuille (2020)",
+            absolute_effect=effect_plus, relative_effect=float("nan"),
+            std_error=se_plus, ci_low=float(lo), ci_high=float(hi),
+            p_value=inf_plus.p_value, n_treatment=int(g_mask.sum()),
+            n_control=int(c_mask.sum()), mean_treatment=float("nan"),
+            mean_control=float("nan"), alpha=alpha,
+        )
+        se_minus, inf_minus = _se_from_influence(effect_minus, psi_minus_g, alpha)
+        lo_m, hi_m = inf_minus.interval(effect_minus)
+        placebos[g] = Estimate(
+            metric=f"DID-({g})", variant="switchers", control="not_yet_switchers",
+            method="de Chaisemartin & D'Haultfœuille (2020) · 安慰剂",
+            absolute_effect=effect_minus, relative_effect=float("nan"),
+            std_error=se_minus, ci_low=float(lo_m), ci_high=float(hi_m),
+            p_value=inf_minus.p_value, n_treatment=int(g_mask.sum()),
+            n_control=int(c_mask.sum()), mean_treatment=float("nan"),
+            mean_control=float("nan"), alpha=alpha,
+        )
+        weights[g] = int(g_mask.sum())
+        psi_plus[g] = psi_plus_g
+        psi_minus[g] = psi_minus_g
+
+    if not effects:
+        raise ValueError("没有任何可估计的换手期（检查队列设置与对照组选择）")
+
+    total = float(sum(weights.values()))
+    w = {g: n / total for g, n in weights.items()}
+
+    def _combine(bys: dict[int, Estimate], psis: dict[int, np.ndarray]) -> Estimate:
+        point = float(sum(w[g] * bys[g].absolute_effect for g in bys))
+        psi = np.zeros(n_units)
+        for g in bys:
+            psi = psi + w[g] * psis[g]
+        se, inf = _se_from_influence(point, psi, alpha)
+        lo, hi = inf.interval(point)
+        return Estimate(
+            metric="DID", variant="switchers", control="not_yet_switchers",
+            method="de Chaisemartin & D'Haultfœuille (2020) · 加权",
+            absolute_effect=point, relative_effect=float("nan"),
+            std_error=se, ci_low=float(lo), ci_high=float(hi),
+            p_value=inf.p_value, n_treatment=int(total),
+            n_control=int(sum(int(e.n_control or 0) for e in bys.values())),
+            mean_treatment=float("nan"), mean_control=float("nan"), alpha=alpha,
+        )
+
+    return DCDHResult(
+        effects=effects,
+        placebos=placebos,
+        overall=_combine(effects, psi_plus),
+        placebo_overall=_combine(placebos, psi_minus),
+        control_group=control_group,
+    )
+
+
 def borusyak_jaravel_spiess(
     panel: Panel,
     *,

@@ -901,6 +901,127 @@ class TestSignalComparison:
         return run_signal_comparison(n=1200, n_splits=4, n_groups=4, clip=clip)
 
 
+class TestDeChaisemartinDhaultfoeuille:
+    """dCDH 换手估计量：**自带安慰剂**的那一个。
+
+    它的点估计并不比别的估计量更"抗违反"（违反平行趋势时同样偏，实测 +3.41 vs
+    真值 2.0），价值在于**它自己会报警**：同一批人、同一次比较，
+    把时间往前挪一期就是安慰剂 DID⁻。
+    实测（800 单元、队列 3/5/7）：
+      平行趋势成立：DID+ +1.9974（真值 2.0）、DID⁻ +0.0202（p=0.778）
+      平行趋势违反：DID+ +3.4140（偏）、DID⁻ **+1.4369（p=7.7e-46）**
+    """
+
+    @staticmethod
+    def _panel(trend_violation: float = 0.0, n_units: int = 800):
+        cfg = StaggeredPanelConfig(
+            n_units=n_units, n_periods=9, cohorts=(3, 5, 7),
+            cohort_weights=(1 / 3, 1 / 3, 1 / 3), never_treated_share=0.25,
+            effects=(2.0, 2.0, 2.0, 2.0), noise_sd=1.0,
+            trend_violation=trend_violation, seed=7,
+        )
+        return generate_staggered_panel(cfg)
+
+    def test_effect_recovers_truth_when_parallel_trends_hold(self):
+        from ablab.causal import de_chaisemartin_dhaultfoeuille
+
+        panel, truth = self._panel()
+        res = de_chaisemartin_dhaultfoeuille(panel)
+        assert res.overall.absolute_effect == pytest.approx(
+            truth.overall_att, abs=0.15
+        ), (res.overall.absolute_effect, truth.overall_att)
+        assert res.overall.p_value < 1e-6
+
+    def test_placebo_is_silent_when_parallel_trends_hold(self):
+        """安慰剂在平行趋势成立时应当≈0（实测 +0.0202，p=0.778）。"""
+        from ablab.causal import de_chaisemartin_dhaultfoeuille
+
+        panel, _ = self._panel()
+        res = de_chaisemartin_dhaultfoeuille(panel)
+        assert abs(res.placebo_overall.absolute_effect) < 3 * res.placebo_overall.std_error
+        assert res.placebo_overall.p_value > 0.05, res.placebo_overall.p_value
+
+    def test_placebo_detects_the_violation_that_biases_the_effect(self):
+        """**这一条是它存在的理由**：违反平行趋势时点估计会偏，
+        而安慰剂会直接指出假设坏了（实测 p=7.7e-46）。
+
+        对比 TWFE/事件研究：那些做法在同样的数据上也会给一个偏的数，
+        但**不会告诉你**假设不成立。
+        """
+        from ablab.causal import de_chaisemartin_dhaultfoeuille
+
+        panel, truth = self._panel(trend_violation=1.5)
+        res = de_chaisemartin_dhaultfoeuille(panel)
+        # 效应被违反"污染"（偏得明显）
+        assert res.overall.absolute_effect > truth.overall_att + 0.5
+        # 而安慰剂显著非零 —— 它报警了
+        assert res.placebo_overall.p_value < 1e-6
+        assert res.placebo_overall.absolute_effect > 0.5
+
+    def test_per_period_outputs_and_weighting(self):
+        """逐期结果齐全，且整体是按**换手人数**加权的。"""
+        from ablab.causal import de_chaisemartin_dhaultfoeuille
+
+        panel, _ = self._panel()
+        res = de_chaisemartin_dhaultfoeuille(panel)
+        assert set(res.effects) == set(res.placebos) == {3, 5, 7}
+        for est in res.effects.values():
+            assert est.std_error > 0 and est.n_treatment > 0 and est.n_control > 0
+        # 加权平均应当落在逐期效应的最小与最大之间
+        lows = [e.absolute_effect for e in res.effects.values()]
+        assert min(lows) <= res.overall.absolute_effect <= max(lows)
+
+    def test_per_cohort_matches_the_cs_cell_exactly(self):
+        """**逐队列上 dCDH 的 DID+ 与 CS 的同一格逐位相同** —— 最强的交叉验证。
+
+        两者在吸收型处理下估的是同一个东西：队列 g 换手那一期的
+        ``E[Y_g − Y_{g−1} | 队列 g] − E[· | 还没换手]``。
+        实测差 **0.0e+00**（两条完全不同的代码路径：一条走泛化的
+        ``cs_att_with_influence`` 分格，一条走换手口径的专用实现）。
+
+        聚合后两者**会**不同，原因不是加权而是**能用哪些队列**：
+        dCDH 需要多一个前置期做安慰剂，所以最早那个队列被排除；
+        在效应逐队列异质的 DGP 上，少一个队列就改变了加权平均。
+        （这条也在报告里写清楚了，免得被当成 bug。）
+        """
+        import numpy as np
+
+        from ablab.causal import de_chaisemartin_dhaultfoeuille
+        from ablab.causal.did import cs_att_with_influence
+
+        cfg = StaggeredPanelConfig(
+            n_units=800, n_periods=9, cohorts=(2, 4, 6),
+            cohort_weights=(1 / 3, 1 / 3, 1 / 3), never_treated_share=0.1,
+            effects=(1.0, 2.0, 3.0, 4.0), noise_sd=0.5, seed=7,
+        )
+        panel, _ = generate_staggered_panel(cfg)
+        res = de_chaisemartin_dhaultfoeuille(panel)
+        assert set(res.effects) == {4, 6}, "g=2 没有前置两期，应当被排除"
+        for g, est in res.effects.items():
+            ref = cs_att_with_influence(panel, g, g, g - 1, "not_yet_treated")
+            assert ref is not None
+            assert est.absolute_effect == pytest.approx(ref[0], abs=1e-12), g
+            # 影响函数也应当一致（影响函数相同 → SE 也相同）
+            assert np.allclose(
+                est.std_error, float(np.sqrt(np.var(ref[1], ddof=1) / ref[1].size)),
+                rtol=1e-9,
+            ), g
+
+    def test_no_switchers_is_rejected(self):
+        """没有换手期（队列都在头两期处置）时明确报错，而不是给个空结果。"""
+        import pytest
+
+        from ablab.causal import de_chaisemartin_dhaultfoeuille
+
+        cfg = StaggeredPanelConfig(
+            n_units=300, n_periods=6, cohorts=(1, 2), cohort_weights=(0.5, 0.5),
+            never_treated_share=0.3, effects=(2.0,), noise_sd=0.5, seed=3,
+        )
+        panel, _ = generate_staggered_panel(cfg)
+        with pytest.raises(ValueError, match="换手"):
+            de_chaisemartin_dhaultfoeuille(panel)
+
+
 class TestBorusyakJaravelSpiess:
     """BJS 插补估计量：第三种交错处置估计量，用来做**交叉验证**。
 
