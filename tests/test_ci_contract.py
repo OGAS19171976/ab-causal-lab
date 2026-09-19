@@ -85,12 +85,18 @@ class TestCheckPlan:
         assert [s.key for s in runner.steps()][0] == "lock"
 
     def test_fast_checks_run_first(self, runner):
-        """秒级的检查（锁文件、lint、类型检查、治理）与前置条件（数仓）排在最前面。
+        """秒级的检查（锁文件、lint、类型检查、声明核对）与前置条件排在前面。
 
         早失败就早反馈 —— 不用等五分钟的 pytest 跑完才发现少了个导入。
         """
         keys = [s.key for s in runner.steps()]
-        assert keys[:5] == ["lock", "lint", "types", "warehouse", "gov"], keys[:5]
+        assert keys[:6] == ["lock", "lint", "types", "claims", "warehouse", "gov"], keys[:6]
+
+    def test_readme_claims_step_exists(self, runner):
+        """README 的数字要有东西核对 —— 否则"每个数字都能在 reports/ 里找到"
+        只是一句没人执行的声明（这个仓库已经在两处吃过同样的亏）。"""
+        claims = next(s for s in runner.steps() if s.key == "claims")
+        assert any("check_readme_claims.py" in a for a in claims.argv), claims.argv
 
     def test_governance_step_exists(self, runner):
         """治理验证（审计 + 护栏）必须在检查集里，而不是"我本地跑过一次"。"""

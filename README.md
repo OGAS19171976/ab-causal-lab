@@ -1102,10 +1102,11 @@ src/ablab/
 └── plotting.py            图表样式与中文字体探测
 
 sql/                       六个 SQL 文件（ODS→DWD→DWS→ADS + SRM + 簇粒度 DWS）
-scripts/                   十四个脚本（含 pick_demo_salts.py / lock_requirements.py /
+scripts/                   十五个脚本（含 pick_demo_salts.py / lock_requirements.py /
                            run_all_checks.py / check_report_determinism.py /
-                           run_governance_validation.py ——
-                           后四者分别管依赖、全部检查的单一定义、报告重跑一致性、治理验证）
+                           run_governance_validation.py / check_readme_claims.py ——
+                           后五者分别管依赖、全部检查的单一定义、报告重跑一致性、
+                           治理验证、README 数字的出处核对）
 tasks.ps1                  常用命令入口（与 CI 共用 run_all_checks.py）
 .python-version            Python 版本**唯一来源**（CI / uv / pyenv 都读它）
 .github/workflows/ci.yml   静态检查 + 测试 + 验证，并把 reports/ 作为产物发布
@@ -1575,6 +1576,19 @@ python -m mypy                                # 类型检查（范围与档位�
     那条教训当时只用在了 lead 的联合检验上，聚合那一步漏了 ——
     **一个写下来的教训，不等于一个被应用到所有相关处的教训。**
     现在两边都用影响函数合成，并把旧算法的结果作为诊断一并报出。详见 16 节。
+
+42. **"每个数字都能在 reports/ 里找到" —— 这句话本身也要有人执行**
+    这是 README 的第一句承诺，而在这之前**没有任何东西在核对它**：
+    报告重跑时数字会变（甚至方法被修正时会变），README 不会跟着变，
+    于是那句承诺会慢慢变成不准确的声明 —— 这个仓库已经在"统一换行符"
+    与"CI 跑过没有"两件事上各吃过一次同样的亏。
+    现在有了 `scripts/check_readme_claims.py`：维护一张**声明清单**
+    （人读的说法 → 哪份报告 → 必须逐字出现的字符串），进了检查集。
+    第一版跑出来当场抓到 4 条**我凭记忆写错的出处**（把 `-12.61%` 记成 `12.6%`、
+    把派生出来的 "29.0%" 当成报告里的原始数字……），这正说明
+    "凭印象引用的数字"是不可靠的。
+    清单里还刻意避开一个数：M5 的三路径最大偏差（1e-13 量级）**本身随运行环境漂移**，
+    把它当声明，检查器就会随机变红 —— 那正是第 31 条说的假红灯。
 
 ---
 
