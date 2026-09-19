@@ -107,6 +107,8 @@ CLAIMS: list[tuple[str, str, str]] = [
     ("治理·护栏：判定已校准", "governance_report.md", "误停率"),
     ("治理·护栏：H0 不误停", "governance_report.md", "宁可少停"),
     ("治理·护栏：边界点是真正的工作点", "governance_report.md", "边界点"),
+    ("治理·决策层：护栏能停实验", "governance_report.md", "决策层：护栏触发"),
+    ("治理·决策层：服务端复核", "governance_report.md", "服务端自己复核"),
     # 数仓护栏链路：两臂均值与"事件名过滤"是稳定的
     ("数仓·护栏：长表链路", "warehouse_report.md", "护栏链路"),
     ("数仓·护栏：注入的伤害可见", "warehouse_report.md", "latency_p99"),

@@ -42,6 +42,7 @@ from .datasource import list_warehouse_experiments
 from .registry import (
     ROLES,
     STATUSES,
+    ExperimentRecord,
     ExperimentRegistry,
     RegistryConflict,
     RegistryError,
@@ -178,6 +179,27 @@ class AnalyzeIn(_Strict):
         ge=0,
         description="合成数据种子。留空则由实验 salt 确定性派生（salt 不可变，故同一实验永远同一份数据）",
     )
+
+
+class StopIn(_Strict):
+    """停止实验的输入。``analyze`` 决定**服务端用什么参数重新分析**。"""
+
+    analyze: AnalyzeIn = Field(
+        # 显式写全命名参数，而不是 `AnalyzeIn()`：mypy 的 pydantic 插件不认
+        # `Field(默认值)` 的位置写法，会把 AnalyzeIn 的每个字段都当成必填。
+        # 代价是这里与 AnalyzeIn 的默认值有一份重复 —— 用测试钉住两者一致
+        # （`TestGuardrailStopDecision::test_stop_defaults_match_analyze`）。
+        default_factory=lambda: AnalyzeIn(n_users=20_000, alpha=0.05, n_looks=5, seed=None),
+        description="服务端重新跑分析用的参数（护栏是否触发由服务端自己判断）",
+    )
+    force: bool = Field(
+        False,
+        description=(
+            "护栏**没有**触发时仍然停止（人工叫停）。需要 admin 角色，"
+            "审计里会写明「护栏未触发」"
+        ),
+    )
+    reason: str = Field("", description="补充说明，进审计")
 
 
 class AAIn(_Strict):
@@ -527,6 +549,46 @@ def create_app(
         return record.to_dict()
 
     # ---- 分析 ------------------------------------------------------------ #
+    def _analyse(record: ExperimentRecord, payload: AnalyzeIn):
+        """分析派发：**只有这一份**，``/analyze`` 与 ``/stop`` 共用。
+
+        两个入口各写一遍的话，"服务端重新判断一次护栏"就可能与
+        用户看到的那次分析口径不同 —— 那种差异不会报错，只会让停机依据失真。
+        """
+        if record.warehouse_experiment:
+            # 真实链路：读数仓。n_users / seed 在这里没有意义（数据已经存在），
+            # 所以不静默忽略它们 —— 那样只会让人以为参数生效了。
+            if payload.seed is not None:
+                raise HTTPException(
+                    400, "数仓链路的数据是既成的，seed 参数只对合成数据路径有意义"
+                )
+            with warehouse_connection() as con:
+                return analyse_experiment_from_warehouse(
+                    record, con, alpha=payload.alpha, n_looks=payload.n_looks
+                )
+        return analyse_experiment(
+            record,
+            n_users=payload.n_users,
+            alpha=payload.alpha,
+            n_looks=payload.n_looks,
+            seed=payload.seed,
+        )
+
+    def report_guardrail_verdict(item: Any) -> str:
+        """从护栏检查项里取出**判定那一行**（进审计用）。
+
+        不去解析整段正文，只取"判定："后面那截 —— 审计要的是依据，
+        不是把整份报告抄进去。
+        """
+        for line in str(item.message).splitlines():
+            text = line.strip()
+            if text.startswith("判定："):
+                verdict = text[len("判定："):].strip()
+                # 检查项的正文 = 汇总 + 两空格 + 解释性文字；审计只要**依据**，
+                # 不要把整段解释抄进事件表（事件表是 append-only，抄进去就删不掉）。
+                return verdict.split("  ", 1)[0].strip()
+        return "（护栏判定行缺失）"
+
     @app.post("/api/experiments/{experiment_id}/analyze", tags=["分析"])
     def analyze(experiment_id: str, payload: AnalyzeIn) -> dict[str, Any]:
         try:
@@ -535,28 +597,84 @@ def create_app(
             raise HTTPException(404, str(exc)) from exc
 
         try:
-            if record.warehouse_experiment:
-                # 真实链路：读数仓。n_users / seed 在这里没有意义（数据已经存在），
-                # 所以不静默忽略它们 —— 那样只会让人以为参数生效了。
-                if payload.seed is not None:
-                    raise HTTPException(
-                        400, "数仓链路的数据是既成的，seed 参数只对合成数据路径有意义"
-                    )
-                with warehouse_connection() as con:
-                    report = analyse_experiment_from_warehouse(
-                        record, con, alpha=payload.alpha, n_looks=payload.n_looks
-                    )
-            else:
-                report = analyse_experiment(
-                    record,
-                    n_users=payload.n_users,
-                    alpha=payload.alpha,
-                    n_looks=payload.n_looks,
-                    seed=payload.seed,
-                )
+            report = _analyse(record, payload)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
         return report.to_dict()
+
+    @app.post("/api/experiments/{experiment_id}/stop", tags=["决策"])
+    def stop_experiment_endpoint(
+        experiment_id: str, payload: StopIn, request: Request
+    ) -> dict[str, Any]:
+        """**依据护栏停止实验** —— 这是平台上第一个"分析 -> 动作"的链接。
+
+        Kohavi 那本书里护栏触发是**停实验的理由**，不是参考信息。
+        但"报告里写着建议停止"与"真的停掉"之间隔着一次判断，
+        所以这个端点不信任调用方递过来的结论：**服务端重新跑一遍分析**，
+        确认护栏确实越界才执行。
+
+        三种结果：
+          * 护栏触发 -> 停实验，审计记下**依据**（哪条护栏、伤害多少、容忍度多少）；
+          * 护栏没触发 -> **409 拒绝**（拿一张过期截图来停实验是最容易犯的错），
+            除非调用方是 **admin** 且显式带 ``force=true`` ——
+            人工叫停是合法的，但要走更强的权限，而且审计里会写明"护栏未触发"；
+          * 没有声明任何护栏 -> 409（没有判据就没有"依据护栏停止"这回事）。
+        """
+        actor = actor_of(request)
+        try:
+            record = registry.get(experiment_id)
+        except RegistryError as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+        # ---- 服务端自己判断一次，不接受调用方的结论 ---------------------- #
+        try:
+            report = _analyse(record, payload.analyze)  # 与 /analyze 同一套派发
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        item = next((c for c in report.checks if c.name == "护栏指标"), None)
+        tripped = item is not None and item.status == "fail"
+
+        forced = bool(payload.force)
+        if forced:
+            role = registry.role_of(actor)
+            if role != "admin":
+                raise HTTPException(403, "force=true（护栏未触发也停）需要 admin 角色")
+        elif not tripped:
+            detail = (
+                "这次分析里护栏没有越界，因此不能以护栏为依据停止实验。"
+                if item is not None
+                else "这个实验没有声明护栏分析（没有判据），不能以护栏为依据停止实验。"
+            )
+            raise HTTPException(
+                409,
+                detail + "（确实要停就带 force=true，需要 admin 角色；审计会写明护栏未触发）",
+            )
+
+        if tripped and item is not None:
+            verdict = report_guardrail_verdict(item)
+            reason = f"护栏停止：{verdict}（服务端重新分析确认）"
+        else:
+            reason = "人工强制停止：护栏未触发（force=true，admin）"
+        if payload.reason:
+            reason = f"{reason}；备注：{payload.reason.strip()}"
+
+        try:
+            stopped = registry.stop_with_reason(
+                experiment_id, actor=actor, reason=reason,
+                expected_version=expected_version_of(request),
+            )
+        except RegistryConflict as exc:
+            raise _conflict(exc) from exc
+        except RegistryError as exc:
+            raise HTTPException(409 if "已经是 stopped" in str(exc) else 400, str(exc)) from exc
+        return {
+            "experiment_id": stopped.id,
+            "status": stopped.status,
+            "version": stopped.version,
+            "guardrail_tripped": tripped,
+            "forced": forced,
+            "reason": reason,
+        }
 
     @app.post("/api/validate/aa", tags=["分析"])
     def validate_aa(payload: AAIn) -> dict[str, Any]:

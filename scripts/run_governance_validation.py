@@ -361,6 +361,80 @@ def main() -> int:
     emit("  于是 H0 下几乎不会误停，代价是伤害刚好压在容忍度附近时")
     emit("  大量落在「观察」带 —— 那正是「宁可少停、也不要误停」的取舍。")
 
+    # ---- 7.9 决策层：把"建议停实验"接到动作上 ----------------------------- #
+    emit("\n### 7.9 决策层：护栏触发**真的能停实验**（而且服务端自己复核）")
+    emit("  前面几节做到的是「报告里写着建议停止实验」。从一句话到一个动作之间")
+    emit("  隔着一次判断，所以这个端点**不信任调用方递过来的结论**：")
+    emit("  它自己重跑一遍分析，确认护栏确实越界才执行。")
+    emit("")
+    from fastapi.testclient import TestClient as _StopClient
+
+    from ablab.platform.api import create_app as _create_app
+
+    stop_app = _create_app(tmpdir / "stop_api.db")
+    stop_reg = stop_app.state.registry
+    stop_editor = stop_reg.add_user("stop_editor", role="editor")
+    stop_admin = stop_reg.add_user("stop_admin", role="admin")
+    sc = _StopClient(stop_app)
+    stop_variants = [
+        {"name": "control", "weight": 0.5},
+        {"name": "treatment", "weight": 0.5},
+    ]
+
+    def _make_stop_experiment(name: str, max_harm: float, demo_harm: float) -> str:
+        resp = sc.post(
+            "/api/experiments",
+            json={
+                "name": name, "variants": stop_variants, "salt": f"{name}_v1",
+                "status": "running", "true_lift": 0.02,
+                "guardrails": ["latency_p99"],
+                "guardrail_specs": [{
+                    "name": "latency_p99", "direction": "lower_is_better",
+                    "max_harm": max_harm, "demo_harm": demo_harm,
+                }],
+            },
+            headers={"Authorization": f"Bearer {stop_editor}"},
+        )
+        return resp.json()["id"]
+
+    tripped_id = _make_stop_experiment("gov_stop_tripped", 0.05, 0.12)
+    clean_id = _make_stop_experiment("gov_stop_clean", 0.50, 0.0)
+    emit("  三种情形各跑一遍：")
+    r_ok = sc.post(
+        f"/api/experiments/{tripped_id}/stop",
+        json={"analyze": {"n_users": 4000}},
+        headers={"Authorization": f"Bearer {stop_editor}"},
+    )
+    emit(f"    A) 护栏越界 -> HTTP {r_ok.status_code}，状态 {r_ok.json().get('status')}，"
+         f"tripped={r_ok.json().get('guardrail_tripped')}")
+    r_409 = sc.post(
+        f"/api/experiments/{clean_id}/stop",
+        json={},
+        headers={"Authorization": f"Bearer {stop_editor}"},
+    )
+    emit(f"    B) 护栏没越界 -> HTTP {r_409.status_code}（拒绝，实验状态不变）")
+    r_403 = sc.post(
+        f"/api/experiments/{clean_id}/stop",
+        json={"force": True},
+        headers={"Authorization": f"Bearer {stop_editor}"},
+    )
+    r_force = sc.post(
+        f"/api/experiments/{clean_id}/stop",
+        json={"force": True, "reason": "业务方要求"},
+        headers={"Authorization": f"Bearer {stop_admin}"},
+    )
+    emit(f"    C) 人工强制：editor -> HTTP {r_403.status_code}；"
+         f"admin -> HTTP {r_force.status_code}（forced={r_force.json().get('forced')}）")
+    emit("")
+    emit("  审计里留下的依据（**动作名单独记为 stop**，理由进 note）：")
+    for e in sc.get(f"/api/experiments/{tripped_id}/events").json()["events"]:
+        if e["action"] == "stop":
+            emit(f"    {e['actor']} | {e['note']}")
+    emit("")
+    emit("  为什么值得单独做一层：停实验是这套平台里**最不可逆**的动作")
+    emit("  （分流随时能重开，已经造成的伤害收不回来）。所以它比「改个状态」厚：")
+    emit("  服务端复核、理由必填、人工叫停要 admin、成功与拒绝都留痕。")
+
     emit("\n### 7.5 并发：丢失更新（后写覆盖），以及乐观锁怎么挡住它")
     emit("  场景：两个客户端（**两个独立连接**，不是同一个对象）都读到同一版本，")
     emit("  然后都要改状态 —— 这就是「两个人同时改」的最小复现。")

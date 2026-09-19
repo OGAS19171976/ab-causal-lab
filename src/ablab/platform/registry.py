@@ -741,6 +741,42 @@ class ExperimentRegistry:
         record.status = status
         return record
 
+    def stop_with_reason(
+        self,
+        experiment_id: str,
+        *,
+        actor: str,
+        reason: str,
+        expected_version: int | None = None,
+    ) -> ExperimentRecord:
+        """**带理由地停止实验**（护栏触发、人工叫停都走这里）。
+
+        为什么不用 ``set_status(id, "stopped")`` 了事：审计要能回答"**为什么**停的"，
+        而 ``set_status`` 只记 ``draft -> stopped``。停实验是这一整套平台里
+        **最不可逆**的动作（分流随时可以重开，但已经造成的伤害收不回来），
+        它的审计必须比"改了个状态"更厚：谁停的、依据是什么、当时的值是多少。
+        所以理由进 ``note``，动作名单独记为 ``stop``。
+        """
+        if not reason.strip():
+            raise RegistryError("停止实验必须给出理由（审计要能回答为什么）")
+        record = self.get(experiment_id)
+        if record.status == "stopped":
+            raise RegistryError(f"实验 {record.name!r} 已经是 stopped")
+        self._check_version(record, expected_version)
+        with self._conn:
+            self._conn.execute(
+                "UPDATE experiments SET status = 'stopped' WHERE id = ?",
+                (experiment_id,),
+            )
+            record.version = self._bump_version(experiment_id, "stop")
+            self._record_event(
+                experiment_id, "stop", actor=actor, field="status",
+                before=record.status, after="stopped",
+                note=f"{reason}；v{record.version - 1} -> v{record.version}",
+            )
+        record.status = "stopped"
+        return record
+
     def set_estimator(
         self,
         experiment_id: str,

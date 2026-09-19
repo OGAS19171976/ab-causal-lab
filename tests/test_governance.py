@@ -412,6 +412,187 @@ class TestAuthAndActor:
             reg.close()
 
 
+class TestGuardrailStopDecision:
+    """护栏的**决策层**：把"建议停实验"接到动作上，而且服务端自己复核。
+
+    Kohavi 那本书里护栏触发是停实验的**理由**。但从"报告里写着建议停止"
+    到"真的停掉"之间隔着一次判断，所以这个端点**不信任调用方递过来的结论**：
+    它自己重跑一遍分析，确认护栏确实越界才执行。
+    拿一张过期截图来停实验，是这类功能里最容易犯的错。
+    """
+
+    @staticmethod
+    def _client(tmp_path: Path):
+        from fastapi.testclient import TestClient
+
+        client = TestClient(create_app(tmp_path / "stop_api.db"))
+        reg = client.app.state.registry
+        tokens = {
+            "admin": reg.add_user("boss", role="admin"),
+            "editor": reg.add_user("alice", role="editor"),
+        }
+        return client, tokens
+
+    @staticmethod
+    def _auth(token: str) -> dict[str, str]:
+        return {"Authorization": f"Bearer {token}"}
+
+    def _make(self, client, tokens, name: str, max_harm: float, demo_harm: float):
+        body = {
+            "name": name,
+            "variants": list(VARIANTS),
+            "salt": f"{name}_v1",
+            "status": "running",
+            "true_lift": 0.02,
+            "guardrails": ["latency_p99"],
+            "guardrail_specs": [
+                {
+                    "name": "latency_p99", "direction": "lower_is_better",
+                    "max_harm": max_harm, "demo_harm": demo_harm,
+                }
+            ],
+        }
+        resp = client.post("/api/experiments", json=body, headers=self._auth(tokens["editor"]))
+        assert resp.status_code == 201, resp.text
+        return resp.json()
+
+    def test_tripped_guardrail_stops_the_experiment_and_records_the_basis(
+        self, tmp_path
+    ):
+        """护栏真的越界 -> 停实验，审计里写明**依据**（哪条护栏、伤害多少）。"""
+        client, tokens = self._client(tmp_path)
+        rec = self._make(client, tokens, "stop_tripped", max_harm=0.05, demo_harm=0.12)
+        resp = client.post(
+            f"/api/experiments/{rec['id']}/stop",
+            json={"analyze": {"n_users": 4000}},
+            headers=self._auth(tokens["editor"]),
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["guardrail_tripped"] is True and body["forced"] is False
+        assert body["status"] == "stopped"
+        assert client.get(f"/api/experiments/{rec['id']}").json()["status"] == "stopped"
+        events = client.get(f"/api/experiments/{rec['id']}/events").json()["events"]
+        stop_events = [e for e in events if e["action"] == "stop"]
+        assert len(stop_events) == 1
+        assert stop_events[0]["actor"] == "alice"
+        assert "latency_p99" in stop_events[0]["note"]
+        assert "服务端重新分析确认" in stop_events[0]["note"]
+
+    def test_untripped_guardrail_is_refused_with_409(self, tmp_path):
+        """护栏没越界 -> **拒绝**，实验状态不变，而且**不写审计**。
+
+        这一条是这个端点存在的理由：只看调用方递过来的结论，
+        就等于谁都能用一句"护栏炸了"停掉任何实验。
+        """
+        client, tokens = self._client(tmp_path)
+        rec = self._make(client, tokens, "stop_untripped", max_harm=0.50, demo_harm=0.0)
+        resp = client.post(
+            f"/api/experiments/{rec['id']}/stop",
+            json={},
+            headers=self._auth(tokens["editor"]),
+        )
+        assert resp.status_code == 409
+        assert "没有越界" in resp.json()["detail"]
+        assert client.get(f"/api/experiments/{rec['id']}").json()["status"] == "running"
+        actions = [
+            e["action"]
+            for e in client.get(f"/api/experiments/{rec['id']}/events").json()["events"]
+        ]
+        assert actions == ["create"]
+
+    def test_force_requires_admin_and_says_so_in_the_audit(self, tmp_path):
+        """人工叫停是合法的，但要走 **admin**，而且审计里写明"护栏未触发"。"""
+        client, tokens = self._client(tmp_path)
+        rec = self._make(client, tokens, "stop_force", max_harm=0.50, demo_harm=0.0)
+        refused = client.post(
+            f"/api/experiments/{rec['id']}/stop",
+            json={"force": True},
+            headers=self._auth(tokens["editor"]),
+        )
+        assert refused.status_code == 403
+        allowed = client.post(
+            f"/api/experiments/{rec['id']}/stop",
+            json={"force": True, "reason": "业务方要求"},
+            headers=self._auth(tokens["admin"]),
+        )
+        assert allowed.status_code == 200, allowed.text
+        assert allowed.json()["forced"] is True
+        note = next(
+            e["note"]
+            for e in client.get(f"/api/experiments/{rec['id']}/events").json()["events"]
+            if e["action"] == "stop"
+        )
+        assert "护栏未触发" in note and "业务方要求" in note
+
+    def test_experiment_without_guardrails_cannot_be_stopped_by_guardrail(self, tmp_path):
+        """没有声明护栏 -> 409：没有判据就没有"依据护栏停止"这回事。"""
+        client, tokens = self._client(tmp_path)
+        rec = client.post(
+            "/api/experiments",
+            json={
+                "name": "stop_no_guard", "variants": list(VARIANTS),
+                "salt": "stop_no_guard_v1", "status": "running",
+            },
+            headers=self._auth(tokens["editor"]),
+        ).json()
+        resp = client.post(
+            f"/api/experiments/{rec['id']}/stop", json={}, headers=self._auth(tokens["editor"])
+        )
+        assert resp.status_code == 409
+        assert "没有声明护栏" in resp.json()["detail"]
+
+    def test_stop_needs_credentials_and_respects_the_optimistic_lock(self, tmp_path):
+        """与其它写接口一致：无凭据 401；带了过期 If-Match 就是 412。"""
+        client, tokens = self._client(tmp_path)
+        rec = self._make(client, tokens, "stop_lock", max_harm=0.05, demo_harm=0.12)
+        assert client.post(f"/api/experiments/{rec['id']}/stop", json={}).status_code == 401
+
+        first = client.post(
+            f"/api/experiments/{rec['id']}/stop",
+            json={"analyze": {"n_users": 4000}},
+            headers={**self._auth(tokens["editor"]), "If-Match": str(rec["version"])},
+        )
+        assert first.status_code == 200
+        # 已经停了：再停一次是 409（"已经是 stopped"），不是 500
+        again = client.post(
+            f"/api/experiments/{rec['id']}/stop", json={}, headers=self._auth(tokens["editor"])
+        )
+        assert again.status_code == 409
+
+    def test_stop_defaults_match_analyze(self):
+        """``StopIn.analyze`` 的默认值必须与 ``AnalyzeIn()`` 一致。
+
+        为什么值得一条测试：那两处默认值有一份**重复**（mypy 的 pydantic 插件
+        不认 `Field(默认值)` 的位置写法，只能显式写全命名参数），
+        重复就会漂移；漂移的后果是"服务端复核用的参数"和"用户看到的分析"
+        悄悄不一样 —— 那正是这个端点最不能出的事。
+        """
+        from ablab.platform.api import AnalyzeIn, StopIn
+
+        assert StopIn().analyze == AnalyzeIn()
+        assert StopIn().force is False and StopIn().reason == ""
+
+    def test_stop_reason_must_be_present_in_the_registry_layer(self, tmp_path):
+        """理由不是可选的装饰：注册表层直接拒绝空理由（审计要能回答为什么）。"""
+        import pytest
+
+        reg = ExperimentRegistry(tmp_path / "reason.db")
+        try:
+            rec = reg.create(
+                actor="tester", name="reason_demo", variants=list(VARIANTS), status="running"
+            )
+            with pytest.raises(RegistryError, match="理由"):
+                reg.stop_with_reason(rec.id, actor="tester", reason="   ")
+            stopped = reg.stop_with_reason(
+                rec.id, actor="tester", reason="护栏停止：latency_p99"
+            )
+            assert stopped.status == "stopped"
+            assert stopped.version == rec.version + 1
+        finally:
+            reg.close()
+
+
 class TestGuardrailCalibration:
     """护栏判定的**运行特征**：误停率与功效。
 
