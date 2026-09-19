@@ -134,6 +134,9 @@ _MIGRATIONS: dict[str, str] = {
     "estimator": "TEXT NOT NULL DEFAULT 'cuped'",
     "analysis_unit": "TEXT NOT NULL DEFAULT 'unit'",
     "metric_type": "TEXT NOT NULL DEFAULT 'mean'",
+    # 乐观锁版本号：老库的既有行都从 1 开始（"我们不知道它被改过几次"，
+    # 但 1 是唯一诚实的选择 —— 编一个更大的数会假装我们知道历史）
+    "version": "INTEGER NOT NULL DEFAULT 1",
 }
 
 #: 审计表新增的列。单独一张表，因为它的迁移规则不一样：
@@ -158,6 +161,16 @@ METRIC_TYPES = ("mean", "ratio")
 
 class RegistryError(ValueError):
     """注册表层的输入错误（参数非法、重名、找不到等）。"""
+
+
+class RegistryConflict(RegistryError):
+    """**并发冲突**：调用方拿的版本已经不是当前版本。
+
+    单独一个类型，因为它与"参数非法"是两件事：
+      * 参数非法是调用方**写错了**（重试也没用）；
+      * 冲突是"你读到的世界已经变了"（重新读、再决定，通常会成功）。
+    API 层据此映射成 412 Precondition Failed 而不是 400。
+    """
 
 
 def _now() -> str:
@@ -228,6 +241,9 @@ class ExperimentRecord:
     metric_type: str = "mean"
     id: str = ""
     created_at: str = ""
+    #: 乐观锁版本号。每次成功的写 +1；调用方带 ``expected_version`` 且对不上时，
+    #: 这次写会被拒（``RegistryConflict``）—— 这就是"防止把别人的改动覆盖掉"。
+    version: int = 1
 
     def to_spec(self) -> ExperimentSpec:
         """把记录还原成分流定义 —— 构造即校验。"""
@@ -384,6 +400,37 @@ class ExperimentRegistry:
         if row is None or row["disabled"]:
             return None
         return str(row["role"])
+
+    # -- 乐观锁 ------------------------------------------------------------- #
+    @staticmethod
+    def _check_version(
+        record: ExperimentRecord, expected_version: int | None
+    ) -> None:
+        """版本对不上就拒绝这次写。
+
+        ``expected_version=None`` 表示"调用方没有声明它读的是哪一版" ——
+        此时按**后写覆盖**放行（这是默认行为，不是漏洞：单机实验平台上
+        大部分调用就是这么用的）。要防止覆盖，就带上版本号。
+        """
+        if expected_version is None:
+            return
+        if int(expected_version) != record.version:
+            raise RegistryConflict(
+                f"版本冲突：你读到的是 v{int(expected_version)}，"
+                f"当前已经是 v{record.version} —— "
+                "说明这中间有人改过。请重新读取后再提交（这次写没有生效）。"
+            )
+
+    def _bump_version(self, experiment_id: str, note_prefix: str) -> int:
+        """把版本 +1，返回新版本号。**与业务更新在同一事务里**。"""
+        self._conn.execute(
+            "UPDATE experiments SET version = version + 1 WHERE id = ?",
+            (experiment_id,),
+        )
+        row = self._conn.execute(
+            "SELECT version FROM experiments WHERE id = ?", (experiment_id,)
+        ).fetchone()
+        return int(row["version"]) if row else 1
 
     # -- 审计（append-only） ------------------------------------------------ #
     def _record_event(
@@ -601,8 +648,8 @@ class ExperimentRegistry:
             (id, name, hypothesis, owner, layer, unit, salt, traffic_ratio,
              variants, primary_metric, guardrails, status, start_ds, end_ds,
              true_lift, warehouse_experiment, estimator, analysis_unit, metric_type,
-             created_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             created_at, version)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 record.id, record.name, record.hypothesis, record.owner, record.layer,
@@ -613,7 +660,7 @@ class ExperimentRegistry:
                 record.status, record.start_ds, record.end_ds,
                 record.true_lift, record.warehouse_experiment, record.estimator,
                 record.analysis_unit, record.metric_type,
-                record.created_at,
+                record.created_at, record.version,
             ),
         )
         self._record_event(
@@ -627,25 +674,42 @@ class ExperimentRegistry:
         return record
 
     def set_status(
-        self, experiment_id: str, status: str, *, actor: str
+        self,
+        experiment_id: str,
+        status: str,
+        *,
+        actor: str,
+        expected_version: int | None = None,
     ) -> ExperimentRecord:
-        """只允许改状态 —— 分流定义一旦上线就不能动。"""
+        """只允许改状态 —— 分流定义一旦上线就不能动。
+
+        带 ``expected_version`` 时是**乐观锁**语义：版本对不上直接拒，
+        不会被"后写覆盖"悄悄吃掉别人的改动。
+        """
         if status not in STATUSES:
             raise RegistryError(f"status 必须是 {STATUSES} 之一，收到 {status!r}")
         record = self.get(experiment_id)
-        with self._conn:  # 变更 + 审计同一事务
+        self._check_version(record, expected_version)
+        with self._conn:  # 变更 + 版本 + 审计同一事务
             self._conn.execute(
                 "UPDATE experiments SET status = ? WHERE id = ?", (status, experiment_id)
             )
+            record.version = self._bump_version(experiment_id, "set_status")
             self._record_event(
                 experiment_id, "set_status", actor=actor, field="status",
                 before=record.status, after=status,
+                note=f"v{record.version - 1} -> v{record.version}",
             )
         record.status = status
         return record
 
     def set_estimator(
-        self, experiment_id: str, estimator: str, *, actor: str
+        self,
+        experiment_id: str,
+        estimator: str,
+        *,
+        actor: str,
+        expected_version: int | None = None,
     ) -> ExperimentRecord:
         """切换判定口径。
 
@@ -657,20 +721,28 @@ class ExperimentRegistry:
         if estimator not in ESTIMATORS:
             raise RegistryError(f"estimator 必须是 {ESTIMATORS} 之一，收到 {estimator!r}")
         record = self.get(experiment_id)
+        self._check_version(record, expected_version)
         with self._conn:
             self._conn.execute(
                 "UPDATE experiments SET estimator = ? WHERE id = ?", (estimator, experiment_id)
             )
+            record.version = self._bump_version(experiment_id, "set_estimator")
             self._record_event(
                 experiment_id, "set_estimator", actor=actor, field="estimator",
                 before=record.estimator, after=estimator,
-                note="判定口径变更：历史结论的判定规则会随之改变",
+                note="判定口径变更：历史结论的判定规则会随之改变；"
+                     f"v{record.version - 1} -> v{record.version}",
             )
         record.estimator = estimator
         return record
 
     def bind_warehouse(
-        self, experiment_id: str, warehouse_experiment: str | None, *, actor: str
+        self,
+        experiment_id: str,
+        warehouse_experiment: str | None,
+        *,
+        actor: str,
+        expected_version: int | None = None,
     ) -> ExperimentRecord:
         """绑定/解绑数仓实验。
 
@@ -681,22 +753,29 @@ class ExperimentRegistry:
         binding = warehouse_experiment.strip() if warehouse_experiment else None
         if warehouse_experiment is not None and not binding:
             raise RegistryError("warehouse_experiment 不能是空白字符串（解绑请传 None）")
+        self._check_version(record, expected_version)
         with self._conn:
             self._conn.execute(
                 "UPDATE experiments SET warehouse_experiment = ? WHERE id = ?",
                 (binding, experiment_id),
             )
+            record.version = self._bump_version(experiment_id, "bind_warehouse")
             self._record_event(
                 experiment_id, "bind_warehouse", actor=actor, field="warehouse_experiment",
                 before=record.warehouse_experiment, after=binding,
-                note="数据源绑定变更：改变读哪份数据，不改变任何用户的分组",
+                note="数据源绑定变更：改变读哪份数据，不改变任何用户的分组；"
+                     f"v{record.version - 1} -> v{record.version}",
             )
         record.warehouse_experiment = binding
         return record
 
-    def delete(self, experiment_id: str, *, actor: str) -> None:
-        if self.get(experiment_id) is None:
+    def delete(self, experiment_id: str, *, actor: str, expected_version: int | None = None) -> None:
+        record = self.get(experiment_id)
+        if record is None:
             raise RegistryError(f"找不到实验 {experiment_id!r}")
+        # 删除也要检查版本：一个人正打算改状态，另一个人把实验删了 ——
+        # 前者应当收到"你读到的世界已经变了"，而不是写进一个不存在的行（静默无效果）。
+        self._check_version(record, expected_version)
         with self._conn:
             self._conn.execute("DELETE FROM experiments WHERE id = ?", (experiment_id,))
             # 审计**不删**：删掉实验之后，"谁删的、删之前是什么状态"正是要回答的问题。
@@ -730,6 +809,7 @@ class ExperimentRegistry:
             analysis_unit=row["analysis_unit"],
             metric_type=row["metric_type"],
             created_at=row["created_at"],
+            version=int(row["version"]),
         )
 
     def get(self, experiment_id: str) -> ExperimentRecord:

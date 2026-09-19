@@ -14,7 +14,12 @@ import pytest
 
 from ablab.platform.analysis import analyse_experiment
 from ablab.platform.api import create_app
-from ablab.platform.registry import ExperimentRecord, ExperimentRegistry, RegistryError
+from ablab.platform.registry import (
+    ExperimentRecord,
+    ExperimentRegistry,
+    RegistryConflict,
+    RegistryError,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -405,6 +410,210 @@ class TestAuthAndActor:
             assert reg.events(rec.id)[0].actor == ACTOR
         finally:
             reg.close()
+
+
+class TestOptimisticLocking:
+    """并发：**两个人同时改，不能有一方的改动被静默吃掉**。
+
+    这一组测试要钉的不是"版本号加一"，而是"丢失更新"这个具体故障：
+    两个客户端都读到 v1，A 先写、B 后写 —— 没有检查时 B 的写会成功，
+    而 A 的改动**从世界上消失**（谁都没报错，审计里也只有 B 那条）。
+    这就是"后写覆盖"，也是为什么它比崩溃更难查。
+    """
+
+    @staticmethod
+    def _app(tmp_path: Path):
+        from fastapi.testclient import TestClient
+
+        client = TestClient(create_app(tmp_path / "optlock.db"))
+        token = client.app.state.registry.add_user("lock_admin", role="admin")
+        return client, {"Authorization": f"Bearer {token}"}
+
+    def _new(self, client, auth, name="lock_demo"):
+        return client.post(
+            "/api/experiments",
+            json={"name": name, "variants": VARIANTS, "salt": f"{name}_v1"},
+            headers=auth,
+        ).json()
+
+    def test_lost_update_is_prevented_by_if_match(self, tmp_path):
+        """核心断言：A 写成功之后，B 拿着**读过的旧版本**再写必须被拒。"""
+        client, auth = self._app(tmp_path)
+        rec = self._new(client, auth)
+        stale = rec["version"]  # 两个客户端都读到 v1
+
+        first = client.patch(
+            f"/api/experiments/{rec['id']}/status",
+            json={"status": "running"},
+            headers={**auth, "If-Match": str(stale)},
+        )
+        assert first.status_code == 200
+        assert first.json()["version"] == stale + 1
+
+        second = client.patch(
+            f"/api/experiments/{rec['id']}/status",
+            json={"status": "stopped"},
+            headers={**auth, "If-Match": str(stale)},
+        )
+        assert second.status_code == 412
+        assert "版本冲突" in second.json()["detail"]
+        # A 的改动还在（没有被 B 覆盖），而且 B 的写**没有**进审计
+        current = client.get(f"/api/experiments/{rec['id']}").json()
+        assert current["status"] == "running"
+        assert current["version"] == stale + 1
+        actions = [
+            e["action"]
+            for e in client.get(f"/api/experiments/{rec['id']}/events").json()["events"]
+        ]
+        assert actions == ["create", "set_status"]
+
+    def test_without_if_match_it_is_last_write_wins(self, tmp_path):
+        """不带 `If-Match` 时按后写覆盖放行 —— 这是**默认行为**，不是漏洞。
+
+        把它钉住，是为了让"乐观锁是可选的"这件事有据可查：
+        要防覆盖就带版本号；不带就表示调用方接受覆盖。
+        """
+        client, auth = self._app(tmp_path)
+        rec = self._new(client, auth, "lock_lww")
+        stale = rec["version"]
+        assert (
+            client.patch(
+                f"/api/experiments/{rec['id']}/status",
+                json={"status": "running"},
+                headers={**auth, "If-Match": str(stale)},
+            ).status_code
+            == 200
+        )
+        overwrite = client.patch(
+            f"/api/experiments/{rec['id']}/status",
+            json={"status": "stopped"},
+            headers=auth,  # 故意不带
+        )
+        assert overwrite.status_code == 200
+        assert overwrite.json()["status"] == "stopped"
+
+    def test_stale_delete_does_not_remove_the_experiment(self, tmp_path):
+        """删除也要检查版本：否则"我正打算改，别人把它删了"会变成静默失败。"""
+        client, auth = self._app(tmp_path)
+        rec = self._new(client, auth, "lock_del")
+        client.patch(
+            f"/api/experiments/{rec['id']}/status",
+            json={"status": "running"},
+            headers={**auth, "If-Match": str(rec["version"])},
+        )
+        stale = client.delete(
+            f"/api/experiments/{rec['id']}", headers={**auth, "If-Match": str(rec["version"])}
+        )
+        assert stale.status_code == 412
+        assert client.get(f"/api/experiments/{rec['id']}").status_code == 200
+
+    def test_malformed_if_match_is_400_and_quoted_form_is_accepted(self, tmp_path):
+        client, auth = self._app(tmp_path)
+        rec = self._new(client, auth, "lock_fmt")
+        bad = client.patch(
+            f"/api/experiments/{rec['id']}/status",
+            json={"status": "running"},
+            headers={**auth, "If-Match": "abc"},
+        )
+        assert bad.status_code == 400
+        # HTTP 规范里 ETag 是带引号的，所以引号写法必须能用
+        quoted = client.patch(
+            f"/api/experiments/{rec['id']}/status",
+            json={"status": "running"},
+            headers={**auth, "If-Match": f'"{rec["version"]}"'},
+        )
+        assert quoted.status_code == 200
+        assert quoted.json()["version"] == rec["version"] + 1
+
+    def test_every_write_bumps_the_version_and_the_audit_says_so(self, tmp_path):
+        """每次成功的写 +1，且审计里留下版本变迁 —— 复现时能对齐到具体某一版。"""
+        client, auth = self._app(tmp_path)
+        rec = self._new(client, auth, "lock_bump")
+        eid = rec["id"]
+        client.patch(
+            f"/api/experiments/{eid}/status", json={"status": "running"}, headers=auth
+        )
+        client.post(
+            f"/api/experiments/{eid}/estimator",
+            json={"estimator": "post_only"},
+            headers=auth,
+        )
+        client.post(
+            f"/api/experiments/{eid}/bind",
+            json={"warehouse_experiment": None},
+            headers=auth,
+        )
+        assert client.get(f"/api/experiments/{eid}").json()["version"] == 4
+        notes = [
+            e["note"]
+            for e in client.get(f"/api/experiments/{eid}/events").json()["events"]
+        ]
+        assert any("v1 -> v2" in n for n in notes), notes
+        assert sum("-> v" in n for n in notes) >= 3
+
+    def test_conflict_type_is_distinct_from_bad_input(self, tmp_path):
+        """冲突与"参数写错"必须是两种类型：前者重读后重试通常会成功。"""
+        reg = ExperimentRegistry(tmp_path / "types.db")
+        try:
+            rec = make(reg, "lock_types")
+            reg.set_status(rec.id, "running", actor=ACTOR, expected_version=rec.version)
+            with pytest.raises(RegistryConflict):
+                reg.set_status(
+                    rec.id, "stopped", actor=ACTOR, expected_version=rec.version
+                )
+            # 冲突是 RegistryError 的子类（调用方可以只捕获父类），但类型可区分
+            with pytest.raises(RegistryError):
+                reg.set_status(
+                    rec.id, "stopped", actor=ACTOR, expected_version=rec.version
+                )
+            with pytest.raises(RegistryError):
+                reg.set_status(rec.id, "not_a_status", actor=ACTOR)
+        finally:
+            reg.close()
+
+    def test_old_database_gets_version_column_at_one(self, tmp_path):
+        """老库迁移：既有行的版本从 **1** 开始 —— 不编造历史。
+
+        我们并不知道那些行被改过几次；写 1 的意思是"从这里开始计数"。
+        编一个更大的数会假装我们知道历史，那正是审计要避免的事。
+        """
+        path = tmp_path / "old_version.db"
+        reg = ExperimentRegistry(path)
+        rec = make(reg, "old_version_row")
+        reg._conn.execute("UPDATE experiments SET version = 99 WHERE id = ?", (rec.id,))
+        reg._conn.commit()
+        reg.close()
+
+        # 模拟"加列之前"的库：删掉 version 列在 sqlite 里做不到，
+        # 所以直接建一个不含该列的表结构，再走一次迁移。
+        raw = sqlite3.connect(tmp_path / "old_shape.db")
+        raw.executescript(
+            """
+            CREATE TABLE experiments (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE,
+                hypothesis TEXT NOT NULL DEFAULT '', owner TEXT NOT NULL DEFAULT '',
+                layer TEXT, unit TEXT NOT NULL DEFAULT 'user_id', salt TEXT NOT NULL,
+                traffic_ratio REAL NOT NULL DEFAULT 1.0, variants TEXT NOT NULL,
+                primary_metric TEXT NOT NULL DEFAULT 'metric',
+                guardrails TEXT NOT NULL DEFAULT '[]',
+                status TEXT NOT NULL DEFAULT 'draft', start_ds TEXT, end_ds TEXT,
+                true_lift REAL NOT NULL DEFAULT 0.0, created_at TEXT NOT NULL
+            );
+            INSERT INTO experiments (id, name, salt, variants, created_at)
+            VALUES ('old1', 'legacy', 'legacy_v1', '[]', '2026-01-01T00:00:00+00:00');
+            """
+        )
+        raw.commit()
+        raw.close()
+
+        migrated = ExperimentRegistry(tmp_path / "old_shape.db")
+        try:
+            row = migrated.get("old1")
+            assert row.version == 1
+            migrated.set_status("old1", "running", actor=ACTOR)
+            assert migrated.get("old1").version == 2
+        finally:
+            migrated.close()
 
 
 class TestGuardrailVisibility:

@@ -39,7 +39,13 @@ from .analysis import (
     run_aa_validation,
 )
 from .datasource import list_warehouse_experiments
-from .registry import ROLES, STATUSES, ExperimentRegistry, RegistryError
+from .registry import (
+    ROLES,
+    STATUSES,
+    ExperimentRegistry,
+    RegistryConflict,
+    RegistryError,
+)
 
 __all__ = ["create_app", "default_registry_path", "default_warehouse_path"]
 
@@ -207,6 +213,32 @@ def bearer_token(authorization: str | None) -> str | None:
     return value.strip()
 
 
+def expected_version_of(request: Request) -> int | None:
+    """读 `If-Match` 头里的版本号（HTTP 原生语义）。
+
+    为什么用 `If-Match` 而不是自定义头或请求体字段：这是 HTTP 里
+    "只有当资源还是我以为的那一版时才执行"的**标准**表达，
+    冲突时标准的状态码就是 **412 Precondition Failed** ——
+    前端、代理、测试工具都认识它，不需要我们发明约定。
+
+    没带这个头时返回 None，注册表按"后写覆盖"放行（默认行为，见已知边界）。
+    格式不对（不是整数、负数）则直接 400：那是调用方写错了，不是冲突。
+    """
+    raw = request.headers.get("if-match")
+    if raw is None or not raw.strip():
+        return None
+    text = raw.strip().strip('"').lstrip("W/").strip('"')
+    try:
+        version = int(text)
+    except ValueError as exc:
+        raise HTTPException(
+            400, f"If-Match 必须是版本号（整数），收到 {raw!r}"
+        ) from exc
+    if version < 1:
+        raise HTTPException(400, f"If-Match 必须 >= 1，收到 {version}")
+    return version
+
+
 def require_role(app: FastAPI, authorization: str | None, minimum: str) -> str:
     """校验凭据与角色，返回**用户 id**（而不是请求里声称的名字）。
 
@@ -275,6 +307,10 @@ def create_app(
 
     def _handle(exc: RegistryError) -> HTTPException:
         return HTTPException(status_code=400, detail=str(exc))
+
+    def _conflict(exc: RegistryConflict) -> HTTPException:
+        """版本冲突是 412，不是 400：调用方重读一遍再提交通常会成功。"""
+        return HTTPException(status_code=412, detail=str(exc))
 
     # ---- 身份：**服务端从凭据推导，绝不相信请求体里的名字** -------------- #
     #
@@ -356,8 +392,13 @@ def create_app(
         experiment_id: str, payload: StatusIn, request: Request
     ) -> dict[str, Any]:
         actor = actor_of(request)
+        expected = expected_version_of(request)
         try:
-            return registry.set_status(experiment_id, payload.status, actor=actor).to_dict()
+            return registry.set_status(
+                experiment_id, payload.status, actor=actor, expected_version=expected
+            ).to_dict()
+        except RegistryConflict as exc:
+            raise _conflict(exc) from exc
         except RegistryError as exc:
             raise HTTPException(404 if "找不到" in str(exc) else 400, str(exc)) from exc
 
@@ -365,7 +406,11 @@ def create_app(
     def delete_experiment(experiment_id: str, request: Request) -> JSONResponse:
         actor = actor_of(request)
         try:
-            registry.delete(experiment_id, actor=actor)
+            registry.delete(
+                experiment_id, actor=actor, expected_version=expected_version_of(request)
+            )
+        except RegistryConflict as exc:
+            raise _conflict(exc) from exc
         except RegistryError as exc:
             raise HTTPException(404, str(exc)) from exc
         return JSONResponse(status_code=204, content=None)
@@ -375,10 +420,13 @@ def create_app(
         experiment_id: str, payload: EstimatorIn, request: Request
     ) -> dict[str, Any]:
         actor = actor_of(request)
+        expected = expected_version_of(request)
         try:
             return registry.set_estimator(
-                experiment_id, payload.estimator, actor=actor
+                experiment_id, payload.estimator, actor=actor, expected_version=expected
             ).to_dict()
+        except RegistryConflict as exc:
+            raise _conflict(exc) from exc
         except RegistryError as exc:
             raise HTTPException(404 if "找不到" in str(exc) else 400, str(exc)) from exc
 
@@ -428,8 +476,13 @@ def create_app(
         actor = actor_of(request)
         try:
             record = registry.bind_warehouse(
-                experiment_id, payload.warehouse_experiment, actor=actor
+                experiment_id,
+                payload.warehouse_experiment,
+                actor=actor,
+                expected_version=expected_version_of(request),
             )
+        except RegistryConflict as exc:
+            raise _conflict(exc) from exc
         except RegistryError as exc:
             raise HTTPException(404 if "找不到" in str(exc) else 400, str(exc)) from exc
         # 绑定的目标必须真的存在，否则用户要到点"分析"时才发现 —— 那是更晚、更贵的反馈

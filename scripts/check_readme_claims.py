@@ -86,6 +86,9 @@ CLAIMS: list[tuple[str, str, str]] = [
     ("治理·身份：静态 token + 角色", "governance_report.md", "静态 token"),
     ("治理·身份：凭据只存哈希", "governance_report.md", "sha256"),
     ("治理·身份：伪造无效", "governance_report.md", "http_alice"),
+    # 并发（乐观锁）：文本类声明 —— 版本号随操作次数变，不把数字写进清单
+    ("治理·并发：丢失更新已可见", "governance_report.md", "丢失更新"),
+    ("治理·并发：冲突返回 412", "governance_report.md", "412"),
 ]
 
 

@@ -39,6 +39,7 @@ from ablab.platform.api import create_app  # noqa: E402
 from ablab.platform.registry import (  # noqa: E402
     ExperimentRecord,
     ExperimentRegistry,
+    RegistryConflict,
     RegistryError,
 )
 from ablab.reporting import for_report  # noqa: E402
@@ -291,6 +292,60 @@ def main() -> int:
          f"{bool([c for c in rep2.checks if c.name == '护栏指标'])}（应为 False）")
 
     # ---- 8. 结论 ---------------------------------------------------------- #
+    # ---- 7. 并发：丢失更新与乐观锁 ---------------------------------------- #
+    emit("\n### 7.5 并发：丢失更新（后写覆盖），以及乐观锁怎么挡住它")
+    emit("  场景：两个客户端（**两个独立连接**，不是同一个对象）都读到同一版本，")
+    emit("  然后都要改状态 —— 这就是「两个人同时改」的最小复现。")
+    emit("")
+    conc_db = tmpdir / "concurrent.db"
+    c1 = ExperimentRegistry(conc_db)
+    c2 = ExperimentRegistry(conc_db)
+    try:
+        target = c1.create(
+            actor="alice", name="conc_demo", variants=VARIANTS, salt="conc_demo_v1"
+        )
+        emit(f"  实验建好，version = {target.version}；两个客户端各自读到 "
+             f"v{c1.get(target.id).version} 与 v{c2.get(target.id).version}")
+        emit("")
+        emit("  A) 不带版本号（默认语义 = 后写覆盖）：")
+        c1.set_status(target.id, "running", actor="alice")
+        c2.set_status(target.id, "stopped", actor="bob")
+        final = c1.get(target.id)
+        events = [e for e in c1.events(target.id) if e.action == "set_status"]
+        emit("     alice 写 running -> 成功；bob 写 stopped -> 成功")
+        emit(f"     最终状态 = {final.status}（bob 覆盖了 alice），"
+             f"version = {final.version}")
+        emit(f"     审计里两条都在：{[e.actor for e in events]} —— "
+             "但**alice 的意图已经不在结果里了**，而谁都没收到错误。")
+        emit("     这就是丢失更新：比崩溃难查，因为一切「看起来都成功了」。")
+        emit("")
+        emit("  B) 带上各自读到的版本号（乐观锁）：")
+        c1.set_status(target.id, "running", actor="alice")  # 先把状态放回去
+        v_a = c1.get(target.id).version
+        v_b = c2.get(target.id).version  # 两人都读到同一版本
+        c1.set_status(target.id, "running", actor="alice", expected_version=v_a)
+        try:
+            c2.set_status(target.id, "stopped", actor="bob", expected_version=v_b)
+            emit("     bob 的写竟然成功了 —— 这说明乐观锁没生效（是 bug）")
+        except RegistryConflict as exc:
+            emit(f"     alice 写 -> 成功；bob 写 -> **被拒**（{type(exc).__name__}）")
+            emit(f"     拒绝理由：{exc}")
+        settled = c1.get(target.id)
+        emit(f"     最终状态 = {settled.status}（alice 的改动还在），"
+             f"version = {settled.version}")
+        emit("     也就是说：**冲突被变成了一次可见的失败**，而不是一次静默的覆盖。")
+        emit("")
+        emit("  边界（写在明处）：")
+        emit("    · 乐观锁是**可选**的 —— 不带 If-Match 就退回后写覆盖，")
+        emit("      这是刻意的默认（单机平台上大多数调用就是这么用的）；")
+        emit("    · 没有自动重试与自动合并：拿到 412 之后要**重新读、重新决定**，")
+        emit("      因为「该不该改」取决于中间那次改动是什么；")
+        emit("    · sqlite 单文件本身是串行写的，这里的「并发」是应用层的")
+        emit("      读-改-写交错，不是数据库层的写冲突。")
+    finally:
+        c1.close()
+        c2.close()
+
     emit("\n### 8. 结论")
     emit("  * 审计是 append-only 的**机械**保证：SQLite 触发器拒绝 UPDATE/DELETE，")
     emit("    而且它是被当场试出来的，不是一句声称。")
@@ -302,8 +357,9 @@ def main() -> int:
     emit("      见第 1.5 节与 README 设计决策第 45 条。")
     emit("      **边界**：静态 token 无过期、无轮换、无限速，token 泄露即冒充；")
     emit("      读接口仍然匿名；迁移前的老记录操作者是「（迁移前未知）」。")
-    emit("    - 注册表仍然**没有并发控制**：两个人同时改同一个实验会互相覆盖。")
-    emit("      身份解决「谁改的」，不解决「同时改」—— 那是乐观锁的事。")
+    emit("    - ~~注册表没有并发控制~~ **已补**：`version` 列 + `If-Match` 头，")
+    emit("      冲突返回 412 而不是静默覆盖（见第 7.5 节）。**边界**：乐观锁是")
+    emit("      可选的（不带 If-Match 仍是后写覆盖），且没有自动重试与合并。")
     emit("    - 护栏**仍然没有被分析**：数据模型只有主指标一条时间序列。")
     emit("      要做需要数仓里另建指标表 + 停实验的判据，那是另一件事。")
 
