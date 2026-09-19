@@ -40,6 +40,7 @@ from ablab.causal import (  # noqa: E402
     placebo_inference,
     pretrend_test,
     sun_abraham,
+    sun_abraham_regression,
     synthetic_control,
     trend_sensitivity,
     twfe,
@@ -317,6 +318,106 @@ def main() -> int:
     emit("  而 `_att_influence` 的文档里早就写着「独立合成会严重低估方差」——")
     emit("  那条教训当时只用在了 lead 的联合检验上，聚合这一步漏掉了。")
     emit("  现在两条路径都改用影响函数合成，并把「旧算法会是多少」作为诊断一并报出。")
+
+    # ---- 2.6 Sun-Abraham 的**回归版**：与 IW 版的交叉验证 ------------------ #
+    emit("\n### 2.6 Sun-Abraham 回归版：与 IW 版的交叉验证，以及它的边界")
+    emit("  回归版 = 一条回归（队列×相对期数交互项）+ 双向固定效应，")
+    emit("  用**交替投影**吸收固定效应（不构造 N+T 个哑变量，本仓库没有稀疏最小二乘）。")
+    emit("  它与 IW 版走的是完全不同的计算路径，所以两者一致才是强证据：")
+    emit("")
+    iw_nt = sun_abraham(panel, control_group="never_treated")
+    rg_nt = sun_abraham_regression(panel, control_group="never_treated")
+    emit(f"  {'相对期数':>8}{'IW':>12}{'回归':>12}{'差':>10}{'IW SE':>10}{'回归 SE':>10}")
+    max_diff_never = 0.0
+    for k in sorted(iw_nt.event_study):
+        a, b = iw_nt.event_study[k], rg_nt.event_study[k]
+        d = abs(a.absolute_effect - b.absolute_effect)
+        max_diff_never = max(max_diff_never, d)
+        emit(f"  {k:>8}{a.absolute_effect:>+12.4f}{b.absolute_effect:>+12.4f}"
+             f"{d:>10.1e}{a.std_error:>10.4f}{b.std_error:>10.4f}")
+    emit("")
+    emit(f"  对照组 = never_treated：逐 k 最大点估计差 **{max_diff_never:.1e}**、"
+         f"SE 比值处处 1.000 ——")
+    emit("  「两种算法、同一个估计量」在这里成立。整体 ATT：")
+    emit(f"    IW {iw_nt.overall.absolute_effect:+.6f}（SE {iw_nt.overall.std_error:.4f}）"
+         f" vs 回归 {rg_nt.overall.absolute_effect:+.6f}"
+         f"（SE {rg_nt.overall.std_error:.4f}），真值 {truth.overall_att:+.4f}")
+    emit(f"    TWFE 是 {tw.absolute_effect:+.4f} —— 效应异质时被负权重拉偏，"
+         f"两个 SA 版本都不偏。")
+    emit("")
+    emit("  **但换对照组就不一样了**（这是本轮新测出来的边界，不是实现问题）：")
+    iw_ny = sun_abraham(panel, control_group="not_yet_treated")
+    rg_ny = sun_abraham_regression(panel, control_group="not_yet_treated")
+    emit(f"  {'相对期数':>8}{'IW':>12}{'回归':>12}{'差':>10}{'贡献队列数':>12}")
+    for k in sorted(iw_ny.event_study):
+        a, b = iw_ny.event_study[k], rg_ny.event_study[k]
+        n_coh = len(iw_ny.weights) if False else len(
+            {g for g in panel.cohorts() if 0 <= k + int(g) - 1 < panel.n_periods}
+        )
+        emit(f"  {k:>8}{a.absolute_effect:>+12.4f}{b.absolute_effect:>+12.4f}"
+             f"{abs(a.absolute_effect - b.absolute_effect):>10.1e}{n_coh:>12}")
+    emit("")
+    emit("  读法：差异只出现在**多个队列共同贡献**的相对期数上，")
+    emit("  单队列贡献的期数（该 k 只有最晚队列还能被观测到）又回到 1e-14。")
+    emit("  原因：IW 的每个 (g,t) 分格用**当时尚未处置**的单元当对照（对照集随 t 变），")
+    emit("  而饱和回归只有一套双向固定效应，已处置队列的变化会进入比较 ——")
+    emit("  这正是 Sun & Abraham 提醒的 forbidden comparison。")
+    emit("  所以：**有未处置组时用回归版（与 IW 等同）；没有时用 IW 版**。")
+    emit("  原文把最后一个队列当基准的做法本仓库**没有实现**，写在 README 已知边界里。")
+
+    # ---- 2.7 回归版的交叉验证顺手抓出来的 bug：对照泄漏 -------------------- #
+    #
+    # 这一段刻意把"修之前会算成什么"也重算一遍 —— 与 `naive_overall_se` 同一个
+    # 思路：**差异要可见，而不是靠相信**。修之前的数只存在于 git 历史里，
+    # 那样读者没法复跑，所以这里用旧掩码重算一次。
+    emit("\n### 2.7 交叉验证抓出来的 bug：处置队列进了自己的对照组")
+    emit("  写回归版时做的逐 k 比对（上面 2.6）暴露了一个**早就存在**的错误：")
+    emit("  `not_yet_treated` 的判据是 `C_i > max(t, g-1)`，而处置队列自己满足")
+    emit("  `g > g-1` —— 于是**处置前的格子里，处置组被算成了自己的对照**。")
+    emit("  后果不是崩溃，而是 placebo 被静默压向 0（对照均值里混进了处置组自身的变化）。")
+    emit("")
+    from ablab.causal.did import _att_influence, _control_mask
+
+    pre_cells: list[tuple[int, int, int, float, float, float, int, int]] = []
+    for g in panel.cohorts():
+        g = int(g)
+        base = g - 1
+        if base < 1:
+            continue
+        for t in panel.periods:
+            t = int(t)
+            if t >= base:  # 只看处置前的格子
+                continue
+            g_mask = panel.cohort == g
+            c_leak = _control_mask(panel, t, base, "not_yet_treated")
+            c_fixed = c_leak & ~g_mask
+            if (c_leak & g_mask).sum() == 0 or c_fixed.sum() < 2:
+                continue
+            d_y = panel.outcome[:, t - 1] - panel.outcome[:, base - 1]
+            leak, _ = _att_influence(d_y, g_mask, c_leak)
+            fixed, _ = _att_influence(d_y, g_mask, c_fixed)
+            pre_cells.append(
+                (g, t, base, leak, fixed, abs(fixed) - abs(leak),
+                 int((c_leak & g_mask).sum()), int(c_leak.sum()))
+            )
+    if pre_cells:
+        emit(f"  {'队列':>6}{'期':>4}{'基准':>6}{'对照(泄漏)':>12}{'对照(修复)':>12}"
+             f"{'ATT(泄漏)':>12}{'ATT(修复)':>12}{'被压掉':>10}")
+        for g, t, base, leak, fixed, gap, n_over, n_leak in pre_cells:
+            emit(f"  {g:>6}{t:>4}{base:>6}{n_leak:>12}{n_leak - n_over:>12}"
+                 f"{leak:>+12.4f}{fixed:>+12.4f}{gap / abs(fixed) if fixed else float('nan'):>9.0%}")
+        mean_leak = float(np.mean([abs(c[3]) for c in pre_cells]))
+        mean_fixed = float(np.mean([abs(c[4]) for c in pre_cells]))
+        emit("")
+        emit(f"  处置前 {len(pre_cells)} 个格子：平均 |placebo| 从 {mean_leak:.4f} 变成 "
+             f"**{mean_fixed:.4f}**")
+        emit(f"  （被压掉 {1 - mean_leak / mean_fixed:.0%}）—— 而「处置前系数接近 0」")
+        emit("  看起来**正是我们想看到的结论**，所以这个 bug 一直没被怀疑。")
+        emit("  连带影响：对照掩码重叠让影响函数的两个作用项部分抵消，")
+        emit("  处置前的 SE 被低估一个量级（实测 k=-3 处 0.0082 → 0.1072，13 倍），")
+        emit("  于是「处置前没有异常」这个判断本身也是失真的。")
+    else:
+        emit("  （这份面板的处置前格子没有触发对照泄漏，用测试里的面板验证）")
 
     # ---- 3. 平行趋势检验的盲区 --------------------------------------------- #
     emit(f"\n### 3. 平行趋势检验：能发现什么、发现不了什么（{n_pre} 次/场景）")

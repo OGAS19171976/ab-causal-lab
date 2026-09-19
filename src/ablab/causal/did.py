@@ -409,11 +409,20 @@ def cs_att_with_influence(
     base: int,
     control_group: ControlGroup = "not_yet_treated",
 ) -> tuple[float, np.ndarray, int, int] | None:
-    """单个 ``ATT(g,t)`` 的点估计与影响函数（联合检验用）。"""
+    """单个 ``ATT(g,t)`` 的点估计与影响函数（联合检验用）。
+
+    **处置队列必须从对照里剔除**（``& ~g_mask``）。在处置前的格子上
+    （``t < g-1``）这一定会发生：``not_yet_treated`` 的判据是
+    ``C_i > max(t, g-1)``，而处置队列自己满足 ``g > g-1``，于是它被算成了
+    "尚未处置"。后果不是崩溃，而是**静默的把 placebo 压向 0** ——
+    对照均值里混进了处置组自身的变化（实测 g=4、t=1 时对照 125 个单元里有
+    75 个就是处置组）。这个 bug 一直藏着，因为"处置前系数接近 0"
+    看起来正是我们想看到的结论 —— 这类"顺眼"的错误最难发现。
+    """
     g_mask = panel.cohort == cohort
     if not g_mask.any():
         return None
-    c_mask = _control_mask(panel, period, base, control_group)
+    c_mask = _control_mask(panel, period, base, control_group) & ~g_mask
     if c_mask.sum() < 2:
         return None
 
@@ -765,6 +774,29 @@ def sun_abraham(
             n_treated=int(total),
         )
 
+    return _aggregate_sa(
+        panel, study, control_group=control_group, alpha=alpha,
+        method="Sun & Abraham (interaction-weighted, aggregated)",
+    )
+
+
+def _aggregate_sa(
+    panel: Panel,
+    study: dict[int, SAEventStudy],
+    *,
+    control_group: ControlGroup,
+    alpha: float,
+    method: str,
+) -> SAResult:
+    """把"逐队列 × 逐相对期数"的分格结果聚合成事件研究与整体 ATT。
+
+    **两个版本（IW 与回归）共用这一份**：聚合规则只有一条 ——
+    每个 ``k`` 上按队列份额加权、影响函数同步加权；整体 ATT 只聚合 ``k >= 0``
+    且按该相对期数上的处置单元数加权。分成两份实现的话，
+    "两个版本点估计应当相同"这件事就会变成"两份代码碰巧一样"。
+
+    ``method`` 只进 ``Estimate.method`` 这个标签，不参与计算。
+    """
     # ---- 事件研究（逐 k，SE 来自该 k 的影响函数） ------------------------- #
     event_study: dict[int, Estimate] = {}
     for k, sa in study.items():
@@ -774,7 +806,7 @@ def sun_abraham(
             metric=f"event_study(k={k})",
             variant="treated",
             control="control",
-            method="Sun & Abraham interaction-weighted event study",
+            method=method,
             absolute_effect=sa.effect,
             relative_effect=float("nan"),
             std_error=se,
@@ -823,7 +855,7 @@ def sun_abraham(
         metric="ATT",
         variant="treated",
         control="control",
-        method="Sun & Abraham (interaction-weighted, aggregated)",
+        method=method,
         absolute_effect=overall_effect,
         relative_effect=float("nan"),
         std_error=overall_se,
@@ -861,9 +893,167 @@ def sun_abraham(
     )
 
 
-# --------------------------------------------------------------------------- #
-# 平行趋势检验
-# --------------------------------------------------------------------------- #
+def _absorb_two_way(
+    values: np.ndarray,
+    unit_idx: np.ndarray,
+    time_idx: np.ndarray,
+    n_units: int,
+    n_times: int,
+    *,
+    tol: float = 1e-12,
+    max_iter: int = 500,
+) -> np.ndarray:
+    """用**交替投影**吸收双向固定效应，返回残差。
+
+    为什么不用"加哑变量 + 最小二乘"：N+T 个哑变量会让设计矩阵变成
+    ``(N·T) × (N+T+K)``，面板一大就直接爆掉（本仓库没有稀疏最小二乘，
+    这也是回归版一直没做的原因）。交替投影每次迭代只要两次分组均值，
+    复杂度与面板大小成线性。
+
+    平衡面板下它收敛很快；非平衡面板同样可用（分组均值按各组的实际观测数算）。
+    """
+    resid = values.astype(float, copy=True)
+    resid -= resid.mean()
+    for _ in range(max_iter):
+        cnt_u = np.bincount(unit_idx, minlength=n_units).astype(float)
+        mu = np.bincount(unit_idx, weights=resid, minlength=n_units) / cnt_u
+        resid -= mu[unit_idx]
+        cnt_t = np.bincount(time_idx, minlength=n_times).astype(float)
+        mt = np.bincount(time_idx, weights=resid, minlength=n_times) / cnt_t
+        resid -= mt[time_idx]
+        if np.max(np.abs(mu)) < tol and np.max(np.abs(mt)) < tol:
+            break
+    return resid
+
+
+def sun_abraham_regression(
+    panel: Panel,
+    *,
+    control_group: ControlGroup = "not_yet_treated",
+    min_k: int | None = None,
+    max_k: int | None = None,
+    alpha: float = 0.05,
+) -> SAResult:
+    """Sun & Abraham (2021) 的**回归版**：一条回归 + 队列×相对期数交互项 + 双向固定效应。
+
+    估计方程（省略基准期 ``k = -1``）：:
+
+        Y_it = α_i + λ_t + Σ_g Σ_{k ≠ -1} δ_{g,k} · 1{G_i = g, t - g = k} + ε_it
+
+    ``δ_{g,k}`` 就是"队列 g 在相对期数 k"的效应，聚合规则与 IW 版**完全相同**
+    （共用 ``_aggregate_sa``）。
+
+    **与 IW 版的关系（实测，别把结论说过头）**：
+
+    * 用 ``control_group="never_treated"`` 时，两者**逐位相同**：点估计差
+      1e-14 量级、SE 比值 1.000、聚合权重完全一致。此时"两种算法、同一个
+      估计量"成立，这也是本仓库能给出的最强交叉验证（两条计算路径完全不同：
+      逐 2×2 加权 vs 吸收双向固定效应后的一条回归）。
+    * 用 ``control_group="not_yet_treated"`` 时**两者不同**，而且不是噪音：
+      实测在 cohorts=(3,5,7)、n_periods=10 的面板上，k<=3（多队列共同贡献）
+      的点估计差最大 0.17（该格 IW 的 SE 是 0.086），而 k>=4（只有单队列贡献）
+      的差又回到 1e-14。原因：IW 的每个 ``(g,t)`` 分格用**当时尚未处置**的
+      单元当对照（对照集随 t 变），而饱和回归只有一套双向固定效应，
+      已处置队列的变化会进入比较 —— 这正是 Sun & Abraham 提醒的
+      "forbidden comparison"。
+
+    所以这一版的定位是**可核对的回归形式**：有未处置组时它给出与 IW 等同的结果，
+    没有未处置组时应当用 IW 版（或者像原文那样把最后一个队列当基准，
+    本仓库**没有实现**那一步，理由写在 README 的已知边界里）。
+
+    实现要点：
+
+    * 双向固定效用**交替投影**吸收（``_absorb_two_way``），不构造 N+T 个哑变量；
+    * 设计矩阵一起被吸收（Frisch-Waugh-Lovell），系数由吸收后的回归给出；
+    * 标准误按**单元聚类**：``ψ_i = (X̃'X̃)^{-1} Σ_t X̃_it·û_it``，
+      与 IW 版的影响函数是同一个东西，所以聚合时可以直接相加；
+    * 空分格（该队列在该相对期数没有观测）不进入设计矩阵 —— 否则会得到一个
+      恒等于 0 的伪系数，还会把权重算错。
+    """
+    n_units, n_periods = panel.n_units, panel.n_periods
+    periods = np.asarray(panel.periods)
+    unit_idx = np.repeat(np.arange(n_units), n_periods)
+    time_idx = np.tile(np.arange(n_periods), n_units)
+    y_long = panel.outcome.reshape(-1)
+
+    # ---- 设计矩阵：队列 × 相对期数（去掉基准期 k=-1） --------------------- #
+    cols: list[np.ndarray] = []
+    keys: list[tuple[int, int]] = []
+    n_by_key: dict[tuple[int, int], int] = {}
+    for g in panel.cohorts():
+        g = int(g)
+        if g - 1 < 1:  # 基准期不存在（队列在面板第一期中就被处置）
+            continue
+        for t in periods:
+            t = int(t)
+            k = t - g
+            if k == -1:  # 基准期：系数被归一化为 0
+                continue
+            if min_k is not None and k < min_k:
+                continue
+            if max_k is not None and k > max_k:
+                continue
+            mask = (panel.cohort == g)[unit_idx] & (periods[time_idx] == t)
+            n_g = int(mask.sum())
+            if n_g == 0:
+                continue  # 空分格：会给一个恒为 0 的伪系数
+            cols.append(mask.astype(float))
+            keys.append((g, k))
+            n_by_key[(g, k)] = n_g
+
+    if not cols:
+        raise ValueError("没有任何可估计的分格，检查队列设置与对照组选择")
+
+    design = np.column_stack(cols)
+    design_abs = np.column_stack(
+        [
+            _absorb_two_way(design[:, j], unit_idx, time_idx, n_units, n_periods)
+            for j in range(design.shape[1])
+        ]
+    )
+    y_abs = _absorb_two_way(y_long, unit_idx, time_idx, n_units, n_periods)
+
+    xtx_inv = np.linalg.pinv(design_abs.T @ design_abs)
+    coef = xtx_inv @ (design_abs.T @ y_abs)
+    resid = y_abs - design_abs @ coef
+
+    # ---- 影响函数（按单元聚类）：ψ_i = n·(X̃'X̃)^{-1} Σ_t X̃_it·û_it ------- #
+    #
+    # 为什么要乘 n：`_se_from_influence` 用的是**均值型**约定
+    # （``se = sqrt(Var(ψ)/n)``，对应"ψ 是单个单元对估计量的贡献"）。
+    # 回归系数的聚类稳健方差是 ``Σ_i ψ_i²``（ψ 未乘 n 时），
+    # 两者差一个 n：不乘 n 的话 SE 会被低估约 n 倍 —— 实测差了 400 倍
+    # （0.0001 vs 0.0431），这正是"看起来很小很漂亮"的那类错误。
+    # 乘 n 之后 ``sqrt(Var(n·ψ)/n) = sqrt(n/(n-1)·Σψ²)``，与聚类稳健方差一致
+    # （均值恰好为 0：正规方程给出 X̃'û = 0）。
+    weighted = design_abs * resid[:, None]
+    meat = np.zeros((n_units, design.shape[1]))
+    for j in range(design.shape[1]):
+        meat[:, j] = np.bincount(unit_idx, weights=weighted[:, j], minlength=n_units)
+    psi_matrix = (meat @ xtx_inv) * n_units  # (n_units, n_coef)
+
+    # ---- 按 k 聚合（与 IW 版同一套规则：队列份额加权、影响函数同步加权） --- #
+    by_k: dict[int, list[int]] = {}
+    for j, (_g, k) in enumerate(keys):
+        by_k.setdefault(k, []).append(j)
+
+    study: dict[int, SAEventStudy] = {}
+    for k, idxs in sorted(by_k.items()):
+        total = float(sum(n_by_key[keys[j]] for j in idxs))
+        weights = {keys[j][0]: n_by_key[keys[j]] / total for j in idxs}
+        effect = float(sum(weights[keys[j][0]] * coef[j] for j in idxs))
+        psi = np.zeros(n_units)
+        for j in idxs:
+            psi = psi + weights[keys[j][0]] * psi_matrix[:, j]
+        study[k] = SAEventStudy(
+            k=k, effect=effect, influence=psi, weights=weights,
+            n_treated=int(total),
+        )
+
+    return _aggregate_sa(
+        panel, study, control_group=control_group, alpha=alpha,
+        method="Sun & Abraham (regression, aggregated)",
+    )
 def event_study_leads(
     panel: Panel,
     *,

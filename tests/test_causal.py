@@ -321,6 +321,182 @@ class TestSunAbraham:
         assert set(sa.event_study) <= {-2, -1, 0, 1, 2}
         assert set(sa.weights) <= {0, 1, 2}  # 整体 ATT 只聚合 k>=0
 
+    def test_treated_cohort_never_serves_as_its_own_control(self):
+        """**处置队列不能进自己的对照组** —— 这条钉的是一个真出现过的 bug。
+
+        ``not_yet_treated`` 的判据是 ``C_i > max(t, g-1)``，而处置队列自己满足
+        ``g > g-1``；于是**处置前的格子里**（``t < g-1``）它被算成"尚未处置"。
+        后果不是崩溃，而是 placebo 被静默压向 0（对照均值里混进了处置组自身的
+        变化）。实测（g=4、t=1）：对照从 125 个（其中 75 个是处置组）
+        修成 50 个，placebo 从 +0.0615 变成 +0.1537。
+
+        这个 bug 之所以藏得住，恰恰因为"处置前系数接近 0"看起来正是我们
+        想看到的结论 —— 顺眼的错误最难发现，所以要用结构断言钉住。
+        """
+        from ablab.causal.did import _control_mask, cs_att_with_influence
+
+        cfg = StaggeredPanelConfig(
+            n_units=200, n_periods=7, cohorts=(2, 4), cohort_weights=(0.5, 0.5),
+            never_treated_share=0.25, effects=(1.0, 2.0, 3.0, 4.0), seed=5,
+        )
+        panel, _ = generate_staggered_panel(cfg)
+        g_mask = panel.cohort == 4
+        # 处置前的格子：t=1、基准期 g-1=3
+        raw = _control_mask(panel, 1, 3, "not_yet_treated")
+        assert (raw & g_mask).sum() > 0, "这个面板本应能触发重叠，无法验证修复"
+        out = cs_att_with_influence(panel, 4, 1, 3, "not_yet_treated")
+        assert out is not None
+        # 修复后：对照只应当剩未处置组（50 个），且与处置组不相交
+        c_used = _control_mask(panel, 1, 3, "not_yet_treated") & ~g_mask
+        assert (c_used & g_mask).sum() == 0
+        assert c_used.sum() == int(panel.never_treated_units.sum())
+        # placebo 不再被压向 0：明显大于修复前的电平
+        assert abs(out[0]) > 0.10, out[0]
+
+
+class TestSunAbrahamRegression:
+    """Sun-Abraham 的**回归版**（一条回归 + 队列×相对期数 + 双向固定效应）。
+
+    它的价值不在"再多一个估计量"，而在**交叉验证**：IW 版走的是逐 2×2 再加权，
+    回归版走的是吸收双向固定效应后的一条回归 —— 两条完全不同的计算路径，
+    在饱和设定下必须给出同一个数。实测逐 k 点估计最大差 **9.8e-15**、
+    SE 比值处处 1.000。任何一边写错，这个比对都会立刻炸。
+    """
+
+    @staticmethod
+    def _both(control_group: str = "never_treated"):
+        from ablab.causal import sun_abraham_regression
+
+        panel, truth = generate_staggered_panel(HEADLINE)
+        return (
+            panel,
+            truth,
+            sun_abraham(panel, control_group=control_group),  # type: ignore[arg-type]
+            sun_abraham_regression(panel, control_group=control_group),  # type: ignore[arg-type]
+        )
+
+    def test_regression_matches_interaction_weighted(self):
+        """**有未处置组时**两条路径的点估计、标准误、权重都应当一致。
+
+        容差取得很紧（点估计 1e-9、SE 相对 1e-6）是有意的：它们不是"近似相同"，
+        而是**同一个估计量的两种算法**，松容差就失去交叉验证的意义了。
+        """
+        _panel, _truth, iw, rg = self._both("never_treated")
+        assert set(iw.event_study) == set(rg.event_study)
+        for k in iw.event_study:
+            assert rg.event_study[k].absolute_effect == pytest.approx(
+                iw.event_study[k].absolute_effect, abs=1e-9
+            ), k
+            assert rg.event_study[k].std_error == pytest.approx(
+                iw.event_study[k].std_error, rel=1e-6
+            ), k
+        assert rg.overall.absolute_effect == pytest.approx(
+            iw.overall.absolute_effect, abs=1e-9
+        )
+        assert rg.overall.std_error == pytest.approx(iw.overall.std_error, rel=1e-6)
+        assert set(rg.weights) == set(iw.weights)
+        for k in iw.weights:
+            assert rg.weights[k] == pytest.approx(iw.weights[k], abs=1e-12)
+
+    def test_without_never_treated_the_two_versions_differ_and_why(self):
+        """**没有未处置组时两者不同** —— 这条比"相同"更重要，因为它说明了边界。
+
+        IW 的每个分格用"当时尚未处置"的单元当对照（对照集随 t 变），
+        饱和回归只有一套双向固定效应，已处置队列的变化会进入比较。
+        实测（cohorts=(3,5,7)、n_periods=10、600 单元）：
+          * 多队列共同贡献的相对期数（k<=3）差最大 0.17（IW 的 SE 是 0.086）；
+          * 只有单队列贡献的（k>=4）差回到 1e-14 —— 那时没有"别人"可混进来。
+
+        所以断言的是**这个模式**，而不是"两者应当相同"：后者是错的声明。
+        """
+        from ablab.causal import sun_abraham_regression
+
+        cfg = StaggeredPanelConfig(
+            n_units=600, n_periods=10, cohorts=(3, 5, 7),
+            cohort_weights=(0.25, 0.25, 0.25), never_treated_share=0.25,
+            effects=(1.0, 2.0, 3.0, 3.0, 3.0), noise_sd=1.0, seed=5,
+        )
+        panel, _ = generate_staggered_panel(cfg)
+        iw = sun_abraham(panel, control_group="not_yet_treated")
+        rg = sun_abraham_regression(panel, control_group="not_yet_treated")
+        diffs = {
+            k: abs(iw.event_study[k].absolute_effect - rg.event_study[k].absolute_effect)
+            for k in iw.event_study
+        }
+        multi = [k for k in diffs if k <= 3]
+        single = [k for k in diffs if k >= 4]
+        assert multi and single
+        assert max(diffs[k] for k in single) < 1e-9, {k: diffs[k] for k in single}
+        assert max(diffs[k] for k in multi) > 1e-3, {k: diffs[k] for k in multi}
+
+    def test_influence_scaling_is_not_degenerate(self):
+        """回归版的影响函数**必须按均值型约定缩放**（乘 n）。
+
+        第一版漏了这一步，整体 ATT 的 SE 报成 0.0001（正确值 0.0431）——
+        差 400 倍，而且方向是"看起来更显著"。这条断言钉住量级：
+        它与 IW 版同阶、且大于独立合成的反保守值。
+        """
+        _panel, _truth, iw, rg = self._both("never_treated")
+        ratio = rg.overall.std_error / iw.overall.std_error
+        assert 0.5 < ratio < 2.0, ratio
+        assert rg.naive_overall_se < rg.overall.std_error
+        assert rg.se_understatement > 0.2, rg.se_understatement
+
+    def test_absorption_removes_two_way_fixed_effects(self):
+        """交替投影真的把双向固定效应吸掉了：纯 FE 的向量残差应当≈0。
+
+        这是回归版的**地基**：吸收不干净，``δ`` 就会被固定效应污染，
+        而面板上的固定效应恰好与队列相关（队列效应 + 时间趋势）。
+
+        第二条断言用**理论预期**而不是拍一个阈值：双向吸收会吃掉
+        ``(N + T - 1)/(N·T)`` 那部分自由度，所以保留下来的噪音方差应当约为
+        ``1 - (N+T-1)/(N·T)``。第一版把阈值写成"相关 > 0.99"，
+        那是把吸收当成了"只碰固定效应、不碰噪音"—— 实测 0.930，
+        与理论值 0.9276 吻合，是阈值错了而不是实现错了。
+        """
+        import numpy as np
+
+        from ablab.causal.did import _absorb_two_way
+
+        rng = np.random.default_rng(0)
+        n_units, n_times = 60, 8
+        u = np.repeat(np.arange(n_units), n_times)
+        t = np.tile(np.arange(n_times), n_units)
+        unit_fe = rng.normal(0, 2.0, n_units)
+        time_fe = rng.normal(0, 1.5, n_times)
+        pure_fe = unit_fe[u] + time_fe[t]
+        resid = _absorb_two_way(pure_fe, u, t, n_units, n_times)
+        assert np.max(np.abs(resid)) < 1e-8, np.max(np.abs(resid))
+
+        noise = rng.normal(0, 1.0, pure_fe.size)
+        resid2 = _absorb_two_way(pure_fe + noise, u, t, n_units, n_times)
+        corr = float(np.corrcoef(resid2, noise)[0, 1])
+        expected = float(np.sqrt(1.0 - (n_units + n_times - 1) / (n_units * n_times)))
+        assert abs(corr - expected) < 0.05, (corr, expected)
+        # 残差里不能剩下固定效应：与两个固定效应都应当基本不相关
+        assert abs(np.corrcoef(resid2, unit_fe[u])[0, 1]) < 0.05
+        assert abs(np.corrcoef(resid2, time_fe[t])[0, 1]) < 0.05
+
+    def test_regression_fixes_twfe_bias_under_heterogeneous_dynamics(self):
+        """效应异质时 TWFE 会偏（负权重），回归版不会 —— 这是它存在的理由。
+
+        实测（HEADLINE 面板）：真值 +2.5000，TWFE +2.0086（偏 -0.49），
+        回归版 +2.5585（偏 +0.06）。断言用"误差小一个量级"，不写死具体数。
+        """
+        panel, truth, _iw, rg = self._both()
+        tw = twfe(panel)
+        reg_err = abs(rg.overall.absolute_effect - truth.overall_att)
+        twfe_err = abs(tw.absolute_effect - truth.overall_att)
+        assert reg_err < twfe_err / 3, (reg_err, twfe_err)
+
+    def test_min_max_k_filters_periods(self):
+        from ablab.causal import sun_abraham_regression
+
+        panel, _ = generate_staggered_panel(HEADLINE)
+        rg = sun_abraham_regression(panel, min_k=-2, max_k=2)
+        assert set(rg.event_study) <= {-2, -1, 0, 1, 2}
+        assert set(rg.weights) <= {0, 1, 2}
+
     def test_event_study_se_uses_influence_too(self):
         """事件研究的聚合也改用影响函数了 —— 但它的影响**很小，而且符号不定**。
 
@@ -745,11 +921,40 @@ class TestSensitivity:
         assert sens.scale > 0
 
     def test_summary_warns_about_exploding_ratio(self):
-        """处置前平坦时比值会爆炸 —— 摘要必须把这件事说清楚。"""
+        """比值爆炸时必须给出警告 —— 但这条测试原来是**照着 bug 写的**。
+
+        它原先用 HEADLINE 面板做集成断言，理由是"处置前平坦时比值会爆炸"。
+        实测（对照泄漏 bug 修复后）：同一面板的比值从 **467.7 变成 4.26** ——
+        因为泄漏把处置前系数压向了 0，分母虚小、比值虚大，
+        于是那条"这个数不可用"的告警是被 bug 触发的。
+        所以这里改成**直接测分支语义**（构造三个比值），
+        集成层面只保留"能给出有限比值与翻转点"这一条不会漂移的断言。
+        """
+        from ablab.causal.sensitivity import TrendSensitivity
+
+        def make(pretrend: float) -> TrendSensitivity:
+            return TrendSensitivity(
+                att=2.0, breakdown_delta=0.7, pretrend_delta=pretrend,
+                scale=2.4, n_post_coefs=6, n_pre_coefs=2,
+            )
+
+        # 处置前趋势可测 → 给数值，不给警告
+        normal = make(0.15).summary()
+        assert "与处置前趋势之比" in normal
+        assert "不可用" not in normal
+        # 处置前近乎平坦 → 比值爆炸，必须显式说"这个数不可用"
+        exploding = make(0.0015).summary()
+        assert "不可用" in exploding
+        # 处置前为 0 → 比值无定义，也要说清楚，而不是印一个 inf
+        undefined = make(0.0).summary()
+        assert "无定义" in undefined and "inf" not in undefined
+
+    def test_sensitivity_is_finite_on_the_headline_panel(self):
         panel, _ = generate_staggered_panel(HEADLINE)
-        text = trend_sensitivity(callaway_santanna(panel), panel).summary()
-        assert "翻转点" in text
-        assert "不可用" in text or "比值" in text
+        sens = trend_sensitivity(callaway_santanna(panel), panel)
+        assert "翻转点" in sens.summary()
+        assert np.isfinite(sens.breakdown_delta)
+        assert sens.n_pre_coefs > 0
 
 
 # --------------------------------------------------------------------------- #
