@@ -81,7 +81,9 @@ CLAIMS: list[tuple[str, str, str]] = [
     ("数仓·比值：负对照也显著（诚实记下）", "warehouse_report.md", "0.739366"),
     ("数仓·比值：末次查看 == 主结论", "warehouse_report.md", "末次查看 == 主结论：True"),
     ("治理：审计删不掉", "governance_report.md", "append-only"),
-    ("治理：护栏未分析", "governance_report.md", "尚不分析护栏指标"),
+    # 原"治理：护栏未分析"这条已删除：护栏现在**真的**会被判定，
+    # 报告里不再有"尚不分析"这句话。改成钉"判定规则"本身。
+    ("治理：护栏判定含停实验建议", "governance_report.md", "判定规则"),
     # 身份与审计操作者（静态 token）：用户 id 与角色是稳定的字符串，可以进清单
     ("治理·身份：静态 token + 角色", "governance_report.md", "静态 token"),
     ("治理·身份：凭据只存哈希", "governance_report.md", "sha256"),
@@ -89,6 +91,10 @@ CLAIMS: list[tuple[str, str, str]] = [
     # 并发（乐观锁）：文本类声明 —— 版本号随操作次数变，不把数字写进清单
     ("治理·并发：丢失更新已可见", "governance_report.md", "丢失更新"),
     ("治理·并发：冲突返回 412", "governance_report.md", "412"),
+    # 护栏：真的判定（文本类；数值随 n_users 变，不写进清单）
+    ("治理·护栏：越界建议停实验", "governance_report.md", "建议停止实验"),
+    ("治理·护栏：缺数据不等于通过", "governance_report.md", "不是通过"),
+    ("治理·护栏：方向不从名字猜", "governance_report.md", "不从指标名猜"),
 ]
 
 

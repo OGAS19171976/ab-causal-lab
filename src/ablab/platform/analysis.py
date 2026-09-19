@@ -559,31 +559,40 @@ def analyse_data(data: ExperimentData, *, alpha: float = 0.05) -> ExperimentRepo
             statistic=mde_abs,
         )
     )
-    # ---- 护栏指标：**声明了但本平台不分析**，这件事必须说出来 --------------- #
+    # ---- 护栏指标：**真的判定它们**（这一块原来是"声明了但没人看"） ---------- #
     #
-    # 这是"把静默变成显式"的一个实例。``guardrails`` 字段一直存在、界面上也显示了，
-    # 而引擎从头到尾没读过它 —— 于是用户合理地以为护栏被看着。
-    # 真正的解法不是"假装分析"（数据模型里只有一个主指标，护栏需要另建一张指标表），
-    # 而是在报告里**明说没分析**，并说清为什么。
+    # 历史：``guardrails`` 字段一直存在、界面上也显示了，而引擎从头到尾没读过它 ——
+    # 于是用户合理地以为护栏被看着。当时（正确地）选择"明说没分析"而不是假装分析。
+    # 现在有了数据模型（每个护栏一条按臂的充分统计量）与**事先声明的方向与容忍度**，
+    # 于是可以真的判定：``fail`` 意味着"有把握地越过容忍度"，进 health，
+    # 并在报告里给出**建议停止实验** —— Kohavi 那本书里护栏触发是停实验的理由，
+    # 不是参考信息。
     #
-    # 状态取 ``info`` 而不是 ``warn``：``health`` 的含义是"**这一次**运行有没有
-    # 需要你看一眼的东西"，而护栏未接入是**平台级**缺口 —— 它跟这批数据没关系，
-    # 声明了护栏的每一个实验都会永远 warn。那正是第 31 条那条教训：
-    # **一条永远亮的告警等于没有告警**，久了 health 就没人看了。
-    # 所以信息要**显式**（这条检查永远在报告里），但不占用"这次运行有问题"这个信号。
-    if data.guardrails:
+    # 三种"未知"必须分开说，因为它们的补救办法完全不同：
+    #   1. 声明了名字但没声明方向/容忍度 -> 让人去补声明；
+    #   2. 声明了规格但没有数据（数仓路径还没有护栏表）-> 让人去接数据；
+    #   3. 什么都没声明 -> 不出现这一项。
+    # 三者的共同点是：**都不是"通过"**。
+    declared_specs = list(getattr(data, "guardrail_specs", ()) or ())
+    declared_names = list(data.guardrails or ())
+    if declared_specs or declared_names:
+        from .guardrails import GuardrailSpec, analyse_guardrails
+
+        have = {s.name for s in declared_specs}
+        bare = [GuardrailSpec(name=n) for n in declared_names if n not in have]
+        guard = analyse_guardrails(
+            [*declared_specs, *bare],
+            dict(getattr(data, "guardrail_series", {}) or {}),
+            treated=data.treated,
+            control=data.control,
+            alpha=alpha,
+        )
         checks.append(
             CheckItem(
                 name="护栏指标",
-                status="info",
-                message=(
-                    f"已声明 {len(data.guardrails)} 个护栏：{'、'.join(data.guardrails)}；"
-                    "**本平台尚不分析护栏指标** —— 数据模型只有主指标一条时间序列，"
-                    "护栏需要在数仓里另建指标表。"
-                    "也就是说：这批护栏**目前没有任何东西在看着**，"
-                    "主结论显著不代表可以上线。"
-                ),
-                statistic=float(len(data.guardrails)),
+                status=guard.check_status,
+                message=guard.summary() + "  " + _guardrail_explainer(guard),
+                statistic=float(guard.n_declared),
             )
         )
 
@@ -661,6 +670,7 @@ def analyse_experiment(
         primary_estimator=record.estimator,
         analysis_unit=record.analysis_unit,
         metric_type=record.metric_type,
+        guardrail_specs=tuple(record.guardrail_specs),
     )
     data = _with_record_metadata(data, record)
     return analyse_data(data, alpha=alpha)
@@ -705,6 +715,29 @@ def analyse_experiment_from_warehouse(
     return analyse_data(data, alpha=alpha)
 
 
+def _guardrail_explainer(guard) -> str:
+    """把"为什么是未知"写到读者能照做 —— 三种未知的补救办法完全不同。"""
+    if guard.verdict == "stop":
+        return (
+            "**这是停实验的理由**：护栏触发不是参考信息。"
+            "注意判定用的是伤害的**置信下界**超过事先声明的容忍度，"
+            "而且多条护栏做了 Bonferroni 校正（alpha/K）—— "
+            "宁可少报几条，也不要因为多看几个指标就误停一次实验。"
+        )
+    if guard.verdict == "watch":
+        return "点估计超了但证据不足，继续观察；攒够样本再看一次。"
+    if guard.verdict == "unknown":
+        return (
+            "**这不是通过**。补救办法：只有名字的护栏要补 direction + max_harm；"
+            "有规格但没数据的（例如数仓路径还没有护栏表）要先接数据。"
+            "缺数据时判通过会让人以为护栏被看着 —— 那正是这一块原来的毛病。"
+        )
+    return (
+        f"全部护栏在容忍度内（{guard.n_analysed} 条可判定，"
+        f"校正后 alpha={guard.outcomes[0].alpha_adjusted if guard.outcomes else float('nan'):.4f}）。"
+    )
+
+
 def _with_record_metadata(data: ExperimentData, record: ExperimentRecord) -> ExperimentData:
     """把注册表里的展示字段带进数据对象（报告的标题栏要用）。
 
@@ -716,6 +749,7 @@ def _with_record_metadata(data: ExperimentData, record: ExperimentRecord) -> Exp
     return _replace(
         data,
         guardrails=tuple(record.guardrails or ()),
+        guardrail_specs=tuple(record.guardrail_specs or ()),
         extra={
             **data.extra,
             "experiment_id": record.id,

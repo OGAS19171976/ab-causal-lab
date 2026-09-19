@@ -244,6 +244,14 @@ class ExperimentData:
     #: 护栏需要另建一张指标表；在那之前，"存了字段、界面显示了、引擎没读过"
     #: 会让用户以为护栏被看着 —— 那是静默的不作为，比缺功能危险。
     guardrails: tuple[str, ...] = ()
+    #: 护栏的**声明**（方向 + 容忍度）。名字在 ``guardrails`` 里、规格在这里 ——
+    #: 只有名字没有规格时，护栏分析会判 ``unknown``（"没声明"不等于"通过"）。
+    guardrail_specs: tuple[Any, ...] = ()
+    #: 护栏的实测数据：``{护栏名: {臂名: AggregateStats}}``。
+    #: 与主指标同一套可加充分统计量，所以护栏走同一套推断（Welch）。
+    #: 数仓路径暂时给不出它（没有护栏表），于是那些护栏会被判 ``unknown`` ——
+    #: 这是有意的：**缺数据时假装通过**是这一整块最危险的事。
+    guardrail_series: dict[str, dict[str, Any]] = field(default_factory=dict)
     extra: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -336,6 +344,7 @@ def build_synthetic_data(
     primary_estimator: str = "cuped",
     analysis_unit: str = "unit",
     metric_type: str = "mean",
+    guardrail_specs: tuple[Any, ...] = (),
 ) -> ExperimentData:
     """按 salt 确定性生成合成数据，并给出按**随机进入顺序**的嵌套查看。
 
@@ -427,10 +436,60 @@ def build_synthetic_data(
         analysis_unit="unit",
         metric_type="mean",
         true_lift=float(true_lift),
+        guardrail_specs=tuple(guardrail_specs),
+        guardrail_series=_synthetic_guardrails(
+            specs=guardrail_specs,
+            treated=treated,
+            control=control,
+            treated_name=treated_name,
+            control_name=control_name,
+            seed=seed + 3,
+        ),
         extra={"salt": salt, "n_users": int(n_users)},
     )
     data.validate()
     return data
+
+
+def _synthetic_guardrails(
+    *,
+    specs: tuple[Any, ...],
+    treated: "np.ndarray",
+    control: "np.ndarray",
+    treated_name: str,
+    control_name: str,
+    seed: int,
+) -> dict[str, dict[str, Any]]:
+    """按声明合成护栏数据。
+
+    每个护栏一族取值：基准均值取 1.0（量纲无所谓，判定看的是**相对伤害**），
+    噪声相对标准差 5%。``demo_harm`` 是**演示专用**的真实伤害
+    （与主指标的 ``true_lift`` 同一个性质）：把它设成 0.12，这条护栏在处置组
+    就会真的劣化 12%，于是"护栏触发 -> 建议停实验"这条链路能被真跑出来。
+
+    方向的处理：``demo_harm`` 永远表示**伤害**，所以
+    ``higher_is_better`` 的护栏把伤害注入成"变低"。
+    """
+    from ..inference.aggregates import AggregateStats
+
+    if not specs:
+        return {}
+    rng = np.random.default_rng(seed)
+    out: dict[str, dict[str, Any]] = {}
+    for spec in specs:
+        name = getattr(spec, "name", str(spec))
+        direction = getattr(spec, "direction", "") or "lower_is_better"
+        harm = float(getattr(spec, "demo_harm", 0.0) or 0.0)
+        sign = 1.0 if direction == "lower_is_better" else -1.0
+        control_values = rng.normal(1.0, 0.05, int(control.sum()))
+        treated_values = rng.normal(1.0 + sign * harm, 0.05, int(treated.sum()))
+        # 键必须是**真实变体名**：分析层是按 data.treated / data.control 查的，
+        # 写死成 "treated"/"control" 会让所有护栏都判成"没有数据"（实测踩过）。
+        out[name] = {
+            treated_name: AggregateStats.from_arrays(treated_values),
+            control_name: AggregateStats.from_arrays(control_values),
+        }
+    return out
 
 
 def _synthetic_ratio(

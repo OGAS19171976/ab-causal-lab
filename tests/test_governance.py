@@ -412,6 +412,208 @@ class TestAuthAndActor:
             reg.close()
 
 
+class TestGuardrailAnalysis:
+    """护栏：**真的判定**，并且把"无法判断"与"通过"严格分开。
+
+    这一块原来的毛病不是缺功能，而是"字段存了、界面显示了、引擎没读过"——
+    用户合理地以为护栏被看着。所以测试的重点不在"能不能算出一个数"，
+    而在三件事：**越界要能触发停实验**、**缺声明/缺数据不能被当成通过**、
+    **判定用的是置信下界而不是点估计**。
+    """
+
+    @staticmethod
+    def _series(name: str, values_t, values_c):
+        """按**规格里的名字**建键 —— 名字对不上会被判成"没有数据"（这很常见）。"""
+        import numpy as np
+
+        from ablab.inference.aggregates import AggregateStats
+
+        return {
+            name: {
+                "control": AggregateStats.from_arrays(np.asarray(values_c, dtype=float)),
+                "treatment": AggregateStats.from_arrays(np.asarray(values_t, dtype=float)),
+            }
+        }
+
+    def _run(self, spec, treated_values, control_values):
+        from ablab.platform.guardrails import analyse_guardrails
+
+        return analyse_guardrails(
+            [spec],
+            self._series(spec.name, treated_values, control_values),
+            treated="treatment",
+            control="control",
+        )
+
+    def test_harm_beyond_tolerance_triggers_stop(self):
+        """伤害的**置信下界**越过容忍度 -> fail + 建议停实验 + check 状态 fail。"""
+        import numpy as np
+
+        from ablab.platform.guardrails import GuardrailSpec
+
+        rng = np.random.default_rng(0)
+        spec = GuardrailSpec("latency_p99", "lower_is_better", 0.05)
+        report = self._run(
+            spec,
+            rng.normal(1.20, 0.05, 4000),  # +20% 延迟
+            rng.normal(1.00, 0.05, 4000),
+        )
+        assert report.verdict == "stop"
+        assert report.check_status == "fail"
+        assert "停止实验" in report.recommendation
+        outcome = report.outcomes[0]
+        assert outcome.status == "fail"
+        assert outcome.harm > 0.15
+        assert outcome.harm_ci_low > spec.max_harm
+        assert outcome.p_value < 0.01
+
+    def test_no_harm_passes_and_direction_matters(self):
+        """方向决定"伤害"的正负号 —— 越高越好的指标变低也是伤害。"""
+        import numpy as np
+
+        from ablab.platform.guardrails import GuardrailSpec
+
+        rng = np.random.default_rng(1)
+        # 收入类指标（越高越好）：处置组变低 20% 就是伤害
+        report = self._run(
+            GuardrailSpec("revenue_per_user", "higher_is_better", 0.05),
+            rng.normal(0.80, 0.02, 4000),
+            rng.normal(1.00, 0.02, 4000),
+        )
+        assert report.verdict == "stop"
+        assert report.outcomes[0].harm > 0.15  # 伤害是正的（变低被折算成正伤害）
+        # 同一个数据，方向写反 -> 伤害变成负数 -> 通过（所以方向绝不能猜）
+        reversed_report = self._run(
+            GuardrailSpec("revenue_per_user", "lower_is_better", 0.05),
+            rng.normal(0.80, 0.02, 4000),
+            rng.normal(1.00, 0.02, 4000),
+        )
+        assert reversed_report.verdict == "ok"
+
+    def test_point_estimate_over_limit_is_only_a_warning(self):
+        """点估计超了、但置信下界没超 -> ``warn``（继续观察），不停实验。
+
+        这条是把"停机"这个动作做保守的关键：否则样本少的时候会频繁误停。
+        """
+        import numpy as np
+
+        from ablab.platform.guardrails import GuardrailSpec
+
+        rng = np.random.default_rng(2)
+        report = self._run(
+            GuardrailSpec("latency_p99", "lower_is_better", 0.05),
+            rng.normal(1.06, 0.20, 60),  # 点估计 +6%，但噪声大、样本小
+            rng.normal(1.00, 0.20, 60),
+        )
+        assert report.outcomes[0].status == "warn", report.summary()
+        assert report.verdict == "watch"
+        assert report.check_status == "warn"
+
+    def test_missing_spec_is_warn_missing_data_is_info(self):
+        """两种"无法判断"要分开，因为补救办法不同 —— 而且都**不是通过**。"""
+        from ablab.platform.guardrails import GuardrailSpec, analyse_guardrails
+
+        bare = analyse_guardrails(
+            [GuardrailSpec("latency_p99")], {}, treated="treatment", control="control"
+        )
+        assert bare.verdict == "unknown"
+        assert bare.missing_specs and not bare.missing_data
+        assert bare.check_status == "warn"  # 这一次就能补：direction + max_harm
+        assert "补上声明" in bare.recommendation
+
+        no_data = analyse_guardrails(
+            [GuardrailSpec("latency_p99", "lower_is_better", 0.05)],
+            {},
+            treated="treatment",
+            control="control",
+        )
+        assert no_data.verdict == "unknown"
+        assert no_data.missing_data and not no_data.missing_specs
+        assert no_data.check_status == "info"  # 平台级缺口，不该永远 warn
+        assert "不等于通过" in no_data.recommendation
+
+    def test_bonferroni_adjustment_is_applied_across_guardrails(self):
+        """K 条护栏就是 K 次检验：校正后的 alpha 随 K 变小。"""
+        import numpy as np
+
+        from ablab.platform.guardrails import GuardrailSpec, analyse_guardrails
+
+        rng = np.random.default_rng(3)
+        specs = [
+            GuardrailSpec(f"g{i}", "lower_is_better", 0.05) for i in range(4)
+        ]
+        series = {
+            s.name: {
+                "control": __import__(
+                    "ablab.inference.aggregates", fromlist=["AggregateStats"]
+                ).AggregateStats.from_arrays(rng.normal(1.0, 0.05, 2000)),
+                "treatment": __import__(
+                    "ablab.inference.aggregates", fromlist=["AggregateStats"]
+                ).AggregateStats.from_arrays(rng.normal(1.0, 0.05, 2000)),
+            }
+            for s in specs
+        }
+        report = analyse_guardrails(
+            specs, series, treated="treatment", control="control", alpha=0.05
+        )
+        assert all(abs(o.alpha_adjusted - 0.05 / 4) < 1e-12 for o in report.outcomes)
+
+    def test_analysis_marks_fail_and_stop_in_the_report(self):
+        """走完真实入口：带规格的实验 -> 护栏 fail -> health=fail。"""
+        from ablab.platform.analysis import analyse_experiment
+        from ablab.platform.guardrails import GuardrailSpec
+
+        rec = ExperimentRecord(
+            name="guardrail_e2e",
+            variants=list(VARIANTS),
+            salt="guardrail_e2e_v1",
+            primary_metric="post_metric_14d",
+            guardrails=["latency_p99"],
+            guardrail_specs=[
+                GuardrailSpec("latency_p99", "lower_is_better", 0.05, demo_harm=0.12)
+            ],
+        )
+        report = analyse_experiment(rec, n_users=4000)
+        item = next(c for c in report.checks if c.name == "护栏指标")
+        assert item.status == "fail"
+        assert report.health == "fail"
+        assert "停止实验" in item.message
+
+    def test_warehouse_path_says_unknown_not_pass(self):
+        """数仓路径还没有护栏表 -> 判 unknown 并说清原因，**不是通过**。
+
+        这条钉的是这一整块最容易犯的错：缺数据时给人一个"检查通过"。
+        """
+        from ablab.platform.analysis import _with_record_metadata
+        from ablab.platform.datasource import build_synthetic_data
+        from ablab.platform.guardrails import GuardrailSpec
+
+        rec = ExperimentRecord(
+            name="guardrail_wh",
+            variants=list(VARIANTS),
+            salt="guardrail_wh_v1",
+            primary_metric="post_metric_14d",
+            guardrails=["latency_p99"],
+            guardrail_specs=[GuardrailSpec("latency_p99", "lower_is_better", 0.05)],
+            warehouse_experiment="exp_rank_v2",
+        )
+        data = build_synthetic_data(
+            experiment=rec.name, salt=rec.salt, variants=[("control", 0.5), ("treatment", 0.5)],
+            metric=rec.primary_metric, n_users=2000, n_looks=3, seed=7,
+            population=__import__("ablab.platform.analysis", fromlist=["PLATFORM_POPULATION"]).PLATFORM_POPULATION,
+        )
+        # 数仓路径的护栏数据是空的（还没有那张表）
+        wh_data = _with_record_metadata(data, rec)
+        wh_data = __import__("dataclasses").replace(wh_data, guardrail_series={})
+        from ablab.platform.analysis import analyse_data
+
+        report = analyse_data(wh_data)
+        item = next(c for c in report.checks if c.name == "护栏指标")
+        assert item.status == "info"
+        assert "不等于通过" in item.message
+        assert "停止实验" not in item.message
+
+
 class TestOptimisticLocking:
     """并发：**两个人同时改，不能有一方的改动被静默吃掉**。
 
@@ -617,7 +819,13 @@ class TestOptimisticLocking:
 
 
 class TestGuardrailVisibility:
-    """声明了护栏却没人分析 —— 这件事必须在报告里**明说**。"""
+    """护栏要么被**判定**，要么**说清为什么判不了** —— 不能含糊其辞。
+
+    这一组测试的名字与断言在本轮被改写过：它们原来钉的是"声明了护栏却没人分析，
+    报告里必须明说'尚不分析'"。现在引擎真的会判定了，于是同等重要的关切变成：
+    **没有被判定时，报告必须写清原因，而且绝不能写成通过**。
+    换句话说，钉的不是"某个字符串还在"，而是"这句话还成立"。
+    """
 
     @staticmethod
     def record(name: str, guardrails: list[str]) -> ExperimentRecord:
@@ -629,7 +837,12 @@ class TestGuardrailVisibility:
             guardrails=guardrails,
         )
 
-    def test_declared_guardrails_are_reported_as_not_analysed(self):
+    def test_declared_names_without_specs_say_why_they_cannot_be_judged(self):
+        """只声明名字、没给方向与容忍度 -> warn，并说清"补上声明才能判定"。
+
+        它**不是通过**：缺声明时判通过会让人以为护栏被看着 ——
+        那正是这一块原来的毛病。
+        """
         rep = analyse_experiment(
             self.record("g_declared", ["latency_p99", "crash_rate"]), n_users=4_000
         )
@@ -637,19 +850,39 @@ class TestGuardrailVisibility:
         assert item is not None, [c.name for c in rep.checks]
         assert item.statistic == 2.0
         assert "latency_p99" in item.message and "crash_rate" in item.message
-        assert "尚不分析" in item.message, "必须明说没有分析，而不是含糊其辞"
+        assert item.status == "warn", item.status
+        assert "不等于通过" in item.message
+        assert "direction + max_harm" in item.message
 
-    def test_guardrail_notice_does_not_raise_health(self):
-        """它不该把 health 拉成 warn。
+    def test_platform_level_gap_does_not_raise_health(self):
+        """**有规格但没数据**（数仓还没有护栏表）-> info，不把 health 拉成 warn。
 
-        理由：护栏未接入是**平台级**缺口，声明了护栏的每个实验都会一直 warn，
-        而"一条永远亮的告警等于没有告警" —— health 会因此失去意义。
-        信息要显式（永远在报告里），但不占用"这次运行有问题"这个信号。
+        这是平台级缺口：它对每个实验都一样，永远 warn 就等于没有告警
+        （第 31 条那条教训），health 会因此失去意义。
+        注意与上一条的区别：**用户要补的声明 -> warn**（这一次就能补），
+        **平台要补的数据 -> info**（不该由用户承担）。
         """
-        rep = analyse_experiment(self.record("g_health", ["latency_p99"]), n_users=4_000)
-        item = next(c for c in rep.checks if c.name == "护栏指标")
-        assert item.status == "info"
-        assert rep.health == "pass", rep.health
+        import dataclasses
+
+        from ablab.platform.analysis import PLATFORM_POPULATION, analyse_data
+        from ablab.platform.datasource import build_synthetic_data
+        from ablab.platform.guardrails import GuardrailSpec
+
+        rec = self.record("g_health", ["latency_p99"])
+        rec.guardrail_specs = [GuardrailSpec("latency_p99", "lower_is_better", 0.05)]
+        # 合成路径**会**生成护栏数据；这里显式清空，模拟"数仓路径还没有护栏表"
+        data = build_synthetic_data(
+            experiment=rec.name, salt=rec.salt,
+            variants=[("control", 0.5), ("treatment", 0.5)],
+            metric=rec.primary_metric, n_users=2000, n_looks=3, seed=7,
+            population=PLATFORM_POPULATION, guardrail_specs=tuple(rec.guardrail_specs),
+        )
+        assert data.guardrail_series, "合成路径本应生成护栏数据，否则这条测试没测到东西"
+        empty = dataclasses.replace(data, guardrail_series={})
+        item = next(c for c in analyse_data(empty).checks if c.name == "护栏指标")
+        assert item.status == "info", item.status
+        assert "不等于通过" in item.message
+        assert "数仓" in item.message
 
     def test_no_guardrails_no_notice(self):
         rep = analyse_experiment(self.record("g_none", []), n_users=4_000)

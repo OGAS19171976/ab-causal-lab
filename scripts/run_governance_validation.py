@@ -258,27 +258,78 @@ def main() -> int:
          f"{[e['action'] for e in recent['events']]}（同一个实验的 id 未打印，见上）")
 
     # ---- 7. 护栏指标：声明了但没人分析，必须说出来 ------------------------ #
-    emit("\n### 7. 护栏指标：把「没分析」这条静默变成显式")
-    declared = ["latency_p99", "crash_rate", "revenue_per_user"]
-    demo = ExperimentRecord(
+    emit("\n### 7. 护栏指标：**真的判定**，并给出「要不要停实验」的判据")
+    emit("  三种声明各跑一遍，因为它们的**补救办法完全不同**：")
+    emit("    A) 有规格、有数据（其中一条被注入了 +12% 的真实伤害）")
+    emit("    B) 只声明了名字，没给方向与容忍度")
+    emit("    C) 规格齐全、但没有数据（数仓路径还没有护栏表）")
+    emit("")
+    from ablab.platform.guardrails import GuardrailSpec as _Spec
+
+    spec_demo = ExperimentRecord(
         name="guardrail_demo",
         variants=list(VARIANTS),
         salt="guardrail_demo_v1",
         primary_metric="post_metric_14d",
-        guardrails=declared,
+        guardrails=["latency_p99", "crash_rate", "revenue_per_user"],
+        guardrail_specs=[
+            _Spec("latency_p99", "lower_is_better", 0.05, demo_harm=0.12),
+            _Spec("crash_rate", "lower_is_better", 0.10, demo_harm=0.0),
+            _Spec("revenue_per_user", "higher_is_better", 0.05, demo_harm=0.0),
+        ],
+        true_lift=0.02,
     )
-    rep = analyse_experiment(demo, n_users=8_000)
-    item = next((c for c in rep.checks if c.name == "护栏指标"), None)
-    emit(f"  该实验声明了 {len(declared)} 个护栏：{'、'.join(declared)}")
-    emit(f"  分析报告的检查项（{len(rep.checks)} 项）：{[c.name for c in rep.checks]}")
-    if item is not None:
-        emit(f"  护栏那条：status={item.status}，health 不受影响（当前 health={rep.health}）")
-        emit(f"  正文：{item.message}")
+    rep_a = analyse_experiment(spec_demo, n_users=8_000)
+    item_a = next(c for c in rep_a.checks if c.name == "护栏指标")
+    emit(f"  A) 护栏那条 status = {item_a.status}，health = {rep_a.health}")
+    for line in item_a.message.splitlines()[:6]:
+        emit(f"     {line}")
     emit("")
-    emit("  为什么是 info 而不是 warn：护栏未接入是**平台级**缺口，")
-    emit("  声明了护栏的每个实验都会一直 warn —— 而「一条永远亮的告警等于没有告警」，")
-    emit("  health 会因此失去意义（这条教训来自第 31 条）。")
-    emit("  信息要显式（这条检查永远在报告里），但不占用「这次运行有问题」这个信号。")
+    bare = ExperimentRecord(
+        name="guardrail_bare",
+        variants=list(VARIANTS),
+        salt="guardrail_bare_v1",
+        primary_metric="post_metric_14d",
+        guardrails=["recall_coverage"],
+    )
+    rep_b = analyse_experiment(bare, n_users=8_000)
+    item_b = next(c for c in rep_b.checks if c.name == "护栏指标")
+    emit(f"  B) 只有名字：status = {item_b.status}（**用户这一次就能补**："
+         "补 direction + max_harm）")
+    emit(f"     {[ln.strip() for ln in item_b.message.splitlines() if 'unknown' in ln][0]}")
+    emit("")
+    import dataclasses as _dc
+
+    from ablab.platform.analysis import PLATFORM_POPULATION, analyse_data
+
+    wh_like = _dc.replace(
+        _with_wh_data := __import__(
+            "ablab.platform.datasource", fromlist=["build_synthetic_data"]
+        ).build_synthetic_data(
+            experiment="guardrail_wh", salt="guardrail_wh_v1",
+            variants=[("control", 0.5), ("treatment", 0.5)],
+            metric="post_metric_14d", n_users=4_000, n_looks=3, seed=11,
+            population=PLATFORM_POPULATION,
+            guardrail_specs=(_Spec("latency_p99", "lower_is_better", 0.05),),
+        ),
+        guardrail_series={},
+    )
+    item_c = next(c for c in analyse_data(wh_like).checks if c.name == "护栏指标")
+    emit(f"  C) 有规格没数据：status = {item_c.status}（**平台要补**：数仓还没有护栏表）")
+    emit(f"     {[ln.strip() for ln in item_c.message.splitlines() if 'unknown' in ln][0]}")
+    emit("")
+    emit("  判定规则（写在代码里，也写在 README 里）：")
+    emit("    · 把两臂之差按 direction 折算成**伤害**；越界看的是伤害的**置信下界**，")
+    emit("      不是点估计 —— 点估计超了但证据不足记 warn（继续观察），")
+    emit("      这样「停机」这个动作才是保守的；")
+    emit("    · K 条护栏用 Bonferroni（alpha/K）校正：要控的是「误判有害从而错误停机」；")
+    emit("    · **没声明方向与容忍度就不判断**（判 unknown）—— 从指标名猜方向")
+    emit("      会把伤害静默读成改善；")
+    emit("    · **缺数据判 unknown，绝不判 pass**：那正是这一块原来的毛病。")
+    emit("")
+    emit("  A 组的细节值得看：latency_p99 被注入 +12% 伤害（远超 5% 容忍度），")
+    emit("  于是 health 直接变成 fail，报告里出现「建议停止实验」——")
+    emit("  Kohavi 那本书里护栏触发是**停实验的理由**，不是参考信息。")
 
     no_guard = ExperimentRecord(
         name="no_guardrail_demo",
@@ -360,8 +411,10 @@ def main() -> int:
     emit("    - ~~注册表没有并发控制~~ **已补**：`version` 列 + `If-Match` 头，")
     emit("      冲突返回 412 而不是静默覆盖（见第 7.5 节）。**边界**：乐观锁是")
     emit("      可选的（不带 If-Match 仍是后写覆盖），且没有自动重试与合并。")
-    emit("    - 护栏**仍然没有被分析**：数据模型只有主指标一条时间序列。")
-    emit("      要做需要数仓里另建指标表 + 停实验的判据，那是另一件事。")
+    emit("    - ~~护栏没有被分析~~ **已补**：合成路径现在**真的判定**护栏，")
+    emit("      越界（伤害的置信下界超过事先声明的容忍度）会让 health 变 fail")
+    emit("      并给出「建议停止实验」（见第 7 节）。**边界**：数仓路径还没有")
+    emit("      护栏表，那里的护栏判 unknown（不是通过）；方向与容忍度必须显式声明。")
 
     emit(f"\n总耗时 {time.perf_counter() - t0:.1f}s")
     reopened.close()

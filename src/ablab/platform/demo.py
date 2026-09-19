@@ -54,6 +54,16 @@ DEMO_EXPERIMENTS: tuple[dict[str, Any], ...] = (
         "traffic_ratio": 0.8,
         "primary_metric": "interaction_per_user_14d",
         "guardrails": ["latency_p99", "complaint_rate"],
+        # 护栏的**规格**：方向 + 容忍度（必须在看结果之前定）。
+        # ``demo_harm`` 只在合成数据里生效（与 true_lift 同性质）：
+        # latency_p99 注入 +12% 的真实伤害 —— 演示"护栏触发 -> 建议停实验"，
+        # complaint_rate 不注入，用来对照"没触发"那一侧。
+        "guardrail_specs": [
+            {"name": "latency_p99", "direction": "lower_is_better",
+             "max_harm": 0.05, "demo_harm": 0.12},
+            {"name": "complaint_rate", "direction": "lower_is_better",
+             "max_harm": 0.10, "demo_harm": 0.0},
+        ],
         "status": "running",
         "start_ds": "2026-03-01",
         "true_lift": 0.35,
@@ -71,6 +81,8 @@ DEMO_EXPERIMENTS: tuple[dict[str, Any], ...] = (
         "traffic_ratio": 0.6,
         "primary_metric": "interaction_per_user_14d",
         "guardrails": ["recall_coverage"],
+        # 这条**只声明名字、不给规格**，是有意的：报告里会判 unknown 并提示
+        # "补上 direction + max_harm 才能判定" —— 缺声明不等于通过。
         "status": "running",
         "start_ds": "2026-03-01",
         # 真实效应为零 —— 用来演示"负对照会怎样被协变量失衡污染"
@@ -89,6 +101,10 @@ DEMO_EXPERIMENTS: tuple[dict[str, Any], ...] = (
         "traffic_ratio": 0.3,
         "primary_metric": "interaction_per_user_14d",
         "guardrails": ["scroll_depth"],
+        "guardrail_specs": [
+            {"name": "scroll_depth", "direction": "higher_is_better",
+             "max_harm": 0.05, "demo_harm": 0.0},
+        ],
         "status": "draft",
         "true_lift": -0.1,
     },

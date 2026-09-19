@@ -137,6 +137,9 @@ _MIGRATIONS: dict[str, str] = {
     # 乐观锁版本号：老库的既有行都从 1 开始（"我们不知道它被改过几次"，
     # 但 1 是唯一诚实的选择 —— 编一个更大的数会假装我们知道历史）
     "version": "INTEGER NOT NULL DEFAULT 1",
+    # 护栏的**规格**（方向 + 容忍度），JSON。名字仍在 guardrails 列里：
+    # 只有名字没有规格时，护栏分析会判 unknown（"没声明"不等于"通过"）。
+    "guardrail_specs": "TEXT NOT NULL DEFAULT '[]'",
 }
 
 #: 审计表新增的列。单独一张表，因为它的迁移规则不一样：
@@ -146,6 +149,35 @@ _MIGRATIONS: dict[str, str] = {
 _EVENT_MIGRATIONS: dict[str, str] = {
     "actor": "TEXT NOT NULL DEFAULT '（迁移前未知）'",
 }
+
+def _coerce_spec(raw: Any) -> Any:
+    """把 dict / GuardrailSpec 统一成 ``GuardrailSpec``。
+
+    放在注册表层而不是 API 层：直接调注册表的调用方（脚本、测试、demo 播种）
+    也要走同一条规整化路径，否则同一份声明在不同入口会有不同的解释。
+    """
+    from .guardrails import GuardrailSpec
+
+    if isinstance(raw, GuardrailSpec):
+        return raw
+    if isinstance(raw, dict):
+        return GuardrailSpec.from_dict(raw)
+    raise RegistryError(f"护栏规格必须是 dict 或 GuardrailSpec，收到 {type(raw).__name__}")
+
+
+def _specs_from_json(raw: str | None) -> list[Any]:
+    if not raw:
+        return []
+    from .guardrails import GuardrailSpec
+
+    try:
+        items = json.loads(raw)
+    except json.JSONDecodeError:
+        # 库里存着坏 JSON 时不要把整个读路径打挂：护栏降级成"没有规格"，
+        # 于是分析会判 unknown（"没声明"）—— 而不是假装通过。
+        return []
+    return [GuardrailSpec.from_dict(d) for d in items if isinstance(d, dict)]
+
 
 #: 角色。最小三分法：读 / 写 / 删。
 ROLES = ("viewer", "editor", "admin")
@@ -244,6 +276,10 @@ class ExperimentRecord:
     #: 乐观锁版本号。每次成功的写 +1；调用方带 ``expected_version`` 且对不上时，
     #: 这次写会被拒（``RegistryConflict``）—— 这就是"防止把别人的改动覆盖掉"。
     version: int = 1
+    #: 护栏的**规格**（``GuardrailSpec``）：方向 + 容忍度 + 演示用的真实伤害。
+    #: ``guardrails`` 只有名字 —— 名字决定"界面上显示什么"，
+    #: 规格决定"能不能判定"（只有名字时判 ``unknown``）。
+    guardrail_specs: list[Any] = field(default_factory=list)
 
     def to_spec(self) -> ExperimentSpec:
         """把记录还原成分流定义 —— 构造即校验。"""
@@ -568,6 +604,7 @@ class ExperimentRegistry:
         traffic_ratio: float = 1.0,
         primary_metric: str = "metric",
         guardrails: Sequence[str] = (),
+        guardrail_specs: Sequence[Any] = (),
         status: str = "draft",
         start_ds: str | None = None,
         end_ds: str | None = None,
@@ -631,6 +668,7 @@ class ExperimentRegistry:
             traffic_ratio=float(traffic_ratio),
             primary_metric=primary_metric,
             guardrails=list(guardrails),
+            guardrail_specs=[_coerce_spec(s) for s in guardrail_specs],
             status=status,
             start_ds=start_ds,
             end_ds=end_ds,
@@ -648,8 +686,8 @@ class ExperimentRegistry:
             (id, name, hypothesis, owner, layer, unit, salt, traffic_ratio,
              variants, primary_metric, guardrails, status, start_ds, end_ds,
              true_lift, warehouse_experiment, estimator, analysis_unit, metric_type,
-             created_at, version)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             created_at, version, guardrail_specs)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 record.id, record.name, record.hypothesis, record.owner, record.layer,
@@ -661,6 +699,7 @@ class ExperimentRegistry:
                 record.true_lift, record.warehouse_experiment, record.estimator,
                 record.analysis_unit, record.metric_type,
                 record.created_at, record.version,
+                json.dumps([s.to_dict() for s in record.guardrail_specs], ensure_ascii=False),
             ),
         )
         self._record_event(
@@ -810,6 +849,7 @@ class ExperimentRegistry:
             metric_type=row["metric_type"],
             created_at=row["created_at"],
             version=int(row["version"]),
+            guardrail_specs=_specs_from_json(row["guardrail_specs"]),
         )
 
     def get(self, experiment_id: str) -> ExperimentRecord:

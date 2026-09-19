@@ -74,6 +74,25 @@ class VariantIn(_Strict):
     weight: float
 
 
+class GuardrailSpecIn(_Strict):
+    """一条护栏的声明。**方向与容忍度必填** —— 不从指标名猜。"""
+
+    name: str = Field(..., min_length=1)
+    direction: Literal["lower_is_better", "higher_is_better"] = Field(
+        ..., description="越低越好（延迟/崩溃率）还是越高越好（收入/留存）"
+    )
+    max_harm: float = Field(
+        ..., gt=0, le=1, description="允许的最大相对劣化，如 0.05 = 5%"
+    )
+    demo_harm: float = Field(
+        0.0,
+        description=(
+            "**仅演示数据用**：合成时注入的真实伤害（与 true_lift 同性质）。"
+            "真实平台没有这个字段"
+        ),
+    )
+
+
 class ExperimentIn(_Strict):
     name: str = Field(..., min_length=1, description="实验唯一名，注册表的唯一键")
     variants: list[VariantIn] = Field(..., min_length=1)
@@ -87,6 +106,14 @@ class ExperimentIn(_Strict):
     traffic_ratio: float = 1.0
     primary_metric: str = "metric"
     guardrails: list[str] = []
+    guardrail_specs: list[GuardrailSpecIn] = Field(
+        default_factory=list,
+        description=(
+            "护栏的**规格**：每条要有 direction（lower_is_better / higher_is_better）"
+            "与 max_harm（允许的最大相对劣化）。只给名字不给规格时，护栏分析会判"
+            " unknown —— 缺声明不等于通过。"
+        ),
+    )
     status: Literal["draft", "running", "stopped"] = "draft"
     start_ds: str | None = None
     end_ds: str | None = None
