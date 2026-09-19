@@ -55,6 +55,10 @@ CLAIMS: list[tuple[str, str, str]] = [
     ("M6：MDE 与功效的自洽性", "m6_validation.md", "z_power(mde)="),
     ("数仓：CUPED 与 DWD 明细一致", "warehouse_report.md", "一致"),
     ("数仓：ADS 判据写在报告里", "warehouse_report.md", "判据"),
+    # 比值链路（06/07）的数字 —— 它们是"接通了"这件事唯一的实测证据
+    ("数仓·比值：正对照实验的效应", "warehouse_report.md", "2.350765"),
+    ("数仓·比值：负对照也显著（诚实记下）", "warehouse_report.md", "0.739366"),
+    ("数仓·比值：末次查看 == 主结论", "warehouse_report.md", "末次查看 == 主结论：True"),
     ("治理：审计删不掉", "governance_report.md", "append-only"),
     ("治理：护栏未分析", "governance_report.md", "尚不分析护栏指标"),
 ]

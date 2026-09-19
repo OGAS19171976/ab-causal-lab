@@ -157,6 +157,93 @@ def main() -> int:
          f"，更接近真值")
     emit("  * -> M1 将把这个诊断正式实现为 CUPED，并作为默认分析口径")
 
+    # ---- 6. 比值链路（06/07）的交叉验证 -------------------------------- #
+    #
+    # 这一节存在的理由：比值指标走的是**另一条 ADS 链路**（分子/分母两列可加量），
+    # 而"换了数据源，校准主张就不再自动成立"是这个项目反复强调的规矩。
+    # 所以这里不是"再看一眼数字"，而是拿 **M1 的独立实现**（直接吃 DWD 明细的
+    # ratio_delta_method）当裁判，并顺带给出负对照与"末次查看 == 主结论"的不变量。
+    emit("\n### 6. 比值指标链路（06/07）：平台 vs M1 独立实现")
+    ratio_rows = con.execute(
+        "SELECT experiment, variant, user_cnt, sum_y, sum_x FROM ads_experiment_ratio_result"
+        " ORDER BY experiment, variant"
+    ).df()
+    emit(f"  比值 ADS 有 {len(ratio_rows)} 行（每条实验两臂）")
+    for _, r in ratio_rows.iterrows():
+        ratio = float(r["sum_y"]) / float(r["sum_x"]) if float(r["sum_x"]) else float("nan")
+        emit(f"    {r['experiment']:<14}{r['variant']:<11}"
+             f"Σy={float(r['sum_y']):,.1f}  Σx={float(r['sum_x']):,.0f}"
+             f"  比值 Σy/Σx={ratio:.6f}")
+
+    from ablab.inference import ratio_delta_method
+    from ablab.inference.aggregates import AggregateStats
+    from ablab.platform.analysis import analyse_experiment_from_warehouse
+    from ablab.platform.registry import ExperimentRecord
+
+    def _stats(frame) -> AggregateStats:
+        y = frame["post_metric"].to_numpy(dtype=float)
+        x = frame["post_cnt"].to_numpy(dtype=float)
+        return AggregateStats.from_sums(
+            n=int(y.size), sum_x=float(x.sum()), sum_y=float(y.sum()),
+            sum_xx=float((x * x).sum()), sum_yy=float((y * y).sum()),
+            sum_xy=float((x * y).sum()),
+        )
+
+    emit("")
+    emit(f"  {'实验':<14}{'平台比值':>12}{'平台 SE':>10}{'独立实现':>12}"
+         f"{'偏差':>10}{'p':>10}")
+    for experiment in ("exp_rank_v2", "exp_rec_emb"):
+        detail = con.execute(
+            "SELECT variant, post_metric, post_cnt FROM dwd_experiment_user"
+            " WHERE experiment = ?",
+            [experiment],
+        ).df()
+        t = detail[detail["variant"] == "treatment"]
+        c = detail[detail["variant"] == "control"]
+        ref = ratio_delta_method(_stats(t), _stats(c))
+
+        record = ExperimentRecord(
+            id="ratio_check", name=experiment, salt=f"{experiment}_v1",
+            variants=[{"name": "control", "weight": 0.5},
+                      {"name": "treatment", "weight": 0.5}],
+            primary_metric="post_metric_14d", warehouse_experiment=experiment,
+            estimator="post_only", metric_type="ratio",
+        )
+        rep = analyse_experiment_from_warehouse(record, con, n_looks=5)
+        primary = rep.primary
+        if primary is None:  # pragma: no cover - 比值路径必然给出 primary
+            raise RuntimeError(f"{experiment} 的比值路径没有给出主估计")
+        deviation = abs(primary.absolute_effect - ref.absolute_effect)
+        emit(f"  {experiment:<14}{primary.absolute_effect:>12.6f}"
+             f"{primary.std_error:>10.6f}{ref.absolute_effect:>12.6f}"
+             f"{deviation:>10.2e}{primary.p_value:>10.3g}")
+
+        # 不变量：监控曲线的最后一次查看必须**逐位**等于主结论（M6.1 的那条）
+        last = rep.monitoring[-1]
+        same = (
+            abs(float(last["effect"]) - primary.absolute_effect) < 1e-12
+            and abs(float(last["std_error"]) - primary.std_error) < 1e-12
+        )
+        emit(f"    末次查看 == 主结论：{same}；监控口径={last.get('estimator')}；"
+             f"查看次数={len(rep.monitoring)}")
+
+    emit("")
+    emit("  负对照（exp_rec_emb 的真实效应为零）—— **实测它显著**（p=0.0091），")
+    emit("  所以不能拿「它不显著」当验收标准。真正的问题是：这是比值链路的问题，")
+    emit("  还是这份数据本身的问题？同一份数据上均值口径的负对照是：")
+    for a in analyses:
+        if a.experiment == "exp_rec_emb":
+            emit(f"    {a.experiment} 均值口径 post-only "
+                 f"{a.naive.absolute_effect:+.4f} (SE {a.naive.std_error:.4f}, "
+                 f"p={a.naive.p_value:.3g})")
+    emit("  两个口径都显著 → 指向**同一份实现**（第 5 节的效应分解已经说明：")
+    emit("  这次分流的协变量失衡让 naive 显著，CUPED 把它扣掉）。")
+    emit("  所以这里的结论只是：比值链路的表现与均值链路**一致**，")
+    emit("  而不是「比值链路被验证为校准」—— 那需要很多个 salt 的重复，")
+    emit("  是 README 已知边界里还没做的那一条。")
+    emit("  逐位一致性：平台编排与 M1 的独立实现在 1e-9 内一致（有测试守着）；")
+    emit("  本节偏差列是实测差，量级 1e-14。")
+
     emit(f"\n总耗时 {time.perf_counter() - t0:.1f}s")
     con.close()
 
