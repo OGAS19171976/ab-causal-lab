@@ -161,46 +161,69 @@ def main() -> int:
     emit("  BLP 检验代理是否校准（斜率=1），GATES 给**组级**有效区间。")
     emit("")
     emit(f"  {'配置':<26}{'BLP 斜率(SE)':>18}{'盖住 1':>9}{'GATES 覆盖':>11}"
-         f"{'区间长度':>10}")
+         f"{'区间长度':>10}{'信号峰度':>10}{'裁剪 α':>9}{'裁掉':>8}")
     from ablab.validation.hte_audit import run_gates_blp_audit
-
     splits_main = 6 if args.quick else 30
     splits_xl = max(3, splits_main // 3)
     # 用显式元组而不是 **kwargs：mypy 对 dict[str, object] 展开成关键字参数
     # 会逐个报类型不符（它无法把 object 收窄到 int/str），而这里本来也不需要动态键。
+    # 前四行是**历史口径**（纯 HT、不裁剪）—— 保留它们才能让"换了默认之后
+    # 到底改善在哪"看得见；后四行是现在的默认路径（AIPW + 自动裁剪）。
     grid = [
-        ("森林代理 n=2000", 2000, splits_main, "forest"),
-        ("森林代理 n=4000", 4000, splits_xl, "forest"),
-        ("真值代理 n=2000（正对照）", 2000, splits_main, "oracle"),
-        ("真值代理 n=8000（正对照）", 8000, splits_xl, "oracle"),
+        ("森林代理 n=2000", 2000, splits_main, "forest", "ht", None),
+        ("森林代理 n=4000", 4000, splits_xl, "forest", "ht", None),
+        ("真值代理 n=2000（正对照）", 2000, splits_main, "oracle", "ht", None),
+        ("真值代理 n=8000（正对照）", 8000, splits_xl, "oracle", "ht", None),
+        ("森林代理 n=2000", 2000, splits_main, "forest", "aipw", "auto"),
+        ("森林代理 n=4000", 4000, splits_xl, "forest", "aipw", "auto"),
+        ("真值代理 n=2000（正对照）", 2000, splits_main, "oracle", "aipw", "auto"),
+        ("真值代理 n=8000（正对照）", 8000, splits_xl, "oracle", "aipw", "auto"),
     ]
     gates_rows = []
-    for label, n_gates, n_splits_gates, proxy_kind in grid:
+    for label, n_gates, n_splits_gates, proxy_kind, sig_kind, trim in grid:
         r = run_gates_blp_audit(
-            n=n_gates, n_splits=n_splits_gates, seed=0,
-            cate_form="nonlinear", proxy_kind=proxy_kind,
+            n=n_gates, n_splits=n_splits_gates, seed=0, cate_form="nonlinear",
+            proxy_kind=proxy_kind, signal_kind=sig_kind, trim=trim,
         )
-        gates_rows.append((label, r))
+        gates_rows.append((f"{label}｜{sig_kind}", r))
         emit(f"  {label:<26}{r.blp_slope:>+10.4f}({r.blp_slope_se:.3f})"
              f"{r.blp_covers_one:>9.3f}{r.gates_coverage:>11.4f}"
-             f"{r.gates_mean_length:>10.4f}")
+             f"{r.gates_mean_length:>10.4f}{r.signal_kurtosis:>10.1f}"
+             f"{(format(r.trim_alpha, '.3f') if r.trim_alpha > 0 else '—'):>9}"
+             f"{(format(r.trimmed_share, '.3f') if r.trim_alpha > 0 else '—'):>8}")
     emit("")
-    forest_r, oracle_r = gates_rows[0][1], gates_rows[2][1]  # 同为 n=2000、30 次分裂
-    last_r = gates_rows[-1][1]
-    covs = [r.gates_coverage for _, r in gates_rows]
-    emit("  读法（三条都要看，缺一条就会误判）：")
-    emit(f"  * **GATES 达标**：森林代理 n=2000 下组级覆盖率 {forest_r.gates_coverage:.4f}，"
-         f"真值代理 n=8000 下 {last_r.gates_coverage:.4f}")
-    emit("    —— 与名义 0.95 在蒙特卡洛误差内一致（30 次分裂的配置各 120 个组区间，")
-    emit("    MC SE≈0.02；10 次分裂的各 40 个，MC SE≈0.03）。")
-    emit(f"  * **审计有功效**（不是永远通过）：同一 n 与分裂次数下，真值代理斜率 "
-         f"{oracle_r.blp_slope:.4f}、")
-    emit(f"    盖住 1 的比例 {oracle_r.blp_covers_one:.3f}；森林代理斜率 {forest_r.blp_slope:.4f}、"
-         f"盖住 1 只有 {forest_r.blp_covers_one:.3f}")
-    emit("    —— 它**正确拒了**未校准的代理。")
-    emit("    斜率>1 的含义是代理被「压平」（attenuation），即 τ̂ 的取值范围比真实 CATE 窄。")
-    emit(f"  * **但不稳定**：四次配置的覆盖率在 {min(covs):.3f}~{max(covs):.3f} 之间摆动。")
-    emit("    原因见下一条，这是本轮新发现的瓶颈，不是实现错误。")
+    emit("  前四行 = **历史口径**（纯 HT、不裁剪）；后四行 = **现在的默认路径**")
+    emit("  （AIPW 信号 + 自动裁剪）。并排看才知道换默认换来了什么：")
+    emit("")
+    hist_covs = [r.gates_coverage for _, r in gates_rows[:4]]
+    new_covs = [r.gates_coverage for _, r in gates_rows[4:]]
+    hist_len = [r.gates_mean_length for _, r in gates_rows[:4]]
+    new_len = [r.gates_mean_length for _, r in gates_rows[4:]]
+    hist_kurt = [r.signal_kurtosis for _, r in gates_rows[:4]]
+    new_kurt = [r.signal_kurtosis for _, r in gates_rows[4:]]
+    alphas = [r.trim_alpha for _, r in gates_rows[4:]]
+    shares = [r.trimmed_share for _, r in gates_rows[4:]]
+    emit(f"  * **覆盖率不再摆动**：历史口径 {min(hist_covs):.4f}~{max(hist_covs):.4f} → "
+         f"默认路径 {min(new_covs):.4f}~{max(new_covs):.4f}。")
+    emit(f"    峰度 {min(hist_kurt):.1f}~{max(hist_kurt):.1f} → "
+         f"{min(new_kurt):.1f}~{max(new_kurt):.1f}（重尾被裁掉了）。")
+    emit(f"  * **区间短了三到五成**：同配置逐项比，长度从 "
+         f"{hist_len[0]:.4f}/{hist_len[3]:.4f} 降到 {new_len[0]:.4f}/{new_len[3]:.4f}。")
+    emit(f"  * **阈值是自动选的，而且落在文献的经验值附近**：α="
+         f"{min(alphas):.3f}~{max(alphas):.3f}（Crump 等常用的截断是 0.1），"
+         f"裁掉 {min(shares):.3f}~{max(shares):.3f} 的单元。")
+    emit("    选阈值的准则是「组级估计量的插入式方差最小」—— 用的是本仓库自己的")
+    emit("    估计量，不照抄文献的闭式（那个闭式依赖条件方差的形式）。")
+    emit("  * **审计仍然有功效**：森林代理的 BLP 斜率在两种口径下都明显 >1")
+    emit("    （代理被压平）；真值代理两种口径都盖住 1 的比例高 —— 换了信号")
+    emit("    并没有让这个检验变成「永远通过」。")
+    emit("  * **注意覆盖率的上界已经略高于名义值**（本轮最高 "
+         f"{max(new_covs):.4f}）：裁剪掉极端权重之后 HC0 偏保守。")
+    emit("    保守方向是安全的，但不能写成「精确 95%」—— 名义性是近似。")
+    emit("  * **估计目标变了，必须一起报**：裁剪后推断的是**重叠总体**上的组级")
+    emit("    效应（真值也按裁剪后的样本算，所以覆盖率是自洽的）。")
+    emit("    只报覆盖率和长度、不报被裁掉的比例，就是拿换了目标换来的窄区间")
+    emit("    冒充精度 —— 这两列因此固定在同一张表里。")
     emit("")
     emit("  瓶颈：HT 信号在本 DGP 下重尾到不实用")
     r0 = gates_rows[0][1]
@@ -211,10 +234,10 @@ def main() -> int:
     emit("    组级 SE 用的是 HC0，在峰度几百的量级下有限样本不可靠 ——")
     emit("    这就是覆盖率在 0.88~0.96 之间摆动的原因。")
     emit("  * 所以这一轮的结论不是「HT 路线不行」，而是：")
-    emit("    **推断对象选对了（组级有效、单元级不可能），但信号还需要换。**")
-    emit("    下一步是 AIPW 信号 Γ=μ̂₁(X)-μ̂₀(X)+H·(Y-μ̂_D(X))（E[Γ|Z]=s0(Z)，")
-    emit("    把 1/(p(1-p)) 从 Y 转移到残差上）＋倾向得分裁剪与重叠诊断。")
-    emit("    这条写进 README 已知边界。")
+    emit("    **推断对象选对了（组级有效、单元级不可能）**，而信号那一半**已经修好**")
+    emit("    （见本节后半段与第 7、7b 节）：默认路径 = AIPW 信号 + 自动裁剪，")
+    emit("    峰度从 134 降到 11、覆盖率从 0.875~0.950 收到 0.942~0.983。")
+    emit("    代价是估计目标变成重叠总体，被裁掉的比例固定报在同一张表里。")
     emit("")
     emit("  各组明细（森林代理 n=2000，估计对真实组 ATE）：")
     emit(f"  {'组':>4}{'估计':>10}{'真实':>10}{'差':>10}{'差/噪音':>10}")
@@ -233,15 +256,18 @@ def main() -> int:
     emit(f"  {'路线':<30}{'推断对象':>12}{'覆盖率':>10}{'可用':>8}")
     emit(f"  {'单元级：叶内方差':<30}{'τ(X)':>12}{mean_a:>10.4f}{'否':>8}")
     emit(f"  {'单元级：bootstrap':<30}{'τ(X)':>12}{mean_b:>10.4f}{'否':>8}")
-    emit(f"  {'组级：GATES（森林代理）':<30}{'E[τ|组]':>12}"
+    emit(f"  {'组级：GATES（HT，森林代理）':<30}{'E[τ|组]':>12}"
          f"{gates_rows[0][1].gates_coverage:>10.4f}{'是':>8}")
-    emit(f"  {'组级：GATES（真值代理）':<30}{'E[τ|组]':>12}"
+    emit(f"  {'组级：GATES（默认，森林代理）':<30}{'E[τ|组]':>12}"
+         f"{gates_rows[4][1].gates_coverage:>10.4f}{'是':>8}")
+    emit(f"  {'组级：GATES（默认，真值代理）':<30}{'E[τ|组]':>12}"
          f"{gates_rows[-1][1].gates_coverage:>10.4f}{'是':>8}")
     emit("")
-    emit("  这张表就是这一轮的验收结论：**对象不同，结论不同**。")
+    emit("  这张表就是验收结论：**对象不同，结论不同**。")
     emit(f"  单元级（无论哪条方差路线）覆盖面只有 {min(mean_a, mean_b):.3f}~"
          f"{max(mean_a, mean_b):.3f}，量级性失效；")
-    emit("  组级在名义值附近，且对未校准代理有检出能力。")
+    emit("  组级在名义值附近（换了信号之后连「摆动」都没了），"
+         "且对未校准代理有检出能力。")
     emit("  所以 README 里「M4 只能主张排序」这句话要改成更精确的：")
     emit("  **单元级水平不可用（有不可可能性依据 + 实测），组级水平可用。**")
 

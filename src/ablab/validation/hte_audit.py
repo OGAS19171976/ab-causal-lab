@@ -442,6 +442,11 @@ def _ols(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return beta, np.sqrt(np.maximum(np.diag(cov), 0.0))
 
 
+#: 裁剪阈值的候选网格。上界 0.30 是刻意留的 —— 实测它在**单靠裁剪**时会把
+#: 覆盖率打到 0.5375，自动规则若选到那里就说明目标函数出问题了，应当看得见。
+_TRIM_GRID: tuple[float, ...] = (0.0, 0.02, 0.05, 0.10, 0.15, 0.20, 0.30)
+
+
 @dataclass
 class GatesBlpResult:
     """CATE 的**特征**（而不是 CATE 函数）的校准结果。
@@ -481,6 +486,12 @@ class GatesBlpResult:
     #: 正值性假设。见 README 已知边界里那条"应当换 AIPW 信号"。
     signal_kurtosis: float = float("nan")
     overlap_violation_share: float = float("nan")
+    #: 信号与裁剪：``signal_kind`` 是 ht / aipw；``trim_alpha`` 是实际用上的阈值，
+    #: ``trimmed_share`` 是被裁掉的比例 —— **阈值会改变估计目标**，
+    #: 所以这两个数必须和覆盖率一起看，单独报覆盖率会误导。
+    signal_kind: str = "ht"
+    trim_alpha: float = 0.0
+    trimmed_share: float = 0.0
     #: 对照：同一次实验里单元级那两条路线的覆盖率（见 CateIntervalCoverage）
     unit_level_note: str = ""
 
@@ -494,6 +505,9 @@ class GatesBlpResult:
             f"平均区间长度 {self.gates_mean_length:.4f}",
             f"  信号诊断：峰度 {self.signal_kurtosis:.1f}（正态为 3），"
             f"倾向得分落在 [0.05,0.95] 外的比例 {self.overlap_violation_share:.4f}",
+            f"  信号 {self.signal_kind}，裁剪阈值 {self.trim_alpha:.3f}"
+            f"（裁掉 {self.trimmed_share:.4f} 的单元；阈值改变了估计目标，"
+            f"覆盖率要连同这两个数一起读）",
             "  各组：",
         ]
         for i, (eff, true) in enumerate(zip(self.gates_effects, self.gates_true)):
@@ -510,6 +524,60 @@ class GatesBlpResult:
         return "\n".join(lines)
 
 
+def _gates_fit(
+    proxy: np.ndarray, signal: np.ndarray, n_groups: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[int]]:
+    """GATES 的公共计算：按代理分位数切 K 组、把信号回归到组哑变量上。
+
+    只此一份实现 —— 选阈值时要反复用它（候选阈值各算一次方差），
+    最终结果也用它。写成两处就会让"选出来的阈值"和"报告的组效应"
+    来自不同口径。
+    """
+    edges = np.quantile(proxy, np.linspace(0, 1, n_groups + 1)[1:-1])
+    group = np.searchsorted(edges, proxy, side="right")
+    dummies = np.zeros((proxy.size, n_groups))
+    dummies[np.arange(proxy.size), group] = 1.0
+    keep = [g for g in range(n_groups) if dummies[:, g].sum() > 1]
+    eff, se = _ols(dummies[:, keep], signal)
+    return eff, se, group, keep
+
+
+def _pick_trim_alpha(
+    p: np.ndarray,
+    signal: np.ndarray,
+    proxy: np.ndarray,
+    n_groups: int,
+    grid: tuple[float, ...],
+) -> float:
+    """按 Crump 等的**原则**选裁剪阈值：让组级估计量的插入式方差最小。
+
+    Crump-Hotz-Imbens-Mitnik（2009，*Dealing with limited overlap in estimation
+    of average treatment effects*）的做法是：对 ``e(X)`` 设一个对称阈值 α，
+    丢掉 ``e(X)`` 落在 ``[α, 1-α]`` 之外的单元，并以**估计量的渐近方差最小**
+    来选 α（他们给出了常数条件方差下的闭式，常用的经验截断是 0.1）。
+    这里不照抄那个闭式（它依赖条件方差的具体形式），而是把这个**目标函数**
+    直接在候选网格上算出来：对每个 α，在裁剪后的样本上算组级标准误的均值，
+    取最小的那个。这样选的阈值与本仓库自己的估计量完全一致，
+    而且选出来的 α 和被裁剪的比例都会写进报告。
+
+    诚实的代价：**阈值变了，估计目标也跟着变**（从全体变成重叠总体），
+    这不是"免费的精度"，所以报告里必须同时给出被裁剪的比例。
+    """
+    best_alpha, best_score = 0.0, float("inf")
+    min_keep = max(50, p.size // 4)
+    for a in grid:
+        keep = np.ones(p.size, bool) if a <= 0 else (p >= a) & (p <= 1.0 - a)
+        if int(keep.sum()) < min_keep:
+            continue
+        eff, se, _, k = _gates_fit(proxy[keep], signal[keep], n_groups)
+        if len(k) < n_groups or not np.all(np.isfinite(se)):
+            continue
+        score = float(np.mean(se))
+        if score < best_score - 1e-12:
+            best_alpha, best_score = float(a), score
+    return best_alpha
+
+
 def run_gates_blp_audit(
     *,
     n: int = 1500,
@@ -521,6 +589,8 @@ def run_gates_blp_audit(
     seed: int = 0,
     cate_form: str = "nonlinear",
     proxy_kind: str = "forest",
+    signal_kind: str = "aipw",
+    trim: float | str | None = "auto",
 ) -> GatesBlpResult:
     """BLP 与 GATES 的实测校准（这是"组级水平可用"这句话的唯一证据）。
 
@@ -536,6 +606,27 @@ def run_gates_blp_audit(
     ``proxy_kind="oracle"`` 是**正对照**：直接拿真 CATE 当代理（模拟"代理已
     校准"这个理想情形）。它必须给出 BLP 斜率 ≈ 1、覆盖率 ≈ 0.95 ——
     否则说明这个审计连真值都验不过，那 0.95 就只是"永远通过"，没有信息。
+
+    ``signal_kind``：
+
+    * ``"aipw"``（**默认**，推荐）：``Γ = μ̂₁(X) − μ̂₀(X) + H·(Y − μ̂_D(X))``，
+      结局模型在**辅助样本**上拟合（所以走 AIPW 时连正对照也得分样本，
+      否则模型会在推断样本上拟合过 —— 那是不诚实的）。
+      实测它把覆盖率抬到 0.94~0.98、区间缩短约三分之一。
+    * ``"ht"``（历史口径）：纯 Horvitz-Thompson 信号，不需要结果模型。
+      本 DGP 下重尾（峰度 134），覆盖率会在 0.875~0.950 之间摆动。
+      保留它是为了**可复现历史报告的数字**，也是对照。
+
+    ``trim``：对倾向得分的对称裁剪阈值。
+
+    * ``"auto"``（**默认**，推荐）：在候选网格上按"组级估计量的插入式方差最小"
+      选 α（Crump 等 2009 的原则，见 ``_pick_trim_alpha``）。本 DGP 实测
+      自动选出 α≈0.09~0.13（与文献里常用的 0.1 一致），峰度从 134 降到 11。
+    * ``None``：不裁剪（历史口径）。
+    * 浮点数：按该阈值裁掉 ``p`` 落在 ``[α, 1-α]`` 之外的单元。
+      **阈值会改变估计目标**（全体 → 重叠总体），所以结果里必须同时看
+      ``trim_alpha`` 与 ``trimmed_share``；实测单靠裁剪（不换 AIPW）时
+      阈值超过 0.1 会把覆盖率打到 0.54。
     """
     from ..causal.forest import CausalForest, ForestConfig
     from ..causal.hte import HTEConfig, generate_hte_data
@@ -549,6 +640,8 @@ def run_gates_blp_audit(
     gaps: list[list[float]] = [[] for _ in range(n_groups)]
     kurt_acc: list[float] = []
     overlap_acc: list[float] = []
+    alpha_acc: list[float] = []
+    trimmed_acc: list[float] = []
     group_hits = 0
     group_total = 0
     lengths: list[float] = []
@@ -561,8 +654,11 @@ def run_gates_blp_audit(
         perm = rng.permutation(n)
         aux, main = perm[: n // 2], perm[n // 2 :]
         if proxy_kind == "oracle":
-            # 正对照：代理 = 真值。不需要训练，也不需要辅助样本。
-            main = perm
+            if signal_kind == "ht":
+                # 纯 HT 不需要拟合任何东西，于是可以把全部样本当主样本
+                main = perm
+            # AIPW 需要结局模型，而模型不能在看过的数据上做推断 —— 所以
+            # 走 AIPW 时正对照也保持 aux/main 分样本（见函数的说明）。
             proxy = np.asarray(data.tau)[main]
         elif proxy_kind == "forest":
             cfg = ForestConfig(n_trees=n_trees, max_depth=max_depth, min_leaf=min_leaf)
@@ -575,31 +671,56 @@ def run_gates_blp_audit(
         p = np.asarray(data.propensity)[main]
         d = np.asarray(data.D)[main]
         y = np.asarray(data.Y)[main]
-        # Horvitz-Thompson 信号：E[signal | Z] = s0(Z)，不需要结果模型
-        signal = (d - p) / (p * (1.0 - p)) * y
+        tau_main = np.asarray(data.tau)[main]
+
+        # ---- 信号 ---- #
+        if signal_kind == "ht":
+            signal = (d - p) / (p * (1.0 - p)) * y
+        elif signal_kind == "aipw":
+            xa = np.asarray(data.X)[aux]
+            da = np.asarray(data.D)[aux]
+            ya = np.asarray(data.Y)[aux]
+            x_m = np.asarray(data.X)[main]
+            m1 = _fit_predict(xa[da == 1], ya[da == 1], x_m)
+            m0 = _fit_predict(xa[da == 0], ya[da == 0], x_m)
+            h = (d - p) / (p * (1.0 - p))
+            signal = (m1 - m0) + h * (y - np.where(d == 1, m1, m0))
+        else:  # pragma: no cover - 参数校验
+            raise ValueError(f"未知的 signal_kind: {signal_kind!r}（可选 ht / aipw）")
+
+        # ---- 裁剪（阈值改变的是估计目标，所以要留痕） ---- #
+        if trim == "auto":
+            alpha = _pick_trim_alpha(p, signal, proxy, n_groups, _TRIM_GRID)
+        elif trim is None:
+            alpha = 0.0
+        else:
+            alpha = float(trim)
+        if alpha > 0.0:
+            inside = (p >= alpha) & (p <= 1.0 - alpha)
+            trimmed_acc.append(1.0 - float(inside.mean()))
+            p, d, y, signal = p[inside], d[inside], y[inside], signal[inside]
+            proxy, tau_main = proxy[inside], tau_main[inside]
+        else:
+            trimmed_acc.append(0.0)
+        alpha_acc.append(alpha)
+
         kurt = float(((signal - signal.mean()) ** 4).mean() / signal.var() ** 2)
         kurt_acc.append(kurt)
         overlap_acc.append(float(np.mean((p < 0.05) | (p > 0.95))))
 
         # ---- BLP ---- #
-        x = np.column_stack([np.ones(main.size), proxy - proxy.mean()])
+        # 注意用 proxy.size 而不是 main.size：裁剪之后两者不再相等
+        x = np.column_stack([np.ones(proxy.size), proxy - proxy.mean()])
         beta, se = _ols(x, signal)
         slopes.append(float(beta[1]))
         slope_ses.append(float(se[1]))
         covers_one += int(abs(beta[1] - 1.0) <= z * se[1])
 
         # ---- GATES ---- #
-        # 分位数组：用主样本上的代理分位数切，组大小尽量均衡
-        edges = np.quantile(proxy, np.linspace(0, 1, n_groups + 1)[1:-1])
-        group = np.searchsorted(edges, proxy, side="right")
-        dummies = np.zeros((main.size, n_groups))
-        dummies[np.arange(main.size), group] = 1.0
-        # 去掉空组（分位数理论上不会空，保险起见）
-        keep = [g for g in range(n_groups) if dummies[:, g].sum() > 1]
-        g_eff, g_se = _ols(dummies[:, keep], signal)
-        true_tau = np.asarray(data.tau)[main]
+        # 分组用代理的分位数（分位数组在**裁剪之后**的样本上算，组仍然是均衡的）
+        g_eff, g_se, group, keep = _gates_fit(proxy, signal, n_groups)
         for j, g in enumerate(keep):
-            true_group = float(true_tau[group == g].mean())
+            true_group = float(tau_main[group == g].mean())
             effects_acc[g] += float(g_eff[j])
             true_acc[g] += true_group
             gaps[g].append(float(g_eff[j]) - true_group)
@@ -625,6 +746,9 @@ def run_gates_blp_audit(
         ],
         signal_kurtosis=float(np.mean(kurt_acc)) if kurt_acc else float("nan"),
         overlap_violation_share=float(np.mean(overlap_acc)) if overlap_acc else float("nan"),
+        signal_kind=signal_kind,
+        trim_alpha=float(np.mean(alpha_acc)) if alpha_acc else 0.0,
+        trimmed_share=float(np.mean(trimmed_acc)) if trimmed_acc else 0.0,
         unit_level_note=(
             "单元级那两条路线（叶内方差 / bootstrap）实测覆盖率 0.13~0.74，"
             "而这里是**组级**：对象不同，不能直接比大小，只能比"

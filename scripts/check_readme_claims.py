@@ -70,6 +70,10 @@ CLAIMS: list[tuple[str, str, str]] = [
     ("M4·信号选择：裁剪与 AIPW 的分工", "cate_interval_report.md", "裁剪管尾巴"),
     ("M4·信号选择：这是一次自我纠正", "cate_interval_report.md", "自我纠正"),
     ("M4·信号选择：四版本对照表的列", "cate_interval_report.md", "信号 sd"),
+    # 默认路径（AIPW + 自动裁剪）：仍然只加文本类声明（数值随 --quick 变）
+    ("M4·默认路径：已接成默认", "cate_interval_report.md", "默认路径"),
+    ("M4·默认路径：代价是估计目标变了", "cate_interval_report.md", "重叠总体"),
+    ("M4·默认路径：阈值有文献依据", "cate_interval_report.md", "Crump"),
     ("数仓：CUPED 与 DWD 明细一致", "warehouse_report.md", "一致"),
     ("数仓：ADS 判据写在报告里", "warehouse_report.md", "判据"),
     # 比值链路（06/07）的数字 —— 它们是"接通了"这件事唯一的实测证据

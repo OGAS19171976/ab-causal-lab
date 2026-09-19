@@ -504,6 +504,59 @@ class TestGatesBlp:
         with pytest.raises(ValueError, match="proxy_kind"):
             run_gates_blp_audit(n=200, n_splits=1, proxy_kind="nonsense")
 
+    def test_default_path_is_aipw_with_auto_trim(self):
+        """**默认路径已经是推荐配置**：不是纯 HT，而是 AIPW + 自动裁剪。
+
+        实测（n=1500、8 次分裂）：默认路径峰度 17.1、区间长度 1.1393；
+        历史口径（纯 HT）峰度 70.9、长度 1.8823 —— 覆盖率两者都在
+        0.94~0.97，差别在**区间的宽窄与稳定性**。
+
+        自动选出的阈值落在 0.069（同配置下 4 次分裂是 0.05~0.13），
+        裁掉 9.1% 的单元 —— 这个比例必须被报告，因为**阈值改变了估计目标**
+        （从全体变成重叠总体）。
+        """
+        r = self._run("forest")
+        assert r.signal_kind == "aipw"
+        assert 0.02 <= r.trim_alpha <= 0.20, r.trim_alpha
+        assert 0.0 < r.trimmed_share < 0.35, r.trimmed_share
+        assert r.gates_coverage > 0.8
+
+    def test_historical_ht_path_is_still_reachable(self):
+        """历史口径必须**仍然可复现** —— 报告里那 4 行老数字靠它。
+
+        换了默认值不等于删掉旧路径：`signal_kind="ht", trim=None` 必须
+        逐位给出换默认之前的数（BLP 斜率 2.3618、覆盖率 0.9417）。
+        这条断言只钉"没裁剪 + 峰度是重的"，具体数值由报告锁定。
+        """
+        from ablab.validation.hte_audit import run_gates_blp_audit
+
+        r = run_gates_blp_audit(
+            n=1500, n_splits=8, n_groups=4, seed=0,
+            proxy_kind="forest", signal_kind="ht", trim=None,
+        )
+        assert r.signal_kind == "ht"
+        assert r.trim_alpha == 0.0
+        assert r.trimmed_share == 0.0
+        assert r.signal_kurtosis > 10.0  # 纯 HT 的尾巴还在
+        assert r.gates_mean_length > self._run("forest").gates_mean_length
+
+    def test_default_beats_historical_on_tail_and_length(self):
+        """默认路径比历史口径**尾巴更轻、区间更短**，覆盖率不明显更差。
+
+        这是"接成默认"这个决定本身的证据；如果哪天它反过来了，
+        这个默认值就该改回去，而不是让 README 继续推荐它。
+        """
+        from ablab.validation.hte_audit import run_gates_blp_audit
+
+        new = self._run("forest")
+        old = run_gates_blp_audit(
+            n=1500, n_splits=8, n_groups=4, seed=0,
+            proxy_kind="forest", signal_kind="ht", trim=None,
+        )
+        assert new.signal_kurtosis < old.signal_kurtosis / 2
+        assert new.gates_mean_length < old.gates_mean_length
+        assert new.gates_coverage > 0.8
+
 
 class TestSignalComparison:
     """信号怎么选：**裁剪管尾巴、AIPW 管方差** —— 这条是测出来的，不是推的。
