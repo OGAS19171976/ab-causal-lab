@@ -133,6 +133,39 @@ WAREHOUSE_DEMO: dict[str, Any] = {
     "start_ds": "2026-03-01",
     "true_lift": 2.0,
     "warehouse_experiment": "exp_rank_v2",
+    "guardrail_specs": [
+        {"name": "latency_p99", "direction": "lower_is_better", "max_harm": 0.05},
+    ],
+}
+
+#: 绑定数仓的**簇随机化**演示记录（`exp_city_ctr` 按城市分流）。
+#:
+#: 它与上面那条的区别是**分析单元**：`analysis_unit="cluster"` 时平台改读
+#: 簇粒度 DWS（05），检验也在簇级做。整簇随机化下按单元做检验会把
+#: I 类错误率抬到 60% 以上（M1/M6 实测 69.3%），而那个 p 值看起来完全正常 ——
+#: 所以这条记录存在的意义就是让"声明了 cluster 就真的按簇分析"这件事可被走通。
+WAREHOUSE_CLUSTER_DEMO: dict[str, Any] = {
+    "name": "wh_exp_city_ctr",
+    "hypothesis": "【数仓·簇级】城市级投放策略提升人均互动次数（整簇随机化）",
+    "owner": "growth",
+    "layer": "geo",
+    "variants": [
+        {"name": "control", "weight": 0.5},
+        {"name": "treatment", "weight": 0.5},
+    ],
+    "salt": "wh_exp_city_ctr_v1",
+    "primary_metric": "post_metric_14d",
+    "guardrails": ["latency_p99"],
+    "guardrail_specs": [
+        {"name": "latency_p99", "direction": "lower_is_better", "max_harm": 0.05},
+    ],
+    "status": "running",
+    "start_ds": "2026-03-01",
+    "true_lift": 1.5,
+    "warehouse_experiment": "exp_city_ctr",
+    "analysis_unit": "cluster",
+    # 簇级 CUPED：05 路 DWS 里本来就落了簇级 pre/cross 列，所以这里能开
+    "estimator": "cuped",
 }
 
 
@@ -156,6 +189,7 @@ def seed_demo(
     todo = list(DEMO_EXPERIMENTS)
     if warehouse_available:
         todo.append(WAREHOUSE_DEMO)
+        todo.append(WAREHOUSE_CLUSTER_DEMO)
 
     added = 0
     for spec in todo:

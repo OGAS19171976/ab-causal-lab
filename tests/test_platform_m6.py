@@ -140,12 +140,19 @@ class TestAnalysisUnit:
         last = rep.monitoring[-1]
         assert last["effect"] == rep.primary.absolute_effect
 
-    def test_cluster_with_cuped_is_rejected(self, registry):
-        """整簇路径没有簇级前置指标，CUPED 不可用 —— 创建时就拦住。"""
-        with pytest.raises(RegistryError, match="cluster"):
-            registry.create(actor=ACTOR, 
-                name="cl4", variants=TWO_ARM, analysis_unit="cluster", estimator="cuped"
-            )
+    def test_cluster_with_cuped_is_now_allowed(self, registry):
+        """**改写了**：这条原先断言"整簇 + CUPED 在创建时被拒"。
+
+        拒绝的理由是"数据源没有簇级前置指标"，而那是一个**过时假设**：
+        05 路 DWS 一直落着簇级的 pre_sum / pre_sq_sum / pre_post_cross_sum
+        （实测 pre_sum ≈ 4.4e6）。现在按声明放行；真拿不到前置指标时由分析层
+        报错（数据驱动的检查），而不是在这里一刀切拦住。
+        """
+        rec = registry.create(
+            actor=ACTOR,
+            name="cl4", variants=TWO_ARM, analysis_unit="cluster", estimator="cuped",
+        )
+        assert rec.analysis_unit == "cluster" and rec.estimator == "cuped"
 
     def test_cluster_stats_must_merge_back(self):
         """簇级统计量合并回去必须等于臂级统计量（两次读取口径一致）。"""
@@ -325,15 +332,27 @@ class TestDeclarationsThroughAPI:
         assert r["primary_estimator_name"] == "ratio_delta"
         assert any(c["name"] == "指标类型" for c in r["checks"])
 
-    def test_illegal_cluster_cuped_combo_is_400(self, client):
-        r = client.post("/api/experiments", json={
-            "name": "api_bad_combo",
+    def test_cluster_cuped_combo_is_accepted_by_the_api(self, client):
+        """**改写了**：这个组合现在合法（理由见 TestAnalysisUnit 那条）。
+
+        仍然非法的是"比值指标 + CUPED"（那条理由是真的：比值链路里没有前置协变量），
+        这里一并确认它没被顺手放开。
+        """
+        ok = client.post("/api/experiments", json={
+            "name": "api_cluster_cuped",
             "variants": [{"name": "control", "weight": 0.5}, {"name": "treatment", "weight": 0.5}],
             "analysis_unit": "cluster",
             "estimator": "cuped",
         })
-        assert r.status_code == 400
-        assert "cluster" in r.json()["detail"]
+        assert ok.status_code == 201, ok.text
+        bad = client.post("/api/experiments", json={
+            "name": "api_bad_combo",
+            "variants": [{"name": "control", "weight": 0.5}, {"name": "treatment", "weight": 0.5}],
+            "metric_type": "ratio",
+            "estimator": "cuped",
+        })
+        assert bad.status_code == 400
+        assert "比值" in bad.json()["detail"] or "ratio" in bad.json()["detail"].lower()
 
     def test_design_power_endpoint(self, client):
         r = client.post("/api/design/power", json={

@@ -80,8 +80,8 @@ CLAIMS: list[tuple[str, str, str]] = [
     ("数仓：CUPED 与 DWD 明细一致", "warehouse_report.md", "一致"),
     ("数仓：ADS 判据写在报告里", "warehouse_report.md", "判据"),
     # 比值链路（06/07）的数字 —— 它们是"接通了"这件事唯一的实测证据
-    ("数仓·比值：正对照实验的效应", "warehouse_report.md", "2.350765"),
-    ("数仓·比值：负对照也显著（诚实记下）", "warehouse_report.md", "0.739366"),
+    ("数仓·比值：正对照实验的效应", "warehouse_report.md", "2.297438"),
+    ("数仓·比值：负对照也显著（诚实记下）", "warehouse_report.md", "0.671170"),
     ("数仓·比值：末次查看 == 主结论", "warehouse_report.md", "末次查看 == 主结论：True"),
     ("治理：审计删不掉", "governance_report.md", "append-only"),
     # 原"治理：护栏未分析"这条已删除：护栏现在**真的**会被判定，
@@ -101,6 +101,9 @@ CLAIMS: list[tuple[str, str, str]] = [
     # 数仓护栏链路：两臂均值与"事件名过滤"是稳定的
     ("数仓·护栏：长表链路", "warehouse_report.md", "dim_guardrail_config"),
     ("数仓·护栏：注入的伤害可见", "warehouse_report.md", "latency_p99"),
+    # 簇级 CUPED（文本类：数值随数据重生成会变）
+    ("数仓·簇级 CUPED：口径已打开", "warehouse_report.md", "簇级 CUPED"),
+    ("数仓·簇级 CUPED：观测单位是簇", "warehouse_report.md", "观测单位都是簇"),
 ]
 
 

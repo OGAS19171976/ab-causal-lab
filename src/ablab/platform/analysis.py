@@ -243,8 +243,17 @@ def _headline_path(
     而是在体检项里单独报口径差的**点估计** —— 放一个算不出 SE 的 z 更不诚实。
     """
     if data.analysis_unit == "cluster":
-        # 对照放"单元级"：那是 M1 里 FPR 64.5% 的那个错误做法，
+        # **按声明走**：这一支原先写死成"簇级 post-only + 单元级对照"，
+        # 于是声明 estimator='cuped' 的簇级实验会被**静默忽略** ——
+        # 报告里既没有 CUPED 那一项，也没人知道声明的口径没生效。
+        # 现在：声明什么就用什么（簇级的两种口径都在），
+        # 对照仍然放"单元级"：那是 M1 里 FPR 64.5% 的那个错误做法，
         # 摆在旁边正好说明为什么分析单元必须与随机化单元对齐。
+        if data.primary_estimator == "cuped":
+            return (
+                lk.cluster_cuped()[0], "cluster_cuped",
+                lk.cluster_level(), "cluster_level",
+            )
         return lk.cluster_level(), "cluster_level", lk.post_only(), "unit_level"
     if data.metric_type == "ratio":
         return lk.ratio_delta(), "ratio_delta", None, None
@@ -386,6 +395,12 @@ def analyse_data(data: ExperimentData, *, alpha: float = 0.05) -> ExperimentRepo
             raise ValueError("均值指标的用户级分析必须同时给出 post-only 与 CUPED 两个口径")
         primary = cuped if primary_name == "cuped" else naive
         alt = naive if primary_name == "cuped" else cuped
+    if primary_name == "cluster_cuped":
+        # 簇级 CUPED 也要落到 `cuped` / `cuped_fit` 两个字段上。
+        # 否则报告里"用了簇级 CUPED"只能从 primary_estimator_name 看出来，
+        # 而 to_dict()/API 的 cuped 字段是 None —— 读起来像"没跑"，
+        # 正是"声明了却看不出来"的那类毛病。
+        cuped, fit = total.cluster_cuped()
 
     # ---- 3. 序贯监控路径 --------------------------------------------------- #
     design = design_for(data, alpha)

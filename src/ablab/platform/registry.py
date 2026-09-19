@@ -625,14 +625,13 @@ class ExperimentRegistry:
             )
         if metric_type not in METRIC_TYPES:
             raise RegistryError(f"metric_type 必须是 {METRIC_TYPES} 之一，收到 {metric_type!r}")
-        if analysis_unit == "cluster" and estimator == "cuped":
-            # 早失败：整簇路径需要**簇级**前置指标才能做 CUPED，
-            # 而当前数仓/合成数据都还没有它。与其在分析时报错，不如创建时就拦住。
-            raise RegistryError(
-                "analysis_unit='cluster' 与 estimator='cuped' 不能同时选："
-                "整簇随机化需要簇级的前置指标才能做 CUPED，当前数据源没有提供；"
-                "请把 estimator 设为 'post_only'"
-            )
+        # 簇级 CUPED 现在**放行**了：05 路 DWS 一直落着簇级的
+        # pre_sum / pre_sq_sum / pre_post_cross_sum（当时的注释就写着
+        # "将来做簇级 CUPED 时不必改这一层"），只是平台侧硬编码成了 post_only。
+        # 那个硬编码与这条闸门都基于一个**过时的假设**（"簇 DGP 没有前置期"），
+        # 实测数仓里 pre_sum ≈ 4.4e6，前置期是有的。
+        # 现在按声明走：estimator 是什么就用什么；真拿不到簇级前置指标时，
+        # 由分析层报错（而不是在这里提前拦住一条其实走得通的路）。
 
         if metric_type == "ratio" and estimator == "cuped":
             # 同一个理由、同一个位置：CUPED 需要**前置协变量**，

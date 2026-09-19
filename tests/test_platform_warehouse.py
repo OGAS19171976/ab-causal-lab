@@ -379,9 +379,11 @@ class TestWarehouseAnalysisUnit:
                 build_warehouse_data(warehouse_con, experiment, analysis_unit="cluster")
 
     def test_cluster_randomized_experiment_is_accepted(self, cluster_con):
+        # 口径按**声明**走：这里是"没显式声明"的情况，于是用默认的 cuped。
+        # （这条断言原先写死 post_only —— 那是硬编码时代的产物。）
         data = build_warehouse_data(cluster_con, "exp_city_rollout", analysis_unit="cluster")
         assert data.analysis_unit == "cluster"
-        assert data.primary_estimator == "post_only"
+        assert data.primary_estimator == "cuped"
         assert data.total.has_clusters
         assert data.total.clusters_consistent()
         # SRM 的对象是随机化单元 —— 簇数，不是用户数
@@ -402,7 +404,12 @@ class TestWarehouseAnalysisUnit:
 
     def test_cluster_level_matches_the_independent_implementation(self, cluster_con):
         """平台簇级结论 vs M1 的 ``cluster_level_ttest``（吃 DWD 明细）。"""
-        data = build_warehouse_data(cluster_con, "exp_city_rollout", analysis_unit="cluster")
+        # 这条测的是**簇级 Welch** 那条路径，所以显式声明 post_only ——
+        # 否则会走默认的簇级 CUPED，答的就是另一个问题了。
+        data = build_warehouse_data(
+            cluster_con, "exp_city_rollout", analysis_unit="cluster",
+            primary_estimator="post_only",
+        )
         rep = analyse_data(data)
         assert rep.primary_estimator_name == "cluster_level"
         assert rep.alt_estimator_name == "unit_level"
@@ -464,6 +471,167 @@ class TestWarehouseAnalysisUnit:
                            json={"n_looks": 5})
         assert r.status_code == 400
         assert "不是整簇随机化" in r.json()["detail"]
+
+
+class TestClusterCuped:
+    """簇级 CUPED：打开它，并且**不静默忽略声明**。
+
+    这一块原先有两处**过时假设**写死在代码里：
+      * 创建时拒绝 `analysis_unit=cluster` + `estimator=cuped`（理由是"数据源没有簇级前置指标"）；
+      * `ExperimentData.validate()` 里同样的拒绝；
+      * 以及分析层 `_headline_path` 把簇级路径写死成 post-only ——
+        于是就算前两处放行了，声明也会被**静默忽略**（报告里连 CUPED 那一项都没有）。
+    而 05 路 DWS 一直落着簇级的 pre_sum / pre_sq_sum / pre_post_cross_sum
+    （当时的注释就写着"将来做簇级 CUPED 时不必改这一层"），实测 pre_sum ≈ 4.4e6。
+    """
+
+    @staticmethod
+    def _cluster_record(estimator: str = "cuped"):
+        from ablab.platform.registry import ExperimentRecord
+
+        return ExperimentRecord(
+            name="exp_city_ctr",
+            variants=list(TWO_ARM),
+            salt="exp_city_ctr_v1",
+            primary_metric="post_metric_14d",
+            warehouse_experiment="exp_city_ctr",
+            analysis_unit="cluster",
+            estimator=estimator,
+        )
+
+    def test_cluster_randomized_experiment_exists_in_the_warehouse(self, warehouse_con):
+        """数仓里必须**真有**一个簇随机化实验，否则这条链路在演示里走不到。
+
+        实测（24 个城市）：处理组 9 个簇、对照组 15 个簇 —— 每臂 ≥ 2 个簇，
+        簇级方差的自由度（簇数 − 2）才有定义。
+        """
+        rows = dict(
+            warehouse_con.execute(
+                """
+                SELECT variant, COUNT(DISTINCT cluster_id)
+                FROM dws_experiment_cluster_daily
+                WHERE experiment = 'exp_city_ctr'
+                GROUP BY variant
+                """
+            ).fetchall()
+        )
+        assert rows, "没有簇随机化实验的簇表 —— 簇级链路在演示里走不到"
+        assert rows["control"] >= 2 and rows["treatment"] >= 2, rows
+
+    def test_unit_randomized_experiment_still_refuses_cluster_analysis(
+        self, warehouse_con
+    ):
+        """闸门没被放松：人级随机化的实验按城市分析必须**被拒**。
+
+        簇级检验假设"处理在簇级别分配"。同一个城市里既有对照又有处置时，
+        按城市算的簇级方差量到的不是随机化带来的变异 —— 实测把 I 类错误率
+        从 6% 抬到 69%。这条闸门是 M1 留下的，不能被这一轮的放行顺手拆掉。
+        """
+        import pytest
+
+        from ablab.platform.analysis import analyse_experiment_from_warehouse
+        from ablab.platform.registry import ExperimentRecord
+
+        rec = ExperimentRecord(
+            name="wh_exp_rank_v2",
+            variants=list(TWO_ARM),
+            salt="wh_exp_rank_v2_v1",
+            primary_metric="post_metric_14d",
+            warehouse_experiment="exp_rank_v2",  # 人级随机化
+            analysis_unit="cluster",
+            estimator="post_only",
+        )
+        with pytest.raises(ValueError, match="簇"):
+            analyse_experiment_from_warehouse(rec, warehouse_con)
+
+    def test_cluster_cuped_reduces_variance_and_keeps_cluster_units(
+        self, warehouse_con
+    ):
+        """簇级 CUPED 真的在起作用：方差缩减 > 0，且观测单位仍是**簇**。
+
+        实测：方差缩减 ~31%，标准误降 ~17%（簇级前置指标与后置指标的相关
+        在簇之间是真实存在的）。自由度按"簇数 − 2"，不是"用户数 − 2"。
+        """
+        from ablab.platform.analysis import analyse_experiment_from_warehouse
+
+        rec = self._cluster_record("cuped")
+        report = analyse_experiment_from_warehouse(rec, warehouse_con)
+        assert report.cuped is not None and report.cuped_fit is not None
+        assert report.cuped_fit.variance_reduction > 0.05, report.cuped_fit
+        cuped_item = next(c for c in report.checks if c.name == "CUPED 收益")
+        assert cuped_item.status == "pass"
+        # 主口径就是簇级 CUPED（不是被静默忽略）
+        assert report.primary_estimator_name == "cluster_cuped", (
+            report.primary_estimator_name
+        )
+        # 观测单位是簇：n_treatment 应当等于簇数，而不是用户数
+        n_clusters_t = warehouse_con.execute(
+            "SELECT COUNT(DISTINCT cluster_id) FROM dws_experiment_cluster_daily "
+            "WHERE experiment = 'exp_city_ctr' AND variant = 'treatment'"
+        ).fetchone()[0]
+        assert report.cuped.n_treatment == int(n_clusters_t)
+
+    def test_post_only_cluster_path_still_works_and_reports_unit_level_contrast(
+        self, warehouse_con
+    ):
+        """post-only 那条路径不受影响，而且**照旧报单元级对照**。
+
+        那个对照是 M1 里 I 类错误率 69% 的错误做法，摆在旁边用来说明
+        "分析单元必须与随机化单元对齐"；放行 CUPED 不该把它弄丢。
+        """
+        from ablab.platform.analysis import analyse_experiment_from_warehouse
+
+        rec = self._cluster_record("post_only")
+        report = analyse_experiment_from_warehouse(rec, warehouse_con)
+        item = next(c for c in report.checks if c.name == "分析单元")
+        assert item.status == "info"
+        assert "单元级" in item.message, item.message
+
+    def test_cluster_cuped_without_pre_metric_raises_instead_of_falling_back(self):
+        """拿不到簇级前置指标时**报错**，而不是静默退回 post-only。
+
+        "声明了 CUPED 却按 post-only 出结论"正是 M6 那条老毛病；
+        这里用一份人为把 sum_x 清零的簇级统计量来验证它。
+        """
+        import numpy as np
+        import pytest
+
+        from ablab.inference.aggregates import AggregateStats
+        from ablab.platform.datasource import LookData
+
+        def arm() -> tuple[AggregateStats, ...]:
+            return tuple(
+                AggregateStats(n=100, sum_x=0.0, sum_y=float(i + 1) * 100.0)
+                for i in range(4)
+            )
+
+        look = LookData(
+            label="look 1",
+            information_fraction=1.0,
+            treatment=AggregateStats(n=400, sum_y=600.0),
+            control=AggregateStats(n=400, sum_y=600.0),
+            cluster_treatment=arm(),
+            cluster_control=arm(),
+        )
+        assert not look.clusters_have_pre_metric
+        with pytest.raises(ValueError, match="前置指标"):
+            look.cluster_cuped()
+        # 有前置指标时同一份数据就能算
+        with_pre = tuple(
+            AggregateStats(n=100, sum_x=float(i + 1) * 10.0, sum_y=float(i + 1) * 12.0)
+            for i in range(4)
+        )
+        ok = LookData(
+            label="look 1",
+            information_fraction=1.0,
+            treatment=AggregateStats(n=400, sum_y=600.0),
+            control=AggregateStats(n=400, sum_y=600.0),
+            cluster_treatment=with_pre,
+            cluster_control=with_pre,
+        )
+        assert ok.clusters_have_pre_metric
+        estimate, _fit = ok.cluster_cuped()
+        assert np.isfinite(estimate.absolute_effect)
 
 
 class TestWarehouseGuardrails:

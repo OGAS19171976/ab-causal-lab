@@ -22,12 +22,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
 
 from ..assignment import ExperimentSpec, Layer, LayerSlot, Randomizer, Variant
-from ..hashing import KeyBatcher
+from ..hashing import KeyBatcher, murmur3_32
 
 __all__ = [
     "ExperimentDef",
@@ -103,6 +104,29 @@ DEFAULT_EXPERIMENTS: tuple[ExperimentDef, ...] = (
         ),
     ),
     ExperimentDef(
+        # **簇随机化**实验：分流在**城市**级别做（同一个城市里的用户拿到同一分支）。
+        # 为什么仓库里必须有这么一个：没有它，`dws_experiment_cluster_daily`、
+        # "簇必须是整簇落在一臂"的闸门、以及簇级 CUPED 这三条链路
+        # 在演示里**根本走不到** —— 而走不到的代码等于没有验证过的代码。
+        name="exp_city_ctr",
+        layer="geo",
+        layer_salt="layer_geo",
+        bucket_start=0,
+        bucket_end=10_000,
+        true_lift=1.5,
+        hypothesis="城市级投放策略提升人均互动次数（整簇随机化）",
+        cluster_key="city",
+        # **不在这里声明护栏**，尽管它本来也可以有。原因是一处正在踩到的坑：
+        # ODS 的事件表是 (ds, user_id, event_name, metric_value)，
+        # **没有 experiment 这一列**。于是"同名护栏由两个实验各生成一遍"
+        # 会在同一 (用户, 日, 名字) 上留下两行：08 路的 `SUM(value)` 把它们都加上，
+        # 而 `COUNT(DISTINCT user)` 只算一个 —— 均值被**静默放大一倍**
+        # （实测 latency_p99 从 100 变成 200，伤害从 12% 变成 6%，
+        # 两个数看起来都很正常）。
+        # 这条约束写在这里，免得下次有人顺手给新实验也加一条同名护栏。
+        guardrails=(),
+    ),
+    ExperimentDef(
         name="exp_rec_emb",
         layer="recall",
         layer_salt="layer_recall",
@@ -128,7 +152,28 @@ class WarehouseConfig:
     user_level_mean: float = 50.0
     user_level_sd: float = 15.0
     daily_noise_sd: float = 10.0
-    cities: tuple[str, ...] = ("深圳", "杭州", "北京", "上海", "成都")
+    # 24 个城市而不是 5 个：簇级检验的自由度是**簇数**减 2，
+    # 5 个城市在 50/50 分流下每臂可能只剩 1~2 个簇，簇级方差直接无定义
+    # （实测 5 个城市时某个臂只有 1 个簇，簇级路径直接报错）。
+    # 城市只出现在用户维表与簇粒度 DWS 里，不影响单元级链路的任何数字。
+    # 60 个而不是 5 个：簇级检验的自由度是**簇数**减 2。
+    # 5 个城市时某个臂可能只剩 1 个簇（簇级方差直接无定义）；
+    # 24 个时 50/50 的哈希分流仍常出现 9/15 这类失衡（SRM 会触发，
+    # 而那是**真的**不平衡，不是误报 —— 只是演示数据不该自找麻烦）。
+    # 60 个簇让每臂大约 30 个，SRM 与簇级方差都稳。
+    #
+    # **名字必须等宽**（全是两个字）：分流用的 KeyBatcher 要求 unit_id 的
+    # UTF-8 字节长度一致，混进"哈尔滨""石家庄"这种三字名会直接报错。
+    cities: tuple[str, ...] = (
+        "深圳", "杭州", "北京", "上海", "成都", "广州", "武汉", "西安",
+        "南京", "重庆", "苏州", "天津", "长沙", "青岛", "郑州", "东莞",
+        "宁波", "佛山", "合肥", "福州", "厦门", "济南", "大连", "昆明",
+        "沈阳", "长春", "太原", "南昌", "贵阳", "南宁", "兰州", "银川",
+        "西宁", "海口", "三亚", "珠海", "中山", "惠州", "温州", "绍兴",
+        "嘉兴", "台州", "金华", "泉州", "烟台", "潍坊", "徐州", "常州",
+        "南通", "扬州", "芜湖", "洛阳", "襄阳", "宜昌", "株洲", "柳州",
+        "无锡", "汕头", "湛江", "江门",
+    )
     experiments: tuple[ExperimentDef, ...] = DEFAULT_EXPERIMENTS
 
 
@@ -178,7 +223,12 @@ def generate_source_data(
 
     exposure_frames: list[pd.DataFrame] = []
     guard_frames: list[pd.DataFrame] = []
-    guard_plans: list[tuple[ExperimentDef, np.ndarray, np.ndarray]] = []
+    guard_plans: list[tuple[ExperimentDef, np.ndarray, np.ndarray, Any]] = []
+    # 每个实验一个**独立随机流**：加一个新实验时，别的实验的数字不该跟着变。
+    # 第一版所有实验共用一条 rng，于是「多加一个实验」会移动整条随机流，
+    # 全部实验的数据、以及 README 里引用过的每一个数字都会变 ——
+    # 实测就是这么发生的（加簇级实验时比值链路从 2.3508 变成 2.3308）。
+    # 种子用项目自己的 murmur3 挂在实验名上，所以它也与「是第几个」无关。
     config_rows: list[dict] = []
 
     for exp in cfg.experiments:
@@ -230,6 +280,9 @@ def generate_source_data(
         is_treatment = routed & (codes == 1)
         post_effect += np.where(is_treatment, exp.true_lift, 0.0)
 
+        exp_rng = np.random.default_rng(
+            (cfg.seed + murmur3_32(exp.name.encode("utf-8"))) % (2**32)
+        )
         idx = np.flatnonzero(routed)
         exposure_frames.append(
             pd.DataFrame(
@@ -239,7 +292,7 @@ def generate_source_data(
                     "ts": [
                         datetime.combine(expose_ds[i], datetime.min.time())
                         + timedelta(minutes=int(m))
-                        for i, m in zip(idx, rng.integers(0, 1440, idx.size))
+                        for i, m in zip(idx, exp_rng.integers(0, 1440, idx.size))
                     ],
                     "user_id": [user_ids[i] for i in idx],
                     "experiment": exp.name,
@@ -272,7 +325,7 @@ def generate_source_data(
 
         # 护栏事件的生成挪到后面：它要用到 offsets/active 这些**之后才定义**的量
         # （第一版直接写在这里，跑起来就是 UnboundLocalError: offsets）。
-        guard_plans.append((exp, routed, is_treatment))
+        guard_plans.append((exp, routed, is_treatment, exp_rng))
 
     # 同一用户重复曝光（用于验证 DWD 层的去重口径）
     exposures = pd.concat(exposure_frames, ignore_index=True)
@@ -314,12 +367,12 @@ def generate_source_data(
     # 建模成**长表**（event_name = 护栏名）而不是给主指标表加列：
     # 每个实验声明几个护栏是业务决定的，列式建模会逼着人每加一个护栏
     # 就改一次已发布层的表结构 —— 而按本仓库的规矩，那会让所有引用过的数字全变。
-    for exp, routed, is_treatment in guard_plans:
+    for exp, routed, is_treatment, exp_rng in guard_plans:
         for guard in exp.guardrails:
             # 伤害只作用于**处置组**，而且只在处置之后（is_post）
             boost = np.where(is_treatment, guard.harm, 0.0)
             sign = 1.0 if guard.direction == "lower_is_better" else -1.0
-            g_noise = rng.normal(1.0, guard.noise, (n, offsets.size))
+            g_noise = exp_rng.normal(1.0, guard.noise, (n, offsets.size))
             g_values = guard.baseline * g_noise * (
                 1.0 + sign * boost[:, None] * is_post[None, :]
             )

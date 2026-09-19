@@ -295,6 +295,50 @@ def main() -> int:
     except Exception as exc:  # 老库没有 09 路表
         emit(f"  （这份数仓里没有护栏链路：{type(exc).__name__}）")
 
+    # ---- 簇级 CUPED：整簇随机化下的口径与代价 ------------------------------ #
+    emit("\n### 簇级 CUPED：整簇随机化 + 前置指标（本轮打开的一条口径）")
+    emit("  这条口径原先被**创建时就拒绝**，理由写的是「数据源没有簇级前置指标」。")
+    emit("  实测那是个**过时假设**：05 路 DWS 一直落着簇级的 pre/cross 列，")
+    emit("  pre_sum ≈ 4.4e6。现在按声明走，真拿不到前置指标时由分析层报错。")
+    emit("")
+    try:
+        from ablab.platform.analysis import analyse_experiment_from_warehouse
+        from ablab.platform.registry import ExperimentRecord
+
+        demo_variants = [
+            {"name": "control", "weight": 0.5},
+            {"name": "treatment", "weight": 0.5},
+        ]
+        for est in ("post_only", "cuped"):
+            rec = ExperimentRecord(
+                name="exp_city_ctr", variants=demo_variants, salt="exp_city_ctr_v1",
+                primary_metric="post_metric_14d", warehouse_experiment="exp_city_ctr",
+                analysis_unit="cluster", estimator=est,
+            )
+            rep = analyse_experiment_from_warehouse(rec, con)
+            n_units = int(getattr(rep, "n_analysis_units", 0) or 0)
+            primary = rep.primary
+            if primary is None:  # 理论上不会发生；发生了就说出来，别静默跳过
+                emit(f"  estimator={est:<10} 报告没有主口径估计（跳过）")
+                continue
+            emit(f"  estimator={est:<10} 效应 {primary.absolute_effect:+.4f}"
+                 f"  SE {primary.std_error:.4f}"
+                 f"  分析单元数 {n_units}"
+                 f"（{'簇' if rep.analysis_unit == 'cluster' else '用户'}）")
+            if rep.cuped_fit is not None:
+                emit(f"    ρ={rep.cuped_fit.correlation:.4f}"
+                     f"  方差缩减 {rep.cuped_fit.variance_reduction:.2%}"
+                     f"  标准误降 {rep.cuped_fit.se_shrinkage:.2%}")
+        emit("")
+        emit("  两条口径的**观测单位都是簇**（自由度 = 簇数 − 2），CUPED 只是把")
+        emit("  每簇的 (前置均值, 后置均值) 当成一对观测再做回归调整 ——")
+        emit("  与单元级 CUPED 是同一份实现（``cuped_estimate``）。")
+        emit("  边界：这一轮**没有**量簇级 CUPED 的 A/A 校准（数仓只有一份实现，")
+        emit("  换不了 salt），所以只报「与 post-only 相比方差确实降了」，")
+        emit("  不声称名义覆盖率 —— 那句话要等一个能重复抽样的路径才敢写。")
+    except Exception as exc:
+        emit(f"  （这份数仓里没有簇级实验：{type(exc).__name__}: {exc}）")
+
     emit(f"\n总耗时 {time.perf_counter() - t0:.1f}s")
     con.close()
 

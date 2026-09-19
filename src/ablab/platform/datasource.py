@@ -137,6 +137,23 @@ class LookData:
 
     # -- 簇级 -------------------------------------------------------------- #
     @property
+    def clusters_have_pre_metric(self) -> bool:
+        """簇级统计量里**是否真的有前置指标**（``sum_x`` 不全为 0）。
+
+        为什么用"数据里有没有"来判，而不是按声明一刀切拒绝：
+        原先 `validate()` 里写死"整簇随机化下 CUPED 需要簇级前置指标，
+        当前数据源没有提供"，而那个判断基于一个**过时假设** ——
+        05 路 DWS 一直落着簇级的 pre_sum / pre_sq_sum / pre_post_cross_sum，
+        实测 pre_sum ≈ 4.4e6，前置期是有的。
+        现在的规则是：**有前置指标就允许，没有就报错**（报错，不是静默退回
+        post-only —— "声明了 CUPED 却按 post-only 出结论"正是 M6 那条老毛病）。
+        """
+        if not self.has_clusters:
+            return False
+        cluster_treatment, cluster_control = self.clusters
+        return any(abs(s.sum_x) > 1e-12 for s in (*cluster_treatment, *cluster_control))
+
+    @property
     def has_clusters(self) -> bool:
         return self.cluster_treatment is not None and self.cluster_control is not None
 
@@ -197,6 +214,31 @@ class LookData:
             n_control=c_clusters.n,
             mean_control=c_clusters.mean_y,
             var_control=c_clusters.var_y,
+        )
+
+    def cluster_cuped(self):
+        """**簇级 CUPED**，返回 ``(Estimate, CupedFit)``。
+
+        做法：先把每个簇压成一对观测 ``(前置均值, 后置均值)``，
+        再以**簇**为观测单位跑仓库里那套 CUPED（``cuped_estimate``）——
+        所以方向、θ̂ 的估计方式、SE 的算法都与单元级 CUPED **完全同一份代码**，
+        区别只在"观测单位是簇还是用户"。
+
+        为什么必须这样：整簇随机化下按**用户**做 CUPED 会把簇内相关当成独立信息，
+        SE 被低估、I 类错误率被抬高（单元级检验 69.3% 那个数就是这个毛病）。
+        把观测单位换成簇之后，自由度自然变成"簇数 − 2"。
+        """
+        from ..inference import cuped_estimate
+
+        if not self.has_clusters:
+            raise ValueError("这次查看没有簇级统计量，无法做簇级 CUPED")
+        cluster_treatment, cluster_control = self.clusters
+        if not self.clusters_have_pre_metric:
+            raise ValueError(
+                "簇级统计量里没有前置指标（sum_x 全为 0），做不了簇级 CUPED"
+            )
+        return cuped_estimate(
+            _cluster_pairs(cluster_treatment), _cluster_pairs(cluster_control)
         )
 
     @property
@@ -279,10 +321,14 @@ class ExperimentData:
             if not self.total.clusters_consistent():
                 raise ValueError("簇级统计量合并回去与臂级统计量不一致（两次读取口径不同）")
         if self.analysis_unit == "cluster" and self.primary_estimator == "cuped":
-            raise ValueError(
-                "整簇随机化下 CUPED 需要**簇级**的前置指标；当前数据源没有提供，"
-                "请把 estimator 设为 'post_only'"
-            )
+            if not self.total.clusters_have_pre_metric:
+                # 有条件才允许：数据里真有簇级前置指标就放行（05 路一直落着它），
+                # 没有就**报错**而不是静默退回 post_only —— 后者会让报告里的口径
+                # 与声明不一致，而那正是 M6 反复在防的事。
+                raise ValueError(
+                    "声明了簇级 CUPED，但簇级统计量里没有前置指标（sum_x 全为 0）——"
+                    "请改用 estimator='post_only'，或让数据源落下簇级 pre_sum"
+                )
         if len(self.looks) < 1:
             raise ValueError("至少需要一次查看")
         fractions = [lk.information_fraction for lk in self.looks]
@@ -317,6 +363,37 @@ class ExperimentData:
 
 def _close(a: float, b: float, tol: float = 1e-9) -> bool:
     return abs(float(a) - float(b)) <= tol
+
+
+def _cluster_pairs(clusters: tuple[AggregateStats, ...]) -> AggregateStats:
+    """把一组簇压成**以簇为观测单位**的充分统计量（``x`` = 前置、``y`` = 后置）。
+
+    每个簇贡献一个观测：``(x_i, y_i)`` = 该簇的前置均值与后置均值。
+    六个可加量在这里是**跨簇**求和的，所以之后无论算 θ̂ 还是算方差，
+    看到的都是"簇与簇之间"的变异 —— 这正是簇级推断该有的样子。
+
+    为什么用簇均值而不是簇总量：与 ``cluster_level()`` 的口径保持一致
+    （簇级 post-only 用的就是簇均值），否则 CUPED 与 post-only 会答两个不同的问题。
+    """
+    xs: list[float] = []
+    ys: list[float] = []
+    for c in clusters:
+        if c.n <= 0:
+            continue
+        xs.append(c.sum_x / c.n)
+        ys.append(c.sum_y / c.n)
+    if not xs:
+        return AggregateStats(n=0)
+    x = np.asarray(xs, dtype=float)
+    y = np.asarray(ys, dtype=float)
+    return AggregateStats(
+        n=int(x.size),
+        sum_x=float(x.sum()),
+        sum_y=float(y.sum()),
+        sum_xx=float((x * x).sum()),
+        sum_yy=float((y * y).sum()),
+        sum_xy=float((x * y).sum()),
+    )
 
 
 def _weight_map(raw: dict[str, float]) -> dict[str, float]:
@@ -1122,9 +1199,11 @@ def _warehouse_cluster_data(
              treated_name: float(t_row["design_weight"])}
         ),
         looks=looks,
-        # 簇级 CUPED 需要**簇级**前置指标。ADS 里只有用户级 pre_sum，
-        # 而簇级 DWS 里也有 —— 但当前簇 DGP 没有前置期，所以先只支持 post-only。
-        primary_estimator="post_only",
+        # **按声明走**：簇级 DWS 里一直有簇级的 pre/cross 列，
+        # 所以簇级 CUPED 是可行的（原先硬编码 post_only 基于一个过时假设）。
+        # 真拿不到前置指标时，CUPED 会在推断层报错，而不是静默退回 post-only ——
+        # "声明了 CUPED 却按 post-only 出结论"正是 M6 那条"口径不一致"的老毛病。
+        primary_estimator=primary_estimator,
         analysis_unit="cluster",
         metric_type="mean",
         true_lift=float(t_row["true_lift"]),

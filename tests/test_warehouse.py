@@ -237,7 +237,33 @@ class TestAnalysisOutput:
     def test_srm_does_not_trigger(self, warehouse):
         """分层分流是均匀的，两个实验都不该触发 SRM。"""
         con, _ = warehouse
+        # **SRM 必须在随机化单元上做。**
+        # 人级随机化的实验看用户数；簇随机化的实验要看**簇数** ——
+        # 实测 exp_city_ctr 的用户数是 10623 vs 9377（城市分流 32 vs 28，
+        # 每个城市的用户量相近，于是用户数跟着城市走），
+        # 拿用户数做 SRM 会得到一个 p≈1e-18 的"严重失衡"，
+        # 而那只是**分析单元选错了**：随机化单元是城市，不是用户。
+        clusters = {
+            row[0]: (int(row[1]), int(row[2]))
+            for row in con.execute(
+                """
+                SELECT experiment,
+                       SUM(CASE WHEN variant = 'control' THEN 1 ELSE 0 END),
+                       SUM(CASE WHEN variant = 'treatment' THEN 1 ELSE 0 END)
+                FROM (
+                    SELECT DISTINCT experiment, variant, cluster_id
+                    FROM dws_experiment_cluster_daily
+                ) GROUP BY experiment
+                """
+            ).fetchall()
+        }
+        cluster_randomized = {"exp_city_ctr"}
         for a in analyse_ads(con):
+            if a.experiment in cluster_randomized:
+                n_c, n_t = clusters[a.experiment]
+                # 60 个城市按哈希 50/50 分流：偏离 30/30 五五开是正常的
+                assert abs(n_c - n_t) <= 0.25 * (n_c + n_t), (n_c, n_t)
+                continue
             assert not a.srm_triggered, f"{a.experiment} 触发了 SRM"
 
     def test_negative_control_covariate_imbalance(self, warehouse):
@@ -304,7 +330,11 @@ class TestAnalysisOutput:
             "pre_post_cross_sum",
             "pre_post_cov",
         }
-        assert len(df) == 4  # 2 个实验 × 2 个分支
+        # 实验条数从**配置**推，不写死：写死会在加实验时红，
+        # 而那条红与被测的东西（ADS 的列）无关。
+        from ablab.warehouse.generate import DEFAULT_EXPERIMENTS
+
+        assert len(df) == 2 * len(DEFAULT_EXPERIMENTS)
 
     def test_cross_sum_enables_covariance(self, warehouse):
         """SQL 的 pre_post_cross_sum 必须能还原出正确的协方差。"""

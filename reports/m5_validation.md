@@ -79,10 +79,10 @@ exp_ui_density   exp_ui_density_v3         -0.10   -0.1943    -0.61   +0.1230   
 ==============================================================================
 5. 接口契约（TestClient，逐端点）
 ==============================================================================
-GET  /healthz                        -> {'status': 'ok', 'experiments': 4, 'version': '0.1.0'}
+GET  /healthz                        -> {'status': 'ok', 'experiments': 5, 'version': '0.1.0'}
 GET  /                               -> 200 text/html; charset=utf-8
-GET  /api/experiments                -> 4 条（本次 seed 新增 4）
-GET  /api/experiments?status=running -> 3 条
+GET  /api/experiments                -> 5 条（本次 seed 新增 5）
+GET  /api/experiments?status=running -> 4 条
 GET  /api/experiments?status=nope    -> 400
 POST /api/experiments（权重和!=1）    -> 400 实验 'bad' 的分支权重之和必须为 1，当前为 0.…
 POST /api/experiments（重名）         -> 400
@@ -93,10 +93,10 @@ GET  /api/experiments/nope           -> 404
 PATCH /api/experiments/{id}/status   -> 200
 POST analyze（90/10 + 30% 流量，每组仅 10 样本却要 20 次查看） -> 400 每组可用样本只有 10 个，不足以构造 20 次序贯查看（该…
 POST /api/validate/aa                -> FPR=0.0400 CI=(0.0204,0.0769) calibrated=True
-GET  /api/warehouse/experiments      -> available=True，2 个可选：['exp_rank_v2', 'exp_rec_emb']
-POST /bind（数仓里没有这个实验）       -> 400 数仓里没有实验 'nope'；可选：['exp_ra…
+GET  /api/warehouse/experiments      -> available=True，3 个可选：['exp_city_ctr', 'exp_rank_v2', 'exp_rec_emb']
+POST /bind（数仓里没有这个实验）       -> 400 数仓里没有实验 'nope'；可选：['exp_ci…
 POST /bind（合法）                    -> 200 bound=exp_rec_emb
-POST analyze（绑定后）                -> source=warehouse n=11,913 CUPED=-3.9243 p=0.06095
+POST analyze（绑定后）                -> source=warehouse n=11,913 CUPED=-3.1460 p=0.1384
 POST analyze（数仓路径带 seed）        -> 400 数仓链路的数据是既成的，seed 参数只对合成数据路…
 DELETE /api/experiments/{id}         -> 204
 GET  /api/experiments/{id}（删除后） -> 404
@@ -107,16 +107,17 @@ GET  /api/experiments/{id}（删除后） -> 404
 数仓: build/warehouse.duckdb
 
 可绑定的数仓实验：
+  exp_city_ctr     层=geo        分支=2  人数=20,000
   exp_rank_v2      层=ranking    分支=2  人数=16,033
   exp_rec_emb      层=recall     分支=2  人数=11,913
 
 三条路径：① DWD 明细  ② ADS 汇总（M0 的独立实现）③ 平台编排（M5）
 
 实验             路径              naive 效应    naive SE      CUPED 效应    CUPED SE
-exp_rank_v2    ① DWD 明细       27.248206    2.975240     23.342905    1.799728
-exp_rank_v2    ② ADS 汇总       27.248206    2.975240     23.342905    1.799728
-exp_rank_v2    ③ 平台编排         27.248206    2.975240     23.342905    1.799728
-               最大偏差           3.411e-13                        一致
+exp_rank_v2    ① DWD 明细       25.845760    2.993389     20.871835    1.811867
+exp_rank_v2    ② ADS 汇总       25.845760    2.993389     20.871835    1.811867
+exp_rank_v2    ③ 平台编排         25.845760    2.993389     20.871835    1.811867
+               最大偏差           4.547e-13                        一致
                最后一次查看 == 主结论：True
                监控信息比例（实际累计，不是日历天数）：[0.1924, 0.381, 0.6181, 0.8092, 1.0]
 
@@ -124,10 +125,10 @@ exp_rank_v2    ③ 平台编排         27.248206    2.975240     23.342905    1
   监控查看（按日累计）：[('2026-03-04', 1483), ('2026-03-08', 3011), ('2026-03-13', 4946), ('2026-03-17', 6463), ('2026-03-21', 7996)]
   末次边界=2.0657 reliable=True
 
-exp_rec_emb    ① DWD 明细       -9.941730    3.455110     -3.924325    2.094011
-exp_rec_emb    ② ADS 汇总       -9.941730    3.455110     -3.924325    2.094011
-exp_rec_emb    ③ 平台编排         -9.941730    3.455110     -3.924325    2.094011
-               最大偏差           3.411e-13                        一致
+exp_rec_emb    ① DWD 明细       -8.303264    3.487526     -3.146033    2.122964
+exp_rec_emb    ② ADS 汇总       -8.303264    3.487526     -3.146033    2.122964
+exp_rec_emb    ③ 平台编排         -8.303264    3.487526     -3.146033    2.122964
+               最大偏差           4.547e-13                        一致
                最后一次查看 == 主结论：True
                监控信息比例（实际累计，不是日历天数）：[0.1946, 0.3862, 0.6211, 0.8089, 1.0]
 

@@ -108,14 +108,19 @@ CUPED vs post-only  [randomized]
 
 ### 6. 数仓链路：CUPED 成为默认口径之后
 
+  exp_city_ctr（真实效应 +1.50/天）
+    post-only : +20.5279 SE 2.6881  p=2.331e-14  significant=True
+    CUPED     : +19.5075 SE 1.6314  p=7.727e-33  significant=True
+    ADS/DWD 交叉验证: True
+
   exp_rank_v2（真实效应 +2.00/天）
-    post-only : +27.2482 SE 2.9752  p=5.896e-20  significant=True
-    CUPED     : +23.3429 SE 1.7997  p=2.815e-38  significant=True
+    post-only : +25.8458 SE 2.9934  p=6.458e-18  significant=True
+    CUPED     : +20.8718 SE 1.8119  p=1.388e-30  significant=True
     ADS/DWD 交叉验证: True
 
   exp_rec_emb（真实效应 +0.00/天）
-    post-only : -9.9417 SE 3.4551  p=0.004017  significant=True
-    CUPED     : -3.9243 SE 2.0940  p=0.06095  significant=False
+    post-only : -8.3033 SE 3.4875  p=0.01729  significant=True
+    CUPED     : -3.1460 SE 2.1230  p=0.1384  significant=False
     ADS/DWD 交叉验证: True
 
 ### 7. 生成图表
