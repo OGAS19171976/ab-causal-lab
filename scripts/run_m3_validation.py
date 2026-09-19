@@ -362,8 +362,44 @@ def main() -> int:
     emit("  原因：IW 的每个 (g,t) 分格用**当时尚未处置**的单元当对照（对照集随 t 变），")
     emit("  而饱和回归只有一套双向固定效应，已处置队列的变化会进入比较 ——")
     emit("  这正是 Sun & Abraham 提醒的 forbidden comparison。")
-    emit("  所以：**有未处置组时用回归版（与 IW 等同）；没有时用 IW 版**。")
-    emit("  原文把最后一个队列当基准的做法本仓库**没有实现**，写在 README 已知边界里。")
+    emit("  所以：**有未处置组时用回归版（与 IW 等同）**。")
+    emit("")
+    emit("  **没有未处置组时怎么办**：原文那一步（用最后一个队列当基准）已经实现。")
+    emit("  Sun & Abraham 自己的 Stata 包把做法写得很具体：用最后处置队列当对照时，")
+    emit("  要**剔除未处置单元**、并且**只保留最后队列被处置之前的期数**。")
+    emit("  实测（600 单元、队列 3/5/7、无未处置组）：")
+    from ablab.causal import sun_abraham_regression as _sa_reg
+
+    cfg_no_never = StaggeredPanelConfig(
+        n_units=600, n_periods=10, cohorts=(3, 5, 7),
+        cohort_weights=(1 / 3, 1 / 3, 1 / 3), never_treated_share=0.0,
+        effects=(1.0, 2.0, 3.0, 3.0, 3.0), noise_sd=1.0, seed=5,
+    )
+    panel_nn, truth_nn = generate_staggered_panel(cfg_no_never)
+    iw_nn = sun_abraham(panel_nn, control_group="not_yet_treated")
+    naive_nn = _sa_reg(panel_nn, control_group="not_yet_treated")
+    last_nn = _sa_reg(
+        panel_nn, control_group="not_yet_treated", base_cohort="last_treated"
+    )
+
+    def _kdiff(a, b):
+        ks = set(a.event_study) & set(b.event_study)
+        return max(
+            abs(a.event_study[k].absolute_effect - b.event_study[k].absolute_effect)
+            for k in ks
+        )
+
+    emit(f"    未处置当基准（默认）：与 IW 的最大逐 k 差 {_kdiff(iw_nn, naive_nn):.3f}")
+    _d_naive, _d_last = _kdiff(iw_nn, naive_nn), _kdiff(iw_nn, last_nn)
+    emit(f"    最后队列当基准（新）：与 IW 的最大逐 k 差 {_d_last:.3f}"
+         f"（改善了 {_d_naive / _d_last:.0f} 倍）")
+    emit(f"    整体 ATT：IW {iw_nn.overall.absolute_effect:+.4f} vs "
+         f"新口径 {last_nn.overall.absolute_effect:+.4f}（真值 {truth_nn.overall_att:+.4f}）")
+    emit("    代价是**事件窗变短**（最后队列的处置后期数不再可估）——")
+    emit("    这是原文的要求，不是实现妥协；它有测试钉着。")
+    emit("")
+    emit("  一句话口径：**有未处置组 -> 默认（1e-14 量级一致）；")
+    emit("  没有 -> base_cohort='last_treated'（差 2.39 -> 0.047）**。")
 
     # ---- 2.7 回归版的交叉验证顺手抓出来的 bug：对照泄漏 -------------------- #
     #

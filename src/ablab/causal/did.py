@@ -27,7 +27,7 @@ from scipy import stats
 
 from ..inference.result import Diagnostic, Estimate, Status
 from ..inference.welch import t_inference, welch_inference
-from .panel import GroundTruth, Panel
+from .panel import GroundTruth, Panel, never_treated_code
 
 __all__ = [
     "two_by_two_did",
@@ -915,10 +915,14 @@ def _absorb_two_way(
     resid = values.astype(float, copy=True)
     resid -= resid.mean()
     for _ in range(max_iter):
-        cnt_u = np.bincount(unit_idx, minlength=n_units).astype(float)
+        # ``maximum(cnt, 1)``：限制样本之后，某些单元/期数可能**一个观测都不剩**
+        # （例如"最后一个队列当基准"时会砍掉最后期的所有观测）。
+        # 不保护就会 0/0 出 NaN，而 NaN 会一路传染到系数里 —— 报的还是 RuntimeWarning，
+        # 很容易被忽略。
+        cnt_u = np.maximum(np.bincount(unit_idx, minlength=n_units), 1).astype(float)
         mu = np.bincount(unit_idx, weights=resid, minlength=n_units) / cnt_u
         resid -= mu[unit_idx]
-        cnt_t = np.bincount(time_idx, minlength=n_times).astype(float)
+        cnt_t = np.maximum(np.bincount(time_idx, minlength=n_times), 1).astype(float)
         mt = np.bincount(time_idx, weights=resid, minlength=n_times) / cnt_t
         resid -= mt[time_idx]
         if np.max(np.abs(mu)) < tol and np.max(np.abs(mt)) < tol:
@@ -933,6 +937,7 @@ def sun_abraham_regression(
     min_k: int | None = None,
     max_k: int | None = None,
     alpha: float = 0.05,
+    base_cohort: str = "never_treated",
 ) -> SAResult:
     """Sun & Abraham (2021) 的**回归版**：一条回归 + 队列×相对期数交互项 + 双向固定效应。
 
@@ -957,9 +962,18 @@ def sun_abraham_regression(
       已处置队列的变化会进入比较 —— 这正是 Sun & Abraham 提醒的
       "forbidden comparison"。
 
-    所以这一版的定位是**可核对的回归形式**：有未处置组时它给出与 IW 等同的结果，
-    没有未处置组时应当用 IW 版（或者像原文那样把最后一个队列当基准，
-    本仓库**没有实现**那一步，理由写在 README 的已知边界里）。
+    ``base_cohort="last_treated"`` 就是原文那一步（**本轮补上**）。
+    Sun & Abraham 自己的 Stata 包（``eventstudyinteract``）把做法写得很具体：
+    "If using last-treated unit as control cohort, **exclude the time periods when
+    the last cohort receives treatment**"，并且示例里同时剔除了未处置单元。
+    所以这一步等于：
+
+    1. 估计样本 = **最终会被处置的单元**，且 **``t < g_last``**；
+    2. 设计矩阵丢掉最后一个队列的交互项（它当基准，就像未处置组那样）；
+    3. 聚合权重仍然按各队列份额（与 IW 版同一套 ``_aggregate_sa``）。
+
+    这样"没有未处置组"时也有一条干净的回归路径 —— 而它到底等不等于 IW 版，
+    由实测回答（见 ``reports/m3_validation.md`` 的 2.6 节），不靠推断。
 
     实现要点：
 
@@ -972,17 +986,42 @@ def sun_abraham_regression(
     """
     n_units, n_periods = panel.n_units, panel.n_periods
     periods = np.asarray(panel.periods)
-    unit_idx = np.repeat(np.arange(n_units), n_periods)
-    time_idx = np.tile(np.arange(n_periods), n_units)
-    y_long = panel.outcome.reshape(-1)
+
+    # ---- 样本与基准队列 ---------------------------------------------------- #
+    cohorts_all = [int(g) for g in panel.cohorts()]
+    if base_cohort not in ("never_treated", "last_treated"):
+        raise ValueError(
+            f"base_cohort 必须是 never_treated / last_treated，收到 {base_cohort!r}"
+        )
+    g_last = max(cohorts_all) if cohorts_all else None
+    sample = np.ones((n_units, n_periods), dtype=bool)
+    if base_cohort == "last_treated":
+        if g_last is None or len(cohorts_all) < 2:
+            raise ValueError(
+                "base_cohort='last_treated' 至少需要两个队列（最后一个当基准）"
+            )
+        # 原文（eventstudyinteract 文档）：用最后处置队列当对照时，
+        # **剔除未处置单元**、并且**只保留最后队列被处置之前的期数**。
+        # 两条都必要：不剔除未处置单元就还有另一套对照；
+        # 不限制期数，最后一个队列自己就变成"处置后"了，基准被污染。
+        keep_unit = panel.cohort != never_treated_code
+        keep_time = panel.periods < g_last
+        sample = keep_unit[:, None] & keep_time[None, :]
+
+    unit_idx = np.repeat(np.arange(n_units), n_periods)[sample.reshape(-1)]
+    time_idx = np.tile(np.arange(n_periods), n_units)[sample.reshape(-1)]
+    y_long = panel.outcome.reshape(-1)[sample.reshape(-1)]
 
     # ---- 设计矩阵：队列 × 相对期数（去掉基准期 k=-1） --------------------- #
     cols: list[np.ndarray] = []
     keys: list[tuple[int, int]] = []
     n_by_key: dict[tuple[int, int], int] = {}
-    for g in panel.cohorts():
-        g = int(g)
+    for g in cohorts_all:
         if g - 1 < 1:  # 基准期不存在（队列在面板第一期中就被处置）
+            continue
+        if base_cohort == "last_treated" and g == g_last:
+            # 最后一个队列当**基准**：它的交互项不进设计矩阵
+            # （它的处置后效应在这个样本窗口里本来也不可识别）。
             continue
         for t in periods:
             t = int(t)

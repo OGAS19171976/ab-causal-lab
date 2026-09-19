@@ -814,6 +814,94 @@ class TestSignalComparison:
         return run_signal_comparison(n=1200, n_splits=4, n_groups=4, clip=clip)
 
 
+class TestLastTreatedAsBase:
+    """没有未处置组时用**最后一个队列**当基准（原文那一步）。
+
+    Sun & Abraham 自己的 Stata 包（``eventstudyinteract``）把做法写死了：
+    用最后处置队列当对照时，要**剔除未处置单元**、并且**只保留最后队列
+    被处置之前的期数**。两条都必要 —— 不剔除未处置单元就还有另一套对照；
+    不限制期数，最后那个队列自己就变成"处置后"，基准被污染。
+
+    实测（600 单元、队列 3/5/7、无未处置组）：
+    默认口径（拿未处置当基准，而没有未处置组）与 IW 的最大逐 k 差 **2.39**；
+    换成最后队列当基准后降到 **0.047**（50 倍）。有未处置组时则相反 ——
+    默认口径与 IW 是 1e-14 量级的一致，这时限制样本反而丢信息。
+    """
+
+    @staticmethod
+    def _panel(never_share: float):
+        cfg = StaggeredPanelConfig(
+            n_units=600, n_periods=10, cohorts=(3, 5, 7),
+            cohort_weights=(1 / 3, 1 / 3, 1 / 3), never_treated_share=never_share,
+            effects=(1.0, 2.0, 3.0, 3.0, 3.0), noise_sd=1.0, seed=5,
+        )
+        return generate_staggered_panel(cfg)[0]
+
+    @staticmethod
+    def _max_diff(a, b) -> float:
+        ks = set(a.event_study) & set(b.event_study)
+        return max(
+            abs(a.event_study[k].absolute_effect - b.event_study[k].absolute_effect)
+            for k in ks
+        )
+
+    def test_last_cohort_base_agrees_with_iw_when_no_never_treated(self):
+        from ablab.causal import sun_abraham_regression
+
+        panel = self._panel(never_share=0.0)
+        iw = sun_abraham(panel, control_group="not_yet_treated")
+        last = sun_abraham_regression(
+            panel, control_group="not_yet_treated", base_cohort="last_treated"
+        )
+        naive = sun_abraham_regression(panel, control_group="not_yet_treated")
+        assert self._max_diff(iw, last) < 0.1, self._max_diff(iw, last)
+        # 默认口径在没有未处置组时差得多 —— 这正是这一步存在的理由
+        assert self._max_diff(iw, naive) > 0.5, self._max_diff(iw, naive)
+        assert self._max_diff(iw, last) < self._max_diff(iw, naive) / 10
+
+    def test_last_cohort_base_drops_the_final_periods(self):
+        """限制样本的后果：最后那个队列的处置后期数不再出现在结果里。
+
+        这是**有意的**（原文要求的），也是"没有未处置组时"的代价：
+        你能估的事件窗变短了，换来的是与 IW 的一致。
+        """
+        from ablab.causal import sun_abraham_regression
+
+        panel = self._panel(never_share=0.0)
+        g_last = int(max(panel.cohorts()))
+        res = sun_abraham_regression(
+            panel, control_group="not_yet_treated", base_cohort="last_treated"
+        )
+        for k in res.event_study:
+            # 只有 k <= g_last - 1 - 最早队列 的期数还能被观测到
+            assert k <= g_last - 1 - min(int(g) for g in panel.cohorts()) or k < 0
+        assert res.event_study, "限制样本之后应当仍能估出一些期数"
+
+    def test_never_treated_base_still_wins_when_a_clean_group_exists(self):
+        """有未处置组时**别**用 last_treated：默认口径与 IW 是 1e-14 量级。"""
+        from ablab.causal import sun_abraham_regression
+
+        panel = self._panel(never_share=0.25)
+        iw = sun_abraham(panel, control_group="never_treated")
+        default = sun_abraham_regression(panel, control_group="never_treated")
+        assert self._max_diff(iw, default) < 1e-9
+
+    def test_last_cohort_base_needs_at_least_two_cohorts(self):
+        from ablab.causal import sun_abraham_regression
+
+        cfg = StaggeredPanelConfig(
+            n_units=200, n_periods=6, cohorts=(3,), cohort_weights=(1.0,),
+            never_treated_share=0.4, effects=(2.0,), noise_sd=0.5, seed=3,
+        )
+        panel, _ = generate_staggered_panel(cfg)
+        with pytest.raises(ValueError, match="至少需要两个队列"):
+            sun_abraham_regression(
+                panel, control_group="not_yet_treated", base_cohort="last_treated"
+            )
+        with pytest.raises(ValueError, match="base_cohort"):
+            sun_abraham_regression(panel, base_cohort="nonsense")
+
+
 class TestPretrendTest:
     def test_passes_under_parallel_trends(self):
         cfg = StaggeredPanelConfig(

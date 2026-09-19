@@ -63,6 +63,9 @@ CLAIMS: list[tuple[str, str, str]] = [
     ("M4·CATE 区间：原因是偏差不是方差", "cate_interval_report.md", "而是**点估计有偏**"),
     # 组级校准（BLP/GATES）：同样只加文本类声明 —— 覆盖率与斜率会随
     # --quick（分裂次数 6 vs 30）变，把数字写进清单就是第 31 条那个假红灯。
+    # SA 回归版：最后队列当基准（数值随面板固定，稳定）
+    ("M3·SA：最后队列当基准", "m3_validation.md", "最后队列当基准"),
+    ("M3·SA：改善倍数", "m3_validation.md", "改善了 50 倍"),
     ("M4·组级校准：换推断对象", "cate_interval_report.md", "组级路线：BLP 与 GATES"),
     ("M4·组级校准：验收结论", "cate_interval_report.md", "对象不同，结论不同"),
     ("M4·组级校准：瓶颈是信号重尾", "cate_interval_report.md", "重尾到不实用"),
