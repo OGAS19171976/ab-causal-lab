@@ -603,6 +603,93 @@ class TestCateInterval:
         )
 
 
+class TestConformalITE:
+    """个体效应的**保形预测区间**：解析区间做不到的事，换对象就做到了。
+
+    必须把两件事分开，否则这一组会被读成"前面第 4 节错了"：
+      * 解析区间的对象是 **τ(x) = E[Y(1)−Y(0)|X=x] 的条件均值** —— 盖不住，
+        而且有不可可能性依据（Chernozhukov 等）；
+      * 保形的对象是**个体效应** τ_i（随机变量）的**预测区间**，覆盖是**边际**的。
+    两者不矛盾，但**保形区间不能用来对单个 x 下结论**。
+    """
+
+    @staticmethod
+    def _run(seed: int, n: int = 2000):
+        from ablab.causal.conformal import conformal_ite_intervals
+        from ablab.causal.hte import HTEConfig, generate_hte_data
+
+        data = generate_hte_data(
+            HTEConfig(n=n, n_features=6, n_informative=3, seed=seed, cate_form="nonlinear")
+        )
+        return data, conformal_ite_intervals(
+            x=data.X, d=data.D, y=data.Y, propensity=data.propensity, alpha=0.05, seed=seed
+        )
+
+    def test_marginal_coverage_is_near_nominal(self):
+        """边际覆盖 ≈ 95%（实测两个 n、多个场景平均 0.9453~0.9472）。
+
+        这里只跑 2 个场景并放宽到 >0.85：单场景的覆盖有抽样噪声，
+        把断言卡在 0.95±0.02 会变成一条随机红的测试 ——
+        准确的水平由报告里的多场景平均给出。
+        """
+        covs = [self._run(seed) [1].coverage(self._run(seed)[0].tau) for seed in (0, 1)]
+        assert min(covs) > 0.85, covs
+
+    def test_intervals_are_wide_enough_to_be_honest_about_the_target(self):
+        """区间**明显宽于**真实 CATE 的离散度 —— 这是边际覆盖的代价。
+
+        实测：平均半宽 ~6.9 vs 真 CATE sd ~0.93（约 7 倍）。
+        如果哪天它变得很窄，要么 DGP 变了，要么覆盖是假的 —— 两者都要查。
+        """
+        import numpy as np
+
+        data, res = self._run(3)
+        assert res.mean_width() > 2 * float(np.std(data.tau)), (
+            res.mean_width(), float(np.std(data.tau))
+        )
+
+    def test_covered_subjects_can_be_used_for_decisions(self):
+        """能用它做**决策**：区间整体为正的人，其真实效应也应当多为正。
+
+        这正是这一类区间的正确用法（而不是报"某个人的效应点估计"）。
+        """
+        import numpy as np
+
+        data, res = self._run(4)
+        tau = np.asarray(data.tau)
+        positive = res.lower > 0
+        if positive.sum() >= 20:
+            # 被判为"整体为正"的那批人，真实效应均值应当明显高于全样本
+            assert tau[positive].mean() > tau.mean(), (
+                tau[positive].mean(), tau.mean()
+            )
+        # 区间自洽：下界 ≤ 上界
+        assert (res.lower <= res.upper).all()
+
+    def test_weighting_kicks_in_when_propensity_varies(self):
+        """倾向得分非常数时要用加权保形（本 DGP 的 p 随 X 变）。
+
+        权重写错不会让覆盖立刻垮掉，所以这里钉的是**诊断标志**：
+        它必须报告"用了权重"，否则报告里那句"按 p/(1−p) 加权"就没有依据。
+        """
+        _data, res = self._run(5)
+        assert res.weighted is True
+        assert res.n_cal_treated > 0 and res.n_cal_control > 0
+
+    def test_too_few_units_per_arm_is_rejected(self):
+        import numpy as np
+        import pytest
+
+        from ablab.causal.conformal import conformal_ite_intervals
+
+        x = np.random.default_rng(0).normal(size=(10, 3))
+        d = np.array([1, 1, 0, 0, 1, 0, 1, 0, 1, 0], dtype=float)
+        y = np.random.default_rng(1).normal(size=10)
+        p = np.full(10, 0.5)
+        with pytest.raises(ValueError, match="太少"):
+            conformal_ite_intervals(x=x, d=d, y=y, propensity=p, seed=0)
+
+
 class TestGatesBlp:
     """组级路线：单元级不可行（上一条），**组级可行** —— 换成 BLP/GATES。
 

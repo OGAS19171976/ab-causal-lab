@@ -307,6 +307,57 @@ def main() -> int:
     emit("  该做的是「裁剪（管尾巴）＋ AIPW（管方差）」，而且裁剪的代价（偏差）")
     emit("  在本 DGP 上没有显现为净损失。")
 
+    # ---- 8. 另一条路线：个体效应的**保形预测区间** ------------------------- #
+    emit("\n### 8. 个体效应：解析区间做不到，**保形预测区间**做到了（但对象不同）")
+    emit("  先把两件事分开，否则这一节会被误读成「第 4 节错了」：")
+    emit("    · 第 4 节的失败对象是 **τ(x) = E[Y(1)−Y(0)|X=x] 的条件均值**：")
+    emit("      以 τ̂ 为心的置信集盖不住它，且 Chernozhukov 等证明高维/非参下")
+    emit("      这种自适应置信集**不存在**；")
+    emit("    · 保形的对象是**个体效应本身** τ_i = Y_i(1) − Y_i(0)（一个随机变量）的")
+    emit("      **预测区间**，覆盖是**边际**的：P(τ_i ∈ Ĉ(X_i)) ≥ 1−α。")
+    emit("  两者不矛盾：前者要在每个 x 处一致覆盖整条函数，后者是总体上")
+    emit("  「多少比例的个体被盖住」。**所以保形区间不能用来对单个 x 下结论。**")
+    emit("")
+    emit("  机制（Lei & Candès 2021, arXiv:2006.06138）：劈训练/校准两半，")
+    emit("  训练集拟合两臂结局模型，校准集算绝对残差分数；")
+    emit("  用控制组去预测处置组反事实时按 w(x)=p(x)/(1−p(x)) 加权")
+    emit("  （随机化实验里 p 已知，这正是原文 w₀(x) 的形式）。")
+    emit("  与原文的差异如实记下：原文用加权 split-CQR（分位数回归），")
+    emit("  本仓库没有分位数回归，这里用**均值 + 绝对残差**这一档 ——")
+    emit("  后果是区间对异方差不敏感（同一长度给所有人）。")
+    emit("")
+    from ablab.causal.conformal import conformal_ite_intervals
+    from ablab.causal.hte import HTEConfig, generate_hte_data
+
+    emit(f"  {'n':>7}{'场景数':>8}{'边际覆盖率':>12}{'平均半宽':>10}{'真 CATE sd':>12}")
+    conformal_rows = []
+    for n_conf, reps_conf in ((1500, 4 if args.quick else 20), (4000, 3 if args.quick else 10)):
+        covs, widths, sds = [], [], []
+        for s in range(reps_conf):
+            d = generate_hte_data(
+                HTEConfig(n=n_conf, n_features=6, n_informative=3, seed=s,
+                          cate_form="nonlinear")
+            )
+            res = conformal_ite_intervals(
+                x=d.X, d=d.D, y=d.Y, propensity=d.propensity, alpha=0.05, seed=100 + s
+            )
+            covs.append(res.coverage(d.tau))
+            widths.append(res.mean_width())
+            sds.append(float(np.std(d.tau)))
+        conformal_rows.append((n_conf, reps_conf, covs, widths, sds))
+        emit(f"  {n_conf:>7}{reps_conf:>8}{float(np.mean(covs)):>12.4f}"
+             f"{float(np.mean(widths)):>10.4f}{float(np.mean(sds)):>12.4f}")
+    emit("")
+    emit("  读法：")
+    emit("    · **边际覆盖达标**（≈0.95），而第 4 节那两条单元级路线的解析/自助区间")
+    emit("      只有 0.13 / 0.31 —— 这不是「前面的实现写错了」，而是**对象换了**；")
+    emit("    · **代价是宽**：半宽是真实 CATE 离散度的 7 倍左右。它给的是")
+    emit("      「这个人的效应大概率落在哪」，不是「这个人的效应是多少」；")
+    emit("    · 因此正确的用法是**决策**（例如「区间整体为正的人优先投放」），")
+    emit("      而不是报一个点估计的置信区间。")
+    emit("    · 仍未做：原文的 CQR 版本（需要分位数回归）、以及**条件**覆盖 ——")
+    emit("      后者在无假设下被证明不可能（Barber 等 2019），这里只主张边际。")
+
     # ---- 7b. 裁剪阈值怎么选：它和信号有交互，选错会把覆盖率打下来 ---------- #
     emit("\n### 7b. 裁剪阈值不是免费的：选大了会把覆盖率打下来（而且是单靠裁剪才翻车）")
     emit("  同一组设置下扫阈值（20 次分裂；0.00 即不裁剪）：")
