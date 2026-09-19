@@ -901,6 +901,90 @@ class TestSignalComparison:
         return run_signal_comparison(n=1200, n_splits=4, n_groups=4, clip=clip)
 
 
+class TestBorusyakJaravelSpiess:
+    """BJS 插补估计量：第三种交错处置估计量，用来做**交叉验证**。
+
+    它和 CS/SA 的区别在**加权**：CS/SA 是"每个 (g,t) 分格各自 2×2 再加权"，
+    插补是对**每条处置观测**等权平均。所以它们**不**逐位相同 —— 实测差在
+    2%~4% 量级，而且这个差**在"同质效应"与"异质效应"两块面板上逐位相同**，
+    说明它来自加权方式而不是效应异质（下面有一条测试专门钉这个结构事实）。
+    """
+
+    @staticmethod
+    def _panel(seed: int = 5, homogeneous: bool = False, n_units: int = 600):
+        cfg = StaggeredPanelConfig(
+            n_units=n_units, n_periods=9, cohorts=(3, 6),
+            cohort_weights=(0.5, 0.5), never_treated_share=0.3,
+            effects=(2.0, 2.0, 2.0, 2.0),
+            cohort_effect_multiplier=(1.0, 1.0) if homogeneous else (1.0, 0.25),
+            noise_sd=0.5, seed=seed,
+        )
+        return generate_staggered_panel(cfg)
+
+    def test_point_estimate_is_close_to_cs_but_not_identical(self):
+        """两者都接近真值，但**不逐位相同**（加权方式不同）。"""
+        import numpy as np
+
+        from ablab.causal import borusyak_jaravel_spiess
+
+        panel, truth = self._panel()
+        cs = callaway_santanna(panel).overall.absolute_effect
+        bjs = borusyak_jaravel_spiess(panel).overall.absolute_effect
+        assert abs(cs - truth.overall_att) < 0.1 * abs(truth.overall_att)
+        assert abs(bjs - truth.overall_att) < 0.1 * abs(truth.overall_att)
+        assert abs(bjs - cs) > 1e-9, "两者不该逐位相同（加权方式不同）"
+        assert abs(bjs - cs) < 0.05 * abs(truth.overall_att), (bjs, cs)
+        assert np.isfinite(bjs)
+
+    def test_gap_to_cs_does_not_depend_on_effect_heterogeneity(self):
+        """**关键的诊断**：BJS 与 CS 的差，在同质/异质两块面板上**逐位相同**。
+
+        这条把"差异来自效应异质"这个解释排除掉了：两块面板只改了
+        `cohort_effect_multiplier`（一个队列的效应缩放），而差值不变 ——
+        说明差异来自**加权方式**（未处置观测被两组估计量用得不一样），
+        与效应怎么分布无关。这也是"为什么不把它当成 bug"的依据。
+        """
+        from ablab.causal import borusyak_jaravel_spiess
+
+        gaps = []
+        for homogeneous in (True, False):
+            panel, _ = self._panel(homogeneous=homogeneous)
+            cs = callaway_santanna(panel).overall.absolute_effect
+            bjs = borusyak_jaravel_spiess(panel).overall.absolute_effect
+            gaps.append(bjs - cs)
+        assert abs(gaps[0] - gaps[1]) < 1e-12, gaps
+
+    def test_event_study_and_se_are_finite(self):
+        from ablab.causal import borusyak_jaravel_spiess
+
+        panel, _ = self._panel()
+        res = borusyak_jaravel_spiess(panel)
+        assert res.event_study
+        for est in res.event_study.values():
+            assert est.std_error > 0
+            assert est.std_error < 100  # 量级检查：别把 SE 算成天文数字
+        assert res.overall.std_error > 0
+        assert res.overall.p_value < 1e-6
+
+    def test_requires_untreated_observations(self):
+        import numpy as np
+        import pytest
+
+        from ablab.causal import borusyak_jaravel_spiess
+        from ablab.causal.panel import Panel, never_treated_code
+
+        # 所有单元在第一期就被处置：没有任何未处置观测
+        outcome = np.random.default_rng(0).normal(size=(20, 4))
+        treated = np.ones((20, 4), dtype=bool)
+        panel = Panel(
+            outcome=outcome, treated=treated,
+            cohort=np.full(20, 1), periods=np.arange(1, 5),
+        )
+        assert never_treated_code != 1  # 与"未处置"编码无关，这里全都处置了
+        with pytest.raises(ValueError, match="未处置观测"):
+            borusyak_jaravel_spiess(panel)
+
+
 class TestLastTreatedAsBase:
     """没有未处置组时用**最后一个队列**当基准（原文那一步）。
 

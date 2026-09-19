@@ -930,6 +930,118 @@ def _absorb_two_way(
     return resid
 
 
+def borusyak_jaravel_spiess(
+    panel: Panel,
+    *,
+    min_k: int | None = None,
+    max_k: int | None = None,
+    alpha: float = 0.05,
+) -> SAResult:
+    """Borusyak-Jaravel-Spiess（2021）的**插补估计量**。
+
+    做法只有三步：
+
+    1. 只用**未处置观测**（每个队列处置前的期数 + 未处置组的全部期数）
+       拟合双向固定效应 ``Y_it = α_i + λ_t + ε_it``；
+    2. 用它给**每条处置观测**插补反事实 ``Ŷ_it(0) = α̂_i + λ̂_t``；
+    3. ATT = 处置观测上 ``Y_it − Ŷ_it(0)`` 的平均；事件研究按相对期数分组平均。
+
+    它和 CS/SA 的**区别在加权**：CS/SA 是"每个 (g,t) 分格各自 2×2 再加权"，
+    而插补是对**每条处置观测**等权平均。两者在饱和、无协变量、平衡面板下
+    并不逐位相同 —— 这一点**实测过**（见 ``reports/m3_validation.md`` 2.6 节）：
+    差在 2%~4% 量级，而且**在"同质效应"与"异质效应"两块面板上逐位相同**，
+    说明它来自**加权方式**而不是效应异质。
+
+    标准误按单元聚类：``ψ_i = (Σ_{i 的处置观测} gap) / N_处置观测 − ATT``，
+    ``se = sqrt(Var(ψ)/n_units)`` —— 与仓库里其它聚合估计量同一套约定。
+    """
+    y = panel.outcome
+    n_units, n_periods = y.shape
+    periods = np.asarray(panel.periods)
+    treated = panel.treated
+
+    # ---- 1. 只用未处置观测拟合双向固定效应（交替投影） -------------------- #
+    obs = ~treated
+    if not obs.any():
+        raise ValueError("没有任何未处置观测，插补估计量无从下手")
+    u_idx = np.repeat(np.arange(n_units), n_periods)[obs.reshape(-1)]
+    t_idx = np.tile(np.arange(n_periods), n_units)[obs.reshape(-1)]
+    y_obs = y.reshape(-1)[obs.reshape(-1)]
+
+    unit_fe = np.zeros(n_units)
+    time_fe = np.zeros(n_periods)
+    cnt_u = np.bincount(u_idx, minlength=n_units).astype(float)
+    cnt_t = np.bincount(t_idx, minlength=n_periods).astype(float)
+    for _ in range(5000):
+        new_unit_fe = np.bincount(
+            u_idx, weights=y_obs - time_fe[t_idx], minlength=n_units
+        ) / np.maximum(cnt_u, 1)
+        new_time_fe = np.bincount(
+            t_idx, weights=y_obs - new_unit_fe[u_idx], minlength=n_periods
+        ) / np.maximum(cnt_t, 1)
+        done = (
+            np.max(np.abs(new_unit_fe - unit_fe)) < 1e-13
+            and np.max(np.abs(new_time_fe - time_fe)) < 1e-13
+        )
+        unit_fe, time_fe = new_unit_fe, new_time_fe
+        if done:
+            break
+
+    counterfactual = unit_fe[:, None] + time_fe[None, :]
+    gap = y - counterfactual  # 处置观测上是"效应估计"，未处置观测上是拟合残差
+
+    # ---- 2. 事件研究：按相对期数分组 -------------------------------------- #
+    study: dict[int, SAEventStudy] = {}
+    for g in panel.cohorts():
+        g = int(g)
+        for t in periods:
+            t = int(t)
+            if t < g:
+                continue  # 处置前的观测不进入事件研究（插补只在处置期有意义）
+            k = t - g
+            if min_k is not None and k < min_k:
+                continue
+            if max_k is not None and k > max_k:
+                continue
+            mask = (panel.cohort == g)[:, None] & (periods[None, :] == t)
+            mask &= treated
+            n_obs = int(mask.sum())
+            if n_obs == 0:
+                continue
+            rows = np.flatnonzero(mask.reshape(-1))
+            units = np.repeat(np.arange(n_units), n_periods)[rows]
+            effect = float(gap.reshape(-1)[rows].mean())
+            # 影响函数：单元的贡献 = 该单元在这些观测上的 gap 之和 / N − 该格的效应
+            per_unit = np.zeros(n_units)
+            np.add.at(per_unit, units, gap.reshape(-1)[rows])
+            psi = per_unit / n_obs - effect
+            existing = study.get(k)
+            if existing is None:
+                study[k] = SAEventStudy(
+                    k=k, effect=effect, influence=psi * n_units,
+                    weights={g: 1.0}, n_treated=n_obs,
+                )
+            else:  # 同一 k 上多个队列：按观测数加权合并
+                total = existing.n_treated + n_obs
+                w_new = n_obs / total
+                merged_effect = (1 - w_new) * existing.effect + w_new * effect
+                merged_psi = (1 - w_new) * existing.influence + w_new * (psi * n_units)
+                weights = dict(existing.weights)
+                weights[g] = w_new
+                study[k] = SAEventStudy(
+                    k=k, effect=merged_effect, influence=merged_psi,
+                    weights=weights, n_treated=total,
+                )
+
+    if not study:
+        raise ValueError("没有任何处置后的相对期数可估")
+
+    return _aggregate_sa(
+        panel, study, control_group="not_yet_treated", alpha=alpha,
+        method="Borusyak-Jaravel-Spiess (imputation, aggregated)",
+    )
+
+
 def sun_abraham_regression(
     panel: Panel,
     *,

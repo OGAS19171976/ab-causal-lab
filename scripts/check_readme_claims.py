@@ -67,6 +67,8 @@ CLAIMS: list[tuple[str, str, str]] = [
     # SA 回归版：最后队列当基准（数值随面板固定，稳定）
     ("M3·SA：最后队列当基准", "m3_validation.md", "最后队列当基准"),
     ("M3·SA：改善倍数", "m3_validation.md", "改善了 50 倍"),
+    ("M3·BJS：插补估计量已补", "m3_validation.md", "BJS 插补"),
+    ("M3·BJS：差异不是效应异质", "m3_validation.md", "逐位相同"),
     ("M4·组级校准：换推断对象", "cate_interval_report.md", "组级路线：BLP 与 GATES"),
     ("M4·组级校准：验收结论", "cate_interval_report.md", "对象不同，结论不同"),
     ("M4·组级校准：瓶颈是信号重尾", "cate_interval_report.md", "重尾到不实用"),

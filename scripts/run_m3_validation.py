@@ -398,6 +398,37 @@ def main() -> int:
     emit("    代价是**事件窗变短**（最后队列的处置后期数不再可估）——")
     emit("    这是原文的要求，不是实现妥协；它有测试钉着。")
     emit("")
+    emit("")
+    emit("  **第三种估计量：BJS 插补**（只用未处置观测拟合双向固定效应，")
+    emit("  给每条处置观测插补反事实，再对处置观测等权平均）。")
+    from ablab.causal import borusyak_jaravel_spiess as _bjs
+
+    bjs_res = _bjs(panel)
+    emit(f"    真值 {truth.overall_att:+.4f} | CS {cs.overall.absolute_effect:+.6f}"
+         f"（SE {cs.overall.std_error:.4f}）| BJS {bjs_res.overall.absolute_effect:+.6f}"
+         f"（SE {bjs_res.overall.std_error:.4f}）")
+    emit(f"    BJS − CS = {bjs_res.overall.absolute_effect - cs.overall.absolute_effect:+.6f}"
+         "（2%~4% 量级：**两者不是同一个估计量**）")
+    emit("")
+    emit("  为什么差、以及为什么这不是 bug —— 做了一次**诊断**：")
+    emit("  两者只差在**加权方式**（CS/SA 按 (g,t) 分格 2×2 再加权，")
+    emit("  插补对处置观测等权）。判据是：把「效应异质」这个解释排除掉 ——")
+    _gaps = []
+    for _hom in (True, False):
+        _cfg = StaggeredPanelConfig(
+            n_units=600, n_periods=9, cohorts=(3, 6), cohort_weights=(0.5, 0.5),
+            never_treated_share=0.3, effects=(2.0, 2.0, 2.0, 2.0),
+            cohort_effect_multiplier=(1.0, 1.0) if _hom else (1.0, 0.25),
+            noise_sd=0.5, seed=5,
+        )
+        _panel_h, _ = generate_staggered_panel(_cfg)
+        _cs_h = callaway_santanna(_panel_h).overall.absolute_effect
+        _bjs_h = _bjs(_panel_h).overall.absolute_effect
+        _gaps.append(_bjs_h - _cs_h)
+    emit(f"    同质效应面板 BJS−CS = {_gaps[0]:+.8f}")
+    emit(f"    异质效应面板 BJS−CS = {_gaps[1]:+.8f}")
+    emit("    两者**逐位相同** -> 差异来自加权而不是效应异质（有测试钉着）。")
+
     emit("  一句话口径：**有未处置组 -> 默认（1e-14 量级一致）；")
     emit("  没有 -> base_cohort='last_treated'（差 2.39 -> 0.047）**。")
 
