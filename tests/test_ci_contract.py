@@ -90,7 +90,15 @@ class TestCheckPlan:
         早失败就早反馈 —— 不用等五分钟的 pytest 跑完才发现少了个导入。
         """
         keys = [s.key for s in runner.steps()]
-        assert keys[:6] == ["lock", "lint", "types", "claims", "warehouse", "gov"], keys[:6]
+        assert keys[:7] == [
+            "lock", "lint", "types", "claims", "warehouse", "gov", "cate"
+        ], keys[:7]
+
+    def test_cate_interval_step_exists(self, runner):
+        """CATE 区间的验证必须在检查集里 —— 它的结论是"校准不了"，
+        而**结论是负面的时候更需要有人在跑它**：否则下一个人会以为只是没做。"""
+        cate = next(s for s in runner.steps() if s.key == "cate")
+        assert any("run_cate_interval_validation.py" in a for a in cate.argv), cate.argv
 
     def test_readme_claims_step_exists(self, runner):
         """README 的数字要有东西核对 —— 否则"每个数字都能在 reports/ 里找到"

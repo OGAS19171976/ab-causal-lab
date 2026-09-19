@@ -356,6 +356,77 @@ class TestSunAbraham:
         assert audit.naive_coverage < audit.influence_coverage
 
 
+class TestCateInterval:
+    """CATE 的区间：**算得出来，但校准不了** —— 这两件事都要被钉住。
+
+    如果只钉"能算出来"，下一个人会以为它可用；如果只钉"校准不了"，
+    又会被误解成"没实现"。两条一起钉，才是这一轮的真实状态。
+    """
+
+    @staticmethod
+    def _fitted(seed: int = 3, min_leaf: int = 20):
+        from ablab.causal.forest import CausalForest, ForestConfig
+        from ablab.causal.hte import HTEConfig, generate_hte_data
+
+        data = generate_hte_data(HTEConfig(n=1200, n_features=6, n_informative=3, seed=seed))
+        forest = CausalForest(ForestConfig(n_trees=30, max_depth=4, min_leaf=min_leaf))
+        forest.fit(data.X, data.D, data.Y)
+        return data, forest
+
+    def test_predict_with_se_shapes_and_finiteness(self):
+        import numpy as np
+
+        data, forest = self._fitted()
+        tau, se = forest.predict_with_se(data.X)
+        assert tau.shape == se.shape == (data.X.shape[0],)
+        # 有些叶子只有一臂（倾向得分把样本切开了），那些单元的 SE 是 inf ——
+        # 这是**有意**的：给不出方差就不要给一个假的有限值。
+        finite = np.isfinite(se)
+        assert finite.mean() > 0.5, f"可给出区间的单元太少：{finite.mean():.2f}"
+        assert (se[finite] > 0).all()
+
+    def test_interval_shrinks_with_larger_leaves(self):
+        """验收标准之一（**部分满足**，如实测）：叶子越大整体越短，但**不单调**。
+
+        实测 min_leaf = 10/20/40/80 的解析区间中位长度：
+        0.0824 / 0.0937 / 0.0720 / 0.0507 —— 80 比 10 短约 38%，
+        但 20 处反而比 10 长。原因是**两个效应叠在一起**：min_leaf 变大既让
+        叶子内样本更多（区间变短），又改变"能给出区间的叶子"的比例
+        （纯叶子变多 → 有限 SE 的子集变了）。
+        所以断言的是**整体方向**（80 < 10），不是逐点单调 ——
+        把逐点单调写成断言，就是让标准去迁就一个不成立的说法。
+        """
+        import numpy as np
+
+        medians = []
+        for ml in (10, 80):
+            data, forest = self._fitted(min_leaf=ml)
+            _, se = forest.predict_with_se(data.X)
+            finite = np.isfinite(se)
+            medians.append(float(np.median(se[finite])))
+        assert medians[1] < medians[0], medians
+
+    def test_coverage_is_far_below_nominal_and_that_is_the_point(self):
+        """**覆盖率远低于 95%** —— 这条断言是"水平仍不可用"的证据。
+
+        实测解析区间覆盖 ~0.4、bootstrap ~0.7（见 reports/cate_interval_report.md）。
+        这里只跑一个场景，断言"明显低于名义值"，把它钉成**已知结论**
+        而不是一个会被误读成 bug 的现象。
+        """
+        import numpy as np
+
+        data, forest = self._fitted()
+        tau, se = forest.predict_with_se(data.X)
+        true = np.asarray(data.tau)
+        finite = np.isfinite(se)
+        lo, hi = tau[finite] - 1.96 * se[finite], tau[finite] + 1.96 * se[finite]
+        coverage = float(np.mean((lo <= true[finite]) & (true[finite] <= hi)))
+        assert coverage < 0.8, (
+            f"覆盖率 {coverage:.3f} —— 如果它真的接近 95%，"
+            "那说明点估计变了，README 的已知边界要跟着改"
+        )
+
+
 class TestPretrendTest:
     def test_passes_under_parallel_trends(self):
         cfg = StaggeredPanelConfig(

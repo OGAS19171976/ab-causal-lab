@@ -56,6 +56,10 @@ CLAIMS: list[tuple[str, str, str]] = [
     # 比值口径的 A/A 校准（"换了口径就要重跑审计"那一条的执行）
     ("M6·比值口径：序贯 FWER", "m6_validation.md", "0.0700"),
     ("M6·比值口径：95% 覆盖率", "m6_validation.md", "0.9250"),
+    # CATE 区间：**只加文本类声明**。这份报告的数值会随 --quick 变，
+    # 把数字写进清单就会让检查器在快速模式下随机变红（第 31 条那个坑）。
+    ("M4·CATE 区间：结论是「校准不了」", "cate_interval_report.md", "但它校准不了"),
+    ("M4·CATE 区间：原因是偏差不是方差", "cate_interval_report.md", "而是**点估计有偏**"),
     ("数仓：CUPED 与 DWD 明细一致", "warehouse_report.md", "一致"),
     ("数仓：ADS 判据写在报告里", "warehouse_report.md", "判据"),
     # 比值链路（06/07）的数字 —— 它们是"接通了"这件事唯一的实测证据

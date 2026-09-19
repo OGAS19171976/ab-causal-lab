@@ -39,6 +39,10 @@ class _Node:
     left: "_Node | None" = None
     right: "_Node | None" = None
     tau: float = 0.0
+    #: 叶子 τ̂ 的抽样方差（在 estimation 半样本上算，见 ``_tau_of``）。
+    #: 它让森林能给出**区间**而不只是点估计 —— 这是 M4 从"排序可用"走到
+    #: "水平可用"的那一步。
+    var: float = 0.0
     n_struct: int = 0
     n_est: int = 0
 
@@ -94,15 +98,31 @@ class ForestConfig:
             raise ValueError("n_thresholds 至少为 2")
 
 
-def _tau_of(D: np.ndarray, Y: np.ndarray, mask: np.ndarray) -> tuple[float, int, int]:
-    """子样本上的 CATE 与两组人数。"""
+def _tau_of(D: np.ndarray, Y: np.ndarray, mask: np.ndarray) -> tuple[float, float, int, int]:
+    """子样本上的 CATE、它的**抽样方差**、以及两组人数。
+
+    方差取两臂均值差的标准公式 ``S1²/n1 + S0²/n0``（组内样本方差，ddof=1）——
+    它就是"这个叶子的 τ̂ 有多不确定"的直接估计，不需要额外假设。
+
+    **必须在 estimation 半样本上算**：honest 分裂保证"选叶子的样本"与
+    "估效应的样本"不同，所以这个方差不会被"挑到最漂亮的叶子"这件事污染。
+    用 training 半样本算会**偏小** —— 同一批数据既选叶子又估效应，
+    挑中的叶子天然是效应看起来最大的那个。
+    """
     d = D[mask]
     y = Y[mask]
     n1 = int(d.sum())
     n0 = int(d.size - n1)
     if n1 == 0 or n0 == 0:
-        return 0.0, n1, n0
-    return float(y[d > 0.5].mean() - y[d < 0.5].mean()), n1, n0
+        return 0.0, float("inf"), n1, n0
+    y1 = y[d > 0.5]
+    y0 = y[d < 0.5]
+    tau = float(y1.mean() - y0.mean())
+    # ddof=1：单元素那一臂没有方差可言 → inf，表示"这个叶子给不出区间"
+    v1 = float(y1.var(ddof=1)) if n1 > 1 else float("inf")
+    v0 = float(y0.var(ddof=1)) if n0 > 1 else float("inf")
+    var = v1 / n1 + v0 / n0 if np.isfinite(v1) and np.isfinite(v0) else float("inf")
+    return tau, var, n1, n0
 
 
 def _best_split(
@@ -238,8 +258,9 @@ def _fill_leaf_effects(
 ) -> None:
     """在 estimation 半样本上给叶子填效应值。"""
     if node.is_leaf:
-        tau, n1, n0 = _tau_of(D, Y, idx)
+        tau, var, n1, n0 = _tau_of(D, Y, idx)
         node.tau = tau
+        node.var = var
         node.n_est = n1 + n0
         return
     mask = X[idx, node.feature] <= node.threshold
@@ -260,6 +281,24 @@ def _predict_tree(node: _Node, X: np.ndarray, out: np.ndarray, idx: np.ndarray) 
         _predict_tree(left, X, out, idx[mask])
     if (~mask).any():
         _predict_tree(right, X, out, idx[~mask])
+
+
+def _predict_tree_var(node: _Node, X: np.ndarray, out: np.ndarray, idx: np.ndarray) -> None:
+    """与 ``_predict_tree`` 同路，但落的是**叶子的 τ̂ 方差**。
+
+    单独写一个而不是给 ``_predict_tree`` 加参数：那条路径在预测里被调用多次，
+    多一个"要不要算方差"的分支只会让两条语义混在一起（这也是本项目
+    "别让一个入口干两件事"的一贯做法）。
+    """
+    if node.is_leaf:
+        out[idx] = node.var
+        return
+    mask = X[idx, node.feature] <= node.threshold
+    left, right = node.children
+    if mask.any():
+        _predict_tree_var(left, X, out, idx[mask])
+    if (~mask).any():
+        _predict_tree_var(right, X, out, idx[~mask])
 
 
 class CausalTree:
@@ -357,6 +396,38 @@ class CausalForest:
         X = np.atleast_2d(np.asarray(X, dtype=float))
         preds = np.vstack([t.predict(X) for t in self.trees])
         return preds.mean(axis=0)
+
+    def predict_with_se(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """返回 ``(tau_hat, se)`` —— M4 从"排序"走到"水平"的那一步。
+
+        做法与 GRF 的精神一致、实现是其中最简单的一档：
+
+        * 每棵树走自己的路径，拿到该叶子的 τ̂ 与其**抽样方差**（在 honest 的
+          estimation 半样本上算，见 ``_tau_of``）；
+        * 跨树平均：``τ̂ = (1/B)Σ_b τ̂_b``；
+        * 方差按**独立**合成：``SE = sqrt(Σ_b σ²_b) / B``。
+
+        **这里有一处必须说清的近似**：各棵树用**同一份数据**训练，所以它们
+        并不独立 —— 按独立合成会**低估** SE（与 CS 聚合那个坑同一族错误）。
+        GRF 的完整做法要估计跨树的协方差项，本仓库没有做。
+        所以这个 SE 是**下界性质**的估计，它的真实覆盖率由
+        ``run_cate_coverage_audit`` 实测，**不靠这里的推导**。
+        """
+        if not self._fitted:
+            raise RuntimeError("先调用 fit")
+        X = np.atleast_2d(np.asarray(X, dtype=float))
+        n = X.shape[0]
+        taus = np.empty((len(self.trees), n))
+        vars_ = np.empty((len(self.trees), n))
+        idx = np.arange(n)
+        for b, tree in enumerate(self.trees):
+            assert tree.root is not None
+            _predict_tree(tree.root, X, taus[b], idx)
+            _predict_tree_var(tree.root, X, vars_[b], idx)
+        # inf 表示某个叶子样本太少、给不出方差 → 该单元的 SE 也应当是 inf
+        var_sum = np.where(np.isinf(vars_), np.inf, vars_).sum(axis=0)
+        se = np.sqrt(var_sum) / len(self.trees)
+        return taus.mean(axis=0), se
 
     @property
     def feature_importance(self) -> np.ndarray:
