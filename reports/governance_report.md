@@ -140,6 +140,36 @@ ab-causal-lab · 治理验证：操作审计（append-only）+ 护栏指标显�
   （分流随时能重开，已经造成的伤害收不回来）。所以它比「改个状态」厚：
   服务端复核、理由必填、人工叫停要 admin、成功与拒绝都留痕。
 
+### 7.11 「没做」的清单：从「靠人偶然发现」到「检查集里直接红」
+  这个仓库栽过三次同一类跟头：**功能做完了，README 还写着没做** ——
+  簇级 CUPED（被三处代码拒绝了两轮）、M2 决策层、数仓比值链路。
+  共同点是「没做」是一句**无法被核对**的话：数字有人对（声明清单），
+  「没做」没人对，于是它只朝一个方向漂移。
+  这一轮把每一句「没做」变成一条**带证据**的记录：证据必须现在还成立
+  （某个符号确实不存在 / 某个串搜不到 / 某个文件不存在），
+  一旦不成立就在检查集里报错并指出该改哪一句。
+
+  [OK  ] iv_and_rdd: 符号 ablab.causal.iv 仍不存在 ✓
+  [OK  ] policy_learning: 符号 ablab.causal.uplift.RLearner 仍不存在 ✓
+  [OK  ] wild_cluster_bootstrap: 符号 ablab.inference.clustered.wild_cluster_bootstrap 仍不存在 ✓
+  [OK  ] multivariate_cuped: 符号 ablab.inference.cuped.multivariate_theta 仍不存在 ✓
+  [OK  ] msprt_tau_choice: 符号 ablab.inference.tests.choose_tau 仍不存在 ✓
+  [OK  ] scm_time_placebo: 符号 ablab.causal.synthetic.time_placebo 仍不存在 ✓
+  [OK  ] sensitivity_smoothness: 符号 ablab.causal.sensitivity.rambachan_roth_smoothness 仍不存在 ✓
+  [OK  ] no_real_traffic_code: src/ 下没有「load_real_traffic」✓
+
+  机检 8 条『没做』：8 条仍成立，0 条已经过时。
+  另有 3 条**无法机检**、只能人读 ——清单不假装覆盖它们。
+  退出码：0（0 = 清单与事实一致）
+
+  第一次跑就报了**一个假阳性**：清单里写着 `target=load_real_traffic`，
+  于是「在 src/ 下搜这个串」搜到了**清单自己** —— 检查器也会骗人，
+  所以搜索时显式跳过清单文件（代码里写了原因）。
+  更早一步，这一轮还顺手抓到**三条已经过时的声明**：
+    · M2「没做决策层」（护栏决策层已做，见 7.9）
+    · 「整簇路径只支持 post-only」（簇级 CUPED 已做并校准）
+    · 「数仓不支持比值指标」（06/07 两条 SQL 早已上线）
+
 ### 7.5 并发：丢失更新（后写覆盖），以及乐观锁怎么挡住它
   场景：两个客户端（**两个独立连接**，不是同一个对象）都读到同一版本，
   然后都要改状态 —— 这就是「两个人同时改」的最小复现。

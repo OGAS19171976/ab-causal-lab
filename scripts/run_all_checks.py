@@ -110,7 +110,7 @@ class Step:
 #: 是本项目最该防的行为，所以顺序在这里写死并加了断言。
 #: ``gov``（治理：审计 + 护栏）不依赖数仓，但它是秒级的、且属于"平台自己会不会
 #: 静默骗人"那一类，所以跟静态检查一起放在前面，早失败早反馈。
-_ORDER_HEAD = ("lock", "lint", "types", "claims", "warehouse", "gov", "cate")
+_ORDER_HEAD = ("lock", "lint", "types", "claims", "unimplemented", "warehouse", "gov", "cate")
 
 
 def steps() -> list[Step]:
@@ -125,6 +125,11 @@ def steps() -> list[Step]:
              (py, "-m", "ruff", "check", "src", "scripts", "tests")),
         Step("types", "mypy 类型检查（刻意不 --strict，见 pyproject 的说明）",
              (py, "-m", "mypy")),
+        Step(
+            "unimplemented",
+            "README 里每一句『没做』是否仍然成立（防止过时声明）",
+            (py, "scripts/check_unimplemented.py"),
+        ),
         Step("claims", "README 里的关键数字能否在 reports/ 里找到",
              (py, "scripts/check_readme_claims.py")),
         Step("warehouse", "数仓链路（m5/m6 的前提）",

@@ -85,14 +85,22 @@ class TestCheckPlan:
         assert [s.key for s in runner.steps()][0] == "lock"
 
     def test_fast_checks_run_first(self, runner):
-        """秒级的检查（锁文件、lint、类型检查、声明核对）与前置条件排在前面。
+        """秒级的检查（锁文件、lint、类型检查、声明核对、"没做"清单）
+        与前置条件排在前面。
 
         早失败就早反馈 —— 不用等五分钟的 pytest 跑完才发现少了个导入。
         """
         keys = [s.key for s in runner.steps()]
-        assert keys[:7] == [
-            "lock", "lint", "types", "claims", "warehouse", "gov", "cate"
-        ], keys[:7]
+        assert keys[:8] == [
+            "lock", "lint", "types", "claims", "unimplemented", "warehouse", "gov", "cate"
+        ], keys[:8]
+
+    def test_unimplemented_step_exists(self, runner):
+        """**"没做"的清单也必须在检查集里** —— 与声明核对同一个理由：
+        没人跑的核对等于没有核对。这个仓库栽过三次"功能做完了 README 还写着
+        没做"（簇级 CUPED、M2 决策层、数仓比值链路），每次都靠人偶然发现。"""
+        step = next(s for s in runner.steps() if s.key == "unimplemented")
+        assert any("check_unimplemented.py" in a for a in step.argv), step.argv
 
     def test_cate_interval_step_exists(self, runner):
         """CATE 区间的验证必须在检查集里 —— 它的结论是"校准不了"，
@@ -380,3 +388,80 @@ class TestTypeCheckContract:
         assert re.search(r"subprocess\.run\(\s*[^)]*env=child_env\(\)", text, re.S), (
             "run_all_checks.py 起子进程时没有传 child_env()，日志编码会依赖调用者环境"
         )
+
+
+class TestUnimplementedRegistry:
+    """「没做」的清单：每一句都要有**仍然成立**的机器可核对证据。
+
+    这一组测试要钉的不是"清单里有 8 条"，而是**检查器真的会抓过时声明**：
+    否则它只是一段会打印 OK 的代码，而那段代码挡不住这个仓库栽过三次的跟头
+    （簇级 CUPED、M2 决策层、数仓比值链路 —— 都是功能做完了、README 没改）。
+    """
+
+    def test_all_registered_items_still_hold(self):
+        """清单本体：每条的证据都仍然成立（否则 README 该改了）。"""
+        import importlib
+
+        from ablab.validation.unimplemented import ITEMS
+
+        sys.path.insert(0, str(ROOT / "scripts"))
+        checker = importlib.import_module("check_unimplemented")
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        stale = []
+        for item in ITEMS:
+            ok, detail = checker.check_item(item, readme)
+            if not ok:
+                stale.append(f"{item.id}: {detail}")
+        assert not stale, stale
+
+    def test_checker_detects_a_stale_claim(self):
+        """**核心断言**：证据不成立时必须报错，并指出该改哪一条。"""
+        import importlib
+
+        from ablab.validation.unimplemented import UnimplementedItem
+
+        sys.path.insert(0, str(ROOT / "scripts"))
+        checker = importlib.import_module("check_unimplemented")
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+        # 一条"没做：没有 CausalForest"——而它显然存在
+        stale = UnimplementedItem(
+            id="fake",
+            readme_phrase="CausalForest",  # README 里确实有这个词
+            kind="symbol_absent",
+            target="ablab.causal.forest.CausalForest",
+            anchor_present="ablab.causal.forest",
+            when_done="把这条从清单里删掉",
+        )
+        ok, detail = checker.check_item(stale, readme)
+        assert not ok
+        assert "已经存在" in detail and "把这条从清单里删掉" in detail
+
+    def test_checker_detects_a_phrase_that_left_the_readme(self):
+        """README 里那句被删/改词了 -> 也要报，否则清单会与文档脱节。"""
+        import importlib
+
+        from ablab.validation.unimplemented import UnimplementedItem
+
+        sys.path.insert(0, str(ROOT / "scripts"))
+        checker = importlib.import_module("check_unimplemented")
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        item = UnimplementedItem(
+            id="fake2",
+            readme_phrase="这句话在 README 里绝对不存在（测试用）",
+            kind="symbol_absent",
+            target="ablab.causal.iv",
+        )
+        ok, detail = checker.check_item(item, readme)
+        assert not ok and "找不到这句" in detail
+
+    def test_registry_does_not_cover_uncheckable_claims_silently(self):
+        """无法机检的"没做"要**显式列出来**，不能混进清单充数。"""
+        from ablab.validation.unimplemented import ITEMS, human_reviewed_notes
+
+        notes = human_reviewed_notes()
+        assert notes, "至少要把无法机检的几条列出来"
+        # 清单里的每一条都必须是可机检的三种证据之一
+        assert {i.kind for i in ITEMS} <= {"symbol_absent", "text_absent", "file_absent"}
+        # 而且不能把人工那条伪装成机检项
+        assert not any("真实流量" in i.readme_phrase and i.kind == "symbol_absent" for i in ITEMS)
