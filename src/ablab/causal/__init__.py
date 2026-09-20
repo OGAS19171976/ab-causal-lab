@@ -28,8 +28,10 @@ from .hte import (
     HTEConfig,
     HTEData,
     dml_partial_linear,
+    dr_learner,
     generate_hte_data,
     naive_plugin,
+    r_learner,
     s_learner,
     t_learner,
     x_learner,
@@ -63,6 +65,8 @@ from .uplift import (
 )
 
 __all__ = [
+    "dr_learner",
+    "r_learner",
     "IVResult",
     "anderson_rubin_ci",
     "two_sls",

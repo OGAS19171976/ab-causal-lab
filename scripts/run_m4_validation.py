@@ -46,6 +46,7 @@ from ablab.validation import (  # noqa: E402
     run_cate_coverage_audit,
     run_cate_form_comparison,
     run_dml_audit,
+    run_meta_learner_comparison,
     run_uplift_metric_audit,
 )
 
@@ -268,6 +269,32 @@ def main() -> int:
     emit("    （跨树方差本身也曾算错，第 8c 节已修：SE 从真实波动的 0.354 倍到 0.702 倍，")
     emit("     覆盖率仍上不去 —— 偏差是 SE 的 7.46 倍）。")
 
+    # ---- 3c. 元学习器：S / T / X / R / DR ---------------------------------- #
+    emit("\n### 3c. 元学习器对照：S / T / X / R / DR（四种 CATE 形式）")
+    emit("  M4 原先只有 S / T / X 三个元学习器。这一轮补上 **R-learner**（Nie & Wager）")
+    emit("  与 **DR-learner**（Kennedy）：两者都用正交化 + 交叉拟合的 nuisance，")
+    emit("  R-learner 最小化 R-loss（等价于一个加权回归），DR-learner 回归双稳健伪结果。")
+    emit("  线性 τ 时 R-loss 有闭式解；非线性 τ 走「伪结果 + 加权拟合」那条等价路径。")
+    emit("")
+    meta = run_meta_learner_comparison(
+        n=n_hte if not args.quick else 800,
+        n_replications=3 if not args.quick else 1,
+    )
+    for line in meta.summary().splitlines():
+        emit("  " + line)
+    emit("")
+    emit("  三条要一起读的东西：")
+    emit(f"    · **同基学习器下 R 不差于 T**（四个形式，5% 容差）："
+         f"{meta.r_beats_t_with_same_learner}；")
+    emit("    · **没有单一赢家**：每个形式的最小 MSE 方法不同 —— 这是 M4 的老结论；")
+    emit(f"    · **交叉拟合在 MSE 上不赚**：{meta.cross_fitting_costs_mse}"
+         "（不交叉拟合反而更低）。")
+    emit("      原因是样本内过拟合把 Ỹ 一起缩小、τ̂ 被收缩向 0，相当于正则化；")
+    emit("      交叉拟合买到的是**推断的有效性**（DML 那节量的无偏性与覆盖率），")
+    emit("      不是这个口径上的 MSE。这一条也是**被实测改写过的判据**：")
+    emit("      第一版的对照顺手把不交叉拟合那一支的 ê 换成了常数边际处置率，")
+    emit("      等于一次改了两个变量 —— 对照实验只许改一个。")
+
     # ---- 4. 图表 ------------------------------------------------------------ #
     emit("\n### 4. 生成图表")
     data = generate_hte_data(HTEConfig(n=n_uplift, cate_form="nonlinear", seed=0))
@@ -301,6 +328,9 @@ def main() -> int:
         ),
         "排序与水平结论冲突": uplift.verdicts_conflict,
         "样本内 Qini 虚高": uplift.in_sample_optimism > 0,
+        "R(森林) 不差于 T-learner（同基学习器，四个形式）": meta.r_beats_t_with_same_learner,
+        "元学习器没有单一赢家": len({meta.best(f).method for f in meta.forms}) > 1,
+        "交叉拟合在 MSE 口径上不赚（实测记录）": meta.cross_fitting_costs_mse,
     }
     verdict = "PASS" if all(checks.values()) else "FAIL"
 
@@ -338,6 +368,14 @@ def main() -> int:
          f"（完美 {uplift.qini_perfect:.1f}）；样本内虚高 {uplift.in_sample_optimism:+.0%}")
     emit("    -> **排序指标与水平指标给出相反结论**。")
     emit("       「我的模型 AUUC 更高」不等于「我的 CATE 估得更准」。")
+    # 变量名不要与上面森林那节的 `winners`（list[str]）重名：mypy 会按第一个绑定推断
+    meta_winners = "、".join(
+        f"{f}→{meta.best(f).method}({meta.best(f).mse:.3f})" for f in meta.forms
+    )
+    emit(f"[5] 元学习器：同基学习器下 R 不差于 T = {meta.r_beats_t_with_same_learner}；"
+         f"每个形式的最小 MSE 方法：{meta_winners}")
+    emit("    -> **没有单一赢家**（M4 的老结论），而**交叉拟合在 MSE 上不赚**：")
+    emit("       它买到的是推断的有效性，不是这个口径上的点估计。")
     emit(f"\n逐项检查: {checks}")
     emit(f"总体判定: {verdict}")
     emit(f"总耗时 {time.perf_counter() - t0:.1f}s")

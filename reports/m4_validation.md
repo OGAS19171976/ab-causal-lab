@@ -58,6 +58,65 @@ CATE 区间的覆盖率（5 个场景 × n=1500，bootstrap B=25，名义 0.95�
     （跨树方差本身也曾算错，第 8c 节已修：SE 从真实波动的 0.354 倍到 0.702 倍，
      覆盖率仍上不去 —— 偏差是 SE 的 7.46 倍）。
 
+### 3c. 元学习器对照：S / T / X / R / DR（四种 CATE 形式）
+  M4 原先只有 S / T / X 三个元学习器。这一轮补上 **R-learner**（Nie & Wager）
+  与 **DR-learner**（Kennedy）：两者都用正交化 + 交叉拟合的 nuisance，
+  R-learner 最小化 R-loss（等价于一个加权回归），DR-learner 回归双稳健伪结果。
+  线性 τ 时 R-loss 有闭式解；非线性 τ 走「伪结果 + 加权拟合」那条等价路径。
+
+  元学习器对照（n=3000，留出集评估，四种 CATE 形式）
+    形式         方法                           MSE       秩相关      Qini
+    constant   S-learner                 0.1721       nan    -119.5
+    constant   T-learner                 0.4319       nan      34.0
+    constant   X-learner                 0.1553       nan      49.5
+    constant   R(线性)                     0.0351       nan      72.9
+    constant   R(线性, 不交叉拟合)              0.0312       nan      58.7
+    constant   R(线性, oracle 倾向)          0.0464       nan      53.1
+    constant   R(森林)                     0.2316       nan      46.9
+    constant   DR(线性)                    0.0921       nan      -3.9
+    linear     S-learner                 0.6671    0.5888     145.6
+    linear     T-learner                 0.6753    0.6392     280.7
+    linear     X-learner                 0.3185    0.8519     356.8
+    linear     R(线性)                     0.0481    0.9734     319.1
+    linear     R(线性, 不交叉拟合)              0.0480    0.9736     311.8
+    linear     R(线性, oracle 倾向)          0.0744    0.9581     318.7
+    linear     R(森林)                     0.3931    0.8200     312.6
+    linear     DR(线性)                    0.0966    0.9599     333.5
+    threshold  S-learner                 0.5438    0.7687     225.0
+    threshold  T-learner                 0.4656    0.7589     271.0
+    threshold  X-learner                 0.1923    0.8261     279.0
+    threshold  R(线性)                     0.4553    0.7855     259.5
+    threshold  R(线性, 不交叉拟合)              0.4618    0.7815     247.2
+    threshold  R(线性, oracle 倾向)          0.4790    0.7812     244.6
+    threshold  R(森林)                     0.3396    0.8273     260.0
+    threshold  DR(线性)                    0.4794    0.7626     235.1
+    nonlinear  S-learner                 0.8014    0.6071     198.5
+    nonlinear  T-learner                 0.6593    0.6833     279.0
+    nonlinear  X-learner                 0.3384    0.8381     333.4
+    nonlinear  R(线性)                     0.7417    0.6278     195.1
+    nonlinear  R(线性, 不交叉拟合)              0.7248    0.6390     202.9
+    nonlinear  R(线性, oracle 倾向)          0.7498    0.6360     198.8
+    nonlinear  R(森林)                     0.4068    0.8209     309.6
+    nonlinear  DR(线性)                    0.8729    0.4620      95.2
+    注：constant 那一档的秩相关是 nan —— 真实 CATE 是常数时「排序」这件事本身不存在，不是实现问题。
+    → 每个形式的最小 MSE 方法（**由数据算出来，不写死**）：
+      constant   R(线性, 不交叉拟合)（MSE 0.0312）
+      linear     R(线性, 不交叉拟合)（MSE 0.0480）
+      threshold  X-learner（MSE 0.1923）
+      nonlinear  X-learner（MSE 0.3384）
+    → **没有单一赢家**：2 个方法各赢至少一种形式（R(线性, 不交叉拟合)、X-learner）。
+      这正是本仓库从 M4 起的那条结论 —— 换 DGP 就换赢家，所以「我的模型更好」必须带上「在哪种数据上」。
+
+  三条要一起读的东西：
+    · **同基学习器下 R 不差于 T**（四个形式，5% 容差）：True；
+    · **没有单一赢家**：每个形式的最小 MSE 方法不同 —— 这是 M4 的老结论；
+    · **交叉拟合在 MSE 上不赚**：True（不交叉拟合反而更低）。
+      原因是样本内过拟合把 Ỹ 一起缩小、τ̂ 被收缩向 0，相当于正则化；
+      交叉拟合买到的是**推断的有效性**（DML 那节量的无偏性与覆盖率），
+      不是这个口径上的 MSE。这一条也是**被实测改写过的判据**：
+      第一版的对照顺手把不交叉拟合那一支的 ê 换成了常数边际处置率，
+      等于一次改了两个变量 —— 对照实验只许改一个。
+
 ### 4. 生成图表
   fig21_dml_bias.png
   fig22_cate_forms.png
@@ -78,7 +137,10 @@ CATE 区间的覆盖率（5 个场景 × n=1500，bootstrap B=25，名义 0.95�
 [4] Qini：留出集森林 466.4 vs 常数 11.8（完美 604.8）；样本内虚高 +32%
     -> **排序指标与水平指标给出相反结论**。
        「我的模型 AUUC 更高」不等于「我的 CATE 估得更准」。
+[5] 元学习器：同基学习器下 R 不差于 T = True；每个形式的最小 MSE 方法：constant→R(线性, 不交叉拟合)(0.031)、linear→R(线性, 不交叉拟合)(0.048)、threshold→X-learner(0.192)、nonlinear→X-learner(0.338)
+    -> **没有单一赢家**（M4 的老结论），而**交叉拟合在 MSE 上不赚**：
+       它买到的是推断的有效性，不是这个口径上的点估计。
 
-逐项检查: {'naive plug-in 有可见偏置': True, 'DML 偏置远小于 naive': True, 'DML 覆盖率守住在名义附近': True, 'naive 覆盖率随 n 崩塌': True, '四种 CATE 形式都跑过': True, '存在排序能力（秩相关为正）': True, '排序与水平结论冲突': True, '样本内 Qini 虚高': True}
+逐项检查: {'naive plug-in 有可见偏置': True, 'DML 偏置远小于 naive': True, 'DML 覆盖率守住在名义附近': True, 'naive 覆盖率随 n 崩塌': True, '四种 CATE 形式都跑过': True, '存在排序能力（秩相关为正）': True, '排序与水平结论冲突': True, '样本内 Qini 虚高': True, 'R(森林) 不差于 T-learner（同基学习器，四个形式）': True, '元学习器没有单一赢家': True, '交叉拟合在 MSE 口径上不赚（实测记录）': True}
 总体判定: PASS
 ```

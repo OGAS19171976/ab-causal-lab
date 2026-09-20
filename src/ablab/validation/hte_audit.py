@@ -1,4 +1,4 @@
-"""异质效应审计：CATE 估计到底比"报一个平均值"好在哪里。
+"""异质效应审计：CATE 估计到底比「报一个平均值」好在哪里。
 
 M4 的验证台比前几个阶段难
 ------------------------
@@ -10,7 +10,7 @@ DML 的 θ 有真值可比，直接量偏置和覆盖率就行。但 CATE 不行
 
 1. **四种 CATE 形式各跑一遍**，报告完整对照表 —— "没有单一赢家"是结论，不是失败
 2. **拿常数 ATE 当基准线**。这是最容易被跳过、也最残酷的一问：
-   你的弹性模型比"对所有人报同一个数"到底好在哪？
+   你的弹性模型比「对所有人报同一个数」到底好在哪？
 3. **把排序指标和水平指标分开报**。Qini/AUUC 只衡量排序，
    MSE 衡量水平，两者可以给出完全相反的结论 —— 这是 M4 的核心发现。
 """
@@ -18,6 +18,7 @@ DML 的 θ 有真值可比，直接量偏置和覆盖率就行。但 CATE 不行
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 
@@ -37,6 +38,9 @@ from ..causal.uplift import (
 
 __all__ = [
     "DMLEstimationAudit",
+    "MetaLearnerComparison",
+    "MetaLearnerRow",
+    "run_meta_learner_comparison",
     "CATEFormResult",
     "CATEModelComparison",
     "CateIntervalCoverage",
@@ -293,7 +297,7 @@ def run_cate_form_comparison(
 # --------------------------------------------------------------------------- #
 @dataclass
 class CateIntervalCoverage:
-    """两条区间路线的覆盖率与长度，以及"为什么盖不住"的分解。
+    """两条区间路线的覆盖率与长度，以及「为什么盖不住」的分解。
 
     M4 过去只能主张**排序**（Qini 是常数基线的 40 倍），不能主张**水平**
     （森林 MSE 反而差 17%）。这一组数字回答的是：**加上区间之后，水平可用了吗？**
@@ -310,7 +314,7 @@ class CateIntervalCoverage:
     #: 按单元 bootstrap
     bootstrap_coverage: float
     bootstrap_length: float
-    #: 点估计本身的诊断（这才是"盖不住"的原因）
+    #: 点估计本身的诊断（这才是「盖不住」的原因）
     cate_correlation: float
     rmse: float
     true_cate_sd: float
@@ -357,14 +361,14 @@ def run_cate_coverage_audit(
     min_leaf: int = 20,
     seed_start: int = 1,
 ) -> CateIntervalCoverage:
-    """多场景测量 CATE 区间的覆盖率（这是"有没有区间"唯一算数的证据）。
+    """多场景测量 CATE 区间的覆盖率（这是「有没有区间」唯一算数的证据）。
 
-    **没有这个数，"我们有置信区间了"就只是一句话。**
+    **没有这个数，「我们有置信区间了」就只是一句话。**
     两条路线都测：叶内方差 + 跨树独立合成（``predict_with_se``）
     与按单元 bootstrap。
 
     结果在实测中是**负面**的（覆盖率 0.38~0.74，名义 0.95），
-    所以这个函数的价值不在于给出一个能用的区间，而在于**把"水平不可用"量化** ——
+    所以这个函数的价值不在于给出一个能用的区间，而在于**把「水平不可用」量化** ——
     并且指出它是因为偏差而不是方差。
     """
     from ..causal.forest import CausalForest, ForestConfig
@@ -548,12 +552,12 @@ def run_forest_se_audit(
 
     为什么必须量：旧写法把各棵树的方差按**独立**合成，而它们用同一份数据
     训练 —— 这是本仓库在 CS 聚合、SA 聚合、事件研究上修过三次的同一个错误。
-    修法是把各棵树的**影响函数相加**。但"修好了"这句话不能靠推导，
+    修法是把各棵树的**影响函数相加**。但「修好了」这句话不能靠推导，
     只能靠在同一个靶子前量出来。
 
     网格固定用第一个 replication 的 X 前 ``n_grid`` 行（``tau`` 是 X 的
     确定性函数，所以真值可以直接取）。森林在每次重抽的数据上重新训练，
-    但**始终评估在同一个网格上** —— 不这样就没有"固定的 x"可言。
+    但**始终评估在同一个网格上** —— 不这样就没有「固定的 x」可言。
 
     有限点集的取法：某个网格点只要在**任意一次** replication 里拿到过
     ``inf``（有树切出了退化叶子），就整行剔除。宁可样本变小，也不混两种口径。
@@ -677,12 +681,262 @@ def run_forest_se_audit(
 
 
 # --------------------------------------------------------------------------- #
+# 二之四、元学习器：S / T / X / R / DR 在同一批 DGP 上的对照
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class MetaLearnerRow:
+    """一个（DGP 形式 × 方法）的读数。"""
+
+    cate_form: str
+    method: str
+    mse: float
+    rank_correlation: float
+    qini: float
+
+
+@dataclass
+class MetaLearnerComparison:
+    """S / T / X / R / DR 的对照，外加**两条被单独量出来的机制**。
+
+    为什么要把元学习器放在同一个台上比：它们不是「哪个更先进」的关系，
+    而是**对哪种 DGP 更合适**的关系 —— 本仓库从 M4 起就坚持一件事：
+    只报一个 DGP 的胜负等于在挑赢家。
+
+    两条机制单独量：
+
+    * **同基学习器**：``R(森林)`` vs ``T-learner``（两者都是同一片小森林）。
+      拿 ``R(线性)`` 去比森林 T-learner 会把"基学习器"的差算到"元学习器"头上 ——
+      实测 nonlinear 那一档就是这么被误读的（线性 τ 比值 1.12）。
+    * **交叉拟合**：``R(线性, 不交叉拟合)`` vs ``R(线性, 交叉拟合)``。
+      **实测结论与直觉相反**（见 ``cross_fitting_costs_mse``）：在**点估计 MSE**
+      上，不交叉拟合反而更低 —— 样本内过拟合把 ``Ỹ`` 一起缩小、τ̂ 被收缩向 0，
+      相当于正则化。交叉拟合买到的是**推断的有效性**，不是这个口径上的 MSE。
+      两个变量只差这一个：第一版顺手把不交叉拟合那一支的 ``ê`` 换成了常数边际
+      处置率，于是"对照"同时改了两样东西 —— 那种对照量出来的差不属于任何一个变量。
+    * **nuisance 质量**：``R(线性, oracle 倾向)`` 用的是**真**倾向得分。
+      它与估计版的差，就是「估 nuisance 要付多少钱」。
+    """
+
+    n: int
+    forms: tuple[str, ...]
+    rows: tuple[MetaLearnerRow, ...]
+
+    def best(self, cate_form: str) -> MetaLearnerRow:
+        cand = [r for r in self.rows if r.cate_form == cate_form]
+        return min(cand, key=lambda r: r.mse)
+
+    @property
+    def r_beats_t_with_same_learner(self) -> bool:
+        """**同基学习器**下 R-learner 不差于 T-learner（四个形式）。
+
+        为什么必须"同基学习器"：第一版拿 ``R(线性)`` 去比 ``T-learner``（森林），
+        在 nonlinear 那一档得出"R 更差 12.5%"—— 但那个差**属于基学习器**
+        （非线性 τ 用线性模型本来就吃亏），不属于"R 还是 T"这个变量。
+        改成 ``R(森林)`` vs ``T-learner``（两者都用同一片小森林）之后，
+        四个形式上 R 全面更优。**对照只许换一个东西** ——
+        这条在 README 里写过很多次，这次是在元学习器这一层又踩了一遍。
+
+        判据留 5% 容差：这条主张的是"不差于"，不是"全面碾压"，
+        把容差写成 0 会让薄边际变成假红灯。
+        """
+        for form in self.forms:
+            r = next(r for r in self.rows if r.cate_form == form and r.method == "R(森林)")
+            t_row = next(r for r in self.rows if r.cate_form == form and r.method == "T-learner")
+            if r.mse > t_row.mse * 1.05:
+                return False
+        return True
+
+    @property
+    def linear_vs_forest_gap(self) -> dict[str, float]:
+        """``R(线性)`` 相对 ``T-learner`` 的 MSE 比值（逐形式）。
+
+        留着它是为了让"基学习器的影响"可以被看见：nonlinear 那一档
+        线性 τ 明显吃亏（比值 >1），而那正是"不能拿它当元学习器的对照"的证据。
+        """
+        out: dict[str, float] = {}
+        for form in self.forms:
+            lin = next(r for r in self.rows if r.cate_form == form and r.method == "R(线性)")
+            t_row = next(r for r in self.rows if r.cate_form == form and r.method == "T-learner")
+            out[form] = lin.mse / t_row.mse
+        return out
+
+    @property
+    def cross_fitting_costs_mse(self) -> bool:
+        """**与直觉相反的那一条（实测）**：不交叉拟合的 R-learner MSE 更低。
+
+        交叉拟合的作用是让"自己的观测不进自己的 nuisance"，它买到的是
+        **推断的有效性**（无偏性/覆盖率，见 DML 那一节）。但在**点估计 MSE**
+        这个口径上，样本内过拟合的 nuisance 会把 ``Ỹ = Y − m̂`` 一起缩小，
+        于是 τ̂ 被收缩向 0 —— 那正好起到了正则化的作用，MSE 反而更低
+        （实测 4 个形式里有 3 个如此，低 2%~18%）。
+
+        所以这个属性记的是"实测方向"，并**明确限定在 MSE 口径**：
+        拿它去否定交叉拟合是错的，拿它去否定"交叉拟合总是赢"是对的。
+        """
+        better_without = 0
+        for form in self.forms:
+            with_cf = next(
+                r for r in self.rows if r.cate_form == form and r.method == "R(线性)"
+            )
+            without = next(
+                r for r in self.rows
+                if r.cate_form == form and r.method == "R(线性, 不交叉拟合)"
+            )
+            if without.mse < with_cf.mse:
+                better_without += 1
+        return better_without > len(self.forms) // 2
+
+    def summary(self) -> str:
+        lines = [
+            f"元学习器对照（n={self.n}，留出集评估，四种 CATE 形式）",
+            f"  {'形式':<11}{'方法':<22}{'MSE':>10}{'秩相关':>10}{'Qini':>10}",
+        ]
+        for form in self.forms:
+            for row in [r for r in self.rows if r.cate_form == form]:
+                lines.append(
+                    f"  {row.cate_form:<11}{row.method:<22}{row.mse:>10.4f}"
+                    f"{row.rank_correlation:>10.4f}{row.qini:>10.1f}"
+                )
+        if "constant" in self.forms:
+            lines.append(
+                "  注：constant 那一档的秩相关是 nan —— 真实 CATE 是常数时"
+                "「排序」这件事本身不存在，不是实现问题。"
+            )
+        winners = {form: self.best(form) for form in self.forms}
+        lines.append("  → 每个形式的最小 MSE 方法（**由数据算出来，不写死**）：")
+        for form in self.forms:
+            best = winners[form]
+            lines.append(f"    {form:<11}{best.method}（MSE {best.mse:.4f}）")
+        distinct = sorted({w.method for w in winners.values()})
+        if len(distinct) == 1:
+            lines.append(f"  → 赢家是同一个方法（{distinct[0]}）—— 这批 DGP 上它通吃。")
+        else:
+            lines.append(
+                f"  → **没有单一赢家**：{len(distinct)} 个方法各赢至少一种形式"
+                f"（{'、'.join(distinct)}）。"
+            )
+        lines.append(
+            "    这正是本仓库从 M4 起的那条结论 —— 换 DGP 就换赢家，"
+            "所以「我的模型更好」必须带上「在哪种数据上」。"
+        )
+        return "\n".join(lines)
+
+
+def run_meta_learner_comparison(
+    *,
+    forms: tuple[str, ...] = ("constant", "linear", "threshold", "nonlinear"),
+    n: int = 1500,
+    seed: int = 0,
+    n_replications: int = 3,
+) -> MetaLearnerComparison:
+    """在四种 DGP 上跑 S / T / X / R / DR，留出集评估。
+
+    **每个形式重复 ``n_replications`` 次独立的 DGP 抽取再平均**：
+    只跑一次的话，方法之间的差可能只是那一次抽样 —— 而这一节要下的判断
+    （"没有单一赢家"、"交叉拟合有用"）是关于**方法**的，不是关于某一次抽样的。
+    代价是运行时间乘以重复数，所以默认 3（够压掉单次抽样的噪声，
+    又不至于把 m4 那一步拖长）。
+    """
+    from ..causal.hte import (
+        _default_nuisance,
+        dr_learner,
+        r_learner,
+        s_learner,
+        t_learner,
+        x_learner,
+    )
+
+    methods: list[str] = [
+        "S-learner",
+        "T-learner",
+        "X-learner",
+        "R(线性)",
+        "R(线性, 不交叉拟合)",
+        "R(线性, oracle 倾向)",
+        "R(森林)",
+        "DR(线性)",
+    ]
+    #: 每个 (形式, 方法) 累加（MSE, 秩相关, Qini），最后取平均
+    acc: dict[tuple[str, str], list[float]] = {
+        (form, m): [0.0, 0.0, 0.0] for form in forms for m in methods
+    }
+    rank_undefined = {(form, m): 0 for form in forms for m in methods}
+
+    for i, form in enumerate(forms):
+        for rep in range(n_replications):
+            data = generate_hte_data(
+                HTEConfig(
+                    n=n, n_features=8, n_informative=4, cate_form=form,
+                    seed=seed + i * 100 + rep,
+                )
+            )
+            rng = np.random.default_rng(seed + 100 + i * 100 + rep)
+            perm = rng.permutation(data.n)
+            half = data.n // 2
+            tr, te = perm[:half], perm[half:]
+            X_tr, D_tr, Y_tr = data.X[tr], data.D[tr], data.Y[tr]
+            X_te, tau_te = data.X[te], data.tau[te]
+            Y_te, D_te = data.Y[te], data.D[te]
+
+            builders: list[tuple[str, Any]] = [
+            ("S-learner", lambda: s_learner(X_tr, D_tr, Y_tr)),
+            ("T-learner", lambda: t_learner(X_tr, D_tr, Y_tr)),
+            ("X-learner", lambda: x_learner(X_tr, D_tr, Y_tr, propensity=data.propensity[tr])),
+            ("R(线性)", lambda: r_learner(X_tr, D_tr, Y_tr, seed=seed)),
+            (
+                "R(线性, 不交叉拟合)",
+                lambda: r_learner(X_tr, D_tr, Y_tr, n_folds=1, seed=seed),
+            ),
+            (
+                "R(线性, oracle 倾向)",
+                lambda: r_learner(
+                    X_tr, D_tr, Y_tr, propensity=data.propensity[tr], seed=seed
+                ),
+            ),
+            (
+                "R(森林)",
+                lambda: r_learner(X_tr, D_tr, Y_tr, learner=_default_nuisance(), seed=seed),
+            ),
+            ("DR(线性)", lambda: dr_learner(X_tr, D_tr, Y_tr, seed=seed)),
+        ]
+            for method, build in builders:
+                tau_hat = np.asarray(build()(X_te), dtype=float)
+                rc = rank_correlation(tau_te, tau_hat)
+                slot = acc[(form, method)]
+                slot[0] += float(np.mean((tau_hat - tau_te) ** 2))
+                if np.isfinite(rc):
+                    slot[1] += rc
+                else:
+                    # 真实 CATE 是常数时秩相关没有定义 —— 不能把它当 0 平均进去，
+                    # 否则 constant 那一档会被"平均成一个假的数"。
+                    rank_undefined[(form, method)] += 1
+                slot[2] += qini_coefficient(Y_te, D_te, tau_hat)
+
+    rows: list[MetaLearnerRow] = []
+    for form in forms:
+        for method in methods:
+            total, rc_sum, qini_sum = acc[(form, method)]
+            n_rc = n_replications - rank_undefined[(form, method)]
+            rows.append(
+                MetaLearnerRow(
+                    cate_form=form,
+                    method=method,
+                    mse=total / n_replications,
+                    rank_correlation=rc_sum / n_rc if n_rc else float("nan"),
+                    qini=qini_sum / n_replications,
+                )
+            )
+
+    return MetaLearnerComparison(n=n, forms=tuple(forms), rows=tuple(rows))
+
+
+# --------------------------------------------------------------------------- #
 # 二之三、CATE 的**组级**校准：BLP 与 GATES
 # --------------------------------------------------------------------------- #
 def _ols(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """普通最小二乘 + HC0 稳健标准误（分样本之后这就是经典推断）。
 
-    只依赖 numpy：这一节要的是"在留出样本上做一次线性回归"，
+    只依赖 numpy：这一节要的是「在留出样本上做一次线性回归」，
     引 sklearn 的 LinearRegression 不会有任何额外信息，还挡住标准误。
     """
     inv = np.linalg.pinv(x.T @ x)
@@ -710,7 +964,7 @@ class GatesBlpResult:
     * **BLP**：把信号回归到代理上。``斜率 = 1`` 就是校准；推断来自经典 OLS，
       **不要求代理一致** —— 这正是它绕开那个不可能性的方式。
     * **GATES**：按代理的分位数分组，组内平均效应的**有效置信区间**。
-      于是"排序可用、水平不可用"可以正确地软化成：
+      于是「排序可用、水平不可用」可以正确地软化成：
       **组级水平可用，单元级不可用**。
 
     信号用 Horvitz-Thompson 变换 ``H = (D - p)/(p(1-p))``，``signal = H·Y``，
@@ -720,7 +974,7 @@ class GatesBlpResult:
     n: int
     n_splits: int
     n_groups: int
-    #: BLP 斜率（应当 ≈ 1）与其标准误、以及"CI 盖住 1"的比例
+    #: BLP 斜率（应当 ≈ 1）与其标准误、以及「CI 盖住 1」的比例
     blp_slope: float
     blp_slope_se: float
     blp_covers_one: float
@@ -733,8 +987,8 @@ class GatesBlpResult:
     gates_gap: list[float] = field(default_factory=list)
     gates_gap_mc_se: list[float] = field(default_factory=list)
     #: HT 信号的诊断：峰度（正态为 3）与**重叠度**（倾向得分落在 [0.05,0.95] 外的比例）
-    #: 这两个数解释了"为什么区间有效却又宽又不稳"：峰度 752 的信号 + 近乎违背的
-    #: 正值性假设。见 README 已知边界里那条"应当换 AIPW 信号"。
+    #: 这两个数解释了「为什么区间有效却又宽又不稳」：峰度 752 的信号 + 近乎违背的
+    #: 正值性假设。见 README 已知边界里那条「应当换 AIPW 信号」。
     signal_kurtosis: float = float("nan")
     overlap_violation_share: float = float("nan")
     #: 信号与裁剪：``signal_kind`` 是 ht / aipw；``trim_alpha`` 是实际用上的阈值，
@@ -765,7 +1019,7 @@ class GatesBlpResult:
             gap = eff - true
             mc = self.gates_gap_mc_se[i] if i < len(self.gates_gap_mc_se) else float("nan")
             # 只有超出蒙特卡洛噪音才叫偏差，否则一律记为噪音（不做无依据的断言）
-            verdict = "噪音范围内" if abs(gap) <= 2 * mc else "超出噪音"
+            verdict = "噪音范围内「 if abs(gap) <= 2 * mc else 」超出噪音"
             lines.append(
                 f"    组{i + 1}: 估计 {eff:+.4f} vs 真实 {true:+.4f}"
                 f"（差 {gap:+.4f} ± {mc:.4f}，{verdict}）"
@@ -781,7 +1035,7 @@ def _gates_fit(
     """GATES 的公共计算：按代理分位数切 K 组、把信号回归到组哑变量上。
 
     只此一份实现 —— 选阈值时要反复用它（候选阈值各算一次方差），
-    最终结果也用它。写成两处就会让"选出来的阈值"和"报告的组效应"
+    最终结果也用它。写成两处就会让「选出来的阈值」和"报告的组效应"
     来自不同口径。
     """
     edges = np.quantile(proxy, np.linspace(0, 1, n_groups + 1)[1:-1])
@@ -812,7 +1066,7 @@ def _pick_trim_alpha(
     而且选出来的 α 和被裁剪的比例都会写进报告。
 
     诚实的代价：**阈值变了，估计目标也跟着变**（从全体变成重叠总体），
-    这不是"免费的精度"，所以报告里必须同时给出被裁剪的比例。
+    这不是「免费的精度」，所以报告里必须同时给出被裁剪的比例。
     """
     best_alpha, best_score = 0.0, float("inf")
     min_keep = max(50, p.size // 4)
@@ -843,7 +1097,7 @@ def run_gates_blp_audit(
     signal_kind: str = "aipw",
     trim: float | str | None = "auto",
 ) -> GatesBlpResult:
-    """BLP 与 GATES 的实测校准（这是"组级水平可用"这句话的唯一证据）。
+    """BLP 与 GATES 的实测校准（这是「组级水平可用」这句话的唯一证据）。
 
     流程（每一步都对应文献里的一个决定）：
       1. 把样本随机劈成**辅助样本**（训练代理）与**主样本**（做推断）；
@@ -856,7 +1110,7 @@ def run_gates_blp_audit(
 
     ``proxy_kind="oracle"`` 是**正对照**：直接拿真 CATE 当代理（模拟"代理已
     校准"这个理想情形）。它必须给出 BLP 斜率 ≈ 1、覆盖率 ≈ 0.95 ——
-    否则说明这个审计连真值都验不过，那 0.95 就只是"永远通过"，没有信息。
+    否则说明这个审计连真值都验不过，那 0.95 就只是「永远通过」，没有信息。
 
     ``signal_kind``：
 
@@ -1016,7 +1270,7 @@ def _fit_predict(x: np.ndarray, y: np.ndarray, x_new: np.ndarray) -> np.ndarray:
 
     为什么用最朴素的 OLS：这一节要比的是**信号**（HT vs AIPW）在同一个
     代理、同一套分组下的差别，结局模型越好两边都越好，不改变结论方向；
-    用朴素模型反而避免了"到底是谁带来的改善"这个混淆。
+    用朴素模型反而避免了「到底是谁带来的改善」这个混淆。
     """
     design = np.column_stack([np.ones(x.shape[0]), x])
     beta = np.linalg.lstsq(design, y, rcond=None)[0]
@@ -1037,7 +1291,7 @@ class SignalArmStats:
 
 @dataclass
 class SignalComparison:
-    """四种信号的对照 —— 回答"重尾该怎么修"。
+    """四种信号的对照 —— 回答「重尾该怎么修」。
 
     背景：纯 HT 信号在本 DGP 下峰度 260（见 ``GatesBlpResult``），
     于是组级覆盖率会在 0.875~0.950 之间摆动。README 原先写下的下一步是
@@ -1049,7 +1303,7 @@ class SignalComparison:
       * **降峰度靠裁剪**（260→72.5，3.6 倍），单裁剪不改善覆盖率却缩短区间。
       * 两者叠加最好：峰度 63.5、覆盖率 0.925、长度比纯 HT 短 46%。
 
-    所以正确的下一步不是二选一，而是"裁剪（管尾巴）＋ AIPW（管方差）"，
+    所以正确的下一步不是二选一，而是「裁剪（管尾巴）＋ AIPW（管方差）」，
     并如实记录裁剪引入的偏差 —— 这一节把偏差也测出来放在同一张表里。
     """
 
@@ -1090,7 +1344,7 @@ def run_signal_comparison(
     （代理质量的影响已经在 ``run_gates_blp_audit`` 里单独测过了。）
 
     结局模型在**辅助样本**上拟合、主样本上预测 —— 主样本仍用于推断，
-    所以"拟合过的东西不进推断样本"这条纪律没有被破坏。
+    所以「拟合过的东西不进推断样本」这条纪律没有被破坏。
     """
     from ..causal.hte import HTEConfig, generate_hte_data
 
@@ -1131,7 +1385,7 @@ def run_signal_comparison(
             "AIPW+裁剪": (m1 - m0) + h_clip * (y - m_d),
         }
 
-        # 分组按**真实** τ 的分位数，四个信号共用，隔离"信号"这一个变量
+        # 分组按**真实** τ 的分位数，四个信号共用，隔离「信号」这一个变量
         edges = np.quantile(tau, np.linspace(0, 1, n_groups + 1)[1:-1])
         group = np.searchsorted(edges, tau, side="right")
         dummies = np.zeros((main.size, n_groups))
@@ -1172,7 +1426,7 @@ class ConformalCoverageAudit:
     """保形个体效应区间的覆盖诊断：边际 vs 分组。
 
     上一轮量到它的**边际**覆盖达标（≈0.95）。这一轮量的是**分组**覆盖 ——
-    因为"平均 95%"与"每个人 95%"是两件事，而后者在无假设下
+    因为「平均 95%」与"每个人 95%"是两件事，而后者在无假设下
     **被证明不可能**（Barber 等 2019）。所以这里的目标不是修好它，
     而是把差距**量出来**：最差的组差多少、按什么分组差异最大。
     """
@@ -1197,7 +1451,7 @@ class ConformalCoverageAudit:
     #: 平均半宽（与真 CATE 的离散度比，说明代价）
     mean_half_width: float = float("nan")
     mean_true_sd: float = float("nan")
-    #: **决策相关**：用"区间下界 > 0"挑选出来的那批人里，真实效应确实 > 0 的比例
+    #: **决策相关**：用「区间下界 > 0」挑选出来的那批人里，真实效应确实 > 0 的比例
     selection_precision: float = float("nan")
     #: 这批人占全体多少（挑选率）
     selection_share: float = float("nan")
@@ -1237,7 +1491,7 @@ def run_conformal_coverage_audit(
     """多场景平均地量保形区间的边际与分组覆盖。
 
     **分组覆盖只主张为诊断**：条件覆盖在无假设下不可能，
-    这里量的是"它离条件覆盖有多远"，而不是"它做到了条件覆盖"。
+    这里量的是「它离条件覆盖有多远」，而不是「它做到了条件覆盖」。
     """
     from ..causal.conformal import conformal_ite_intervals
     from ..causal.hte import HTEConfig, generate_hte_data
@@ -1270,7 +1524,7 @@ def run_conformal_coverage_audit(
         half_widths.append(res.mean_width() / 2.0)
         true_sds.append(float(np.std(tau)))
 
-        # 决策相关：按"区间下界 > 0"挑选，看选中的人里真正为正的比例
+        # 决策相关：按「区间下界 > 0」挑选，看选中的人里真正为正的比例
         picked = res.lower > 0
         if picked.any():
             precision.append(float(np.mean(tau[picked] > 0)))

@@ -72,12 +72,18 @@ ITEMS: tuple[UnimplementedItem, ...] = (
         when_done="README 的 M3 那条要改成「已实现 RDD」，并补验收证据",
     ),
     UnimplementedItem(
-        id="policy_learning",
-        readme_phrase="没有实现 R-learner / DR-learner",
+        id="policy_optimization",
+        readme_phrase="策略学习只做到 CATE 排序",
         kind="symbol_absent",
-        target="ablab.causal.uplift.RLearner",
-        anchor_present="ablab.causal.uplift",
-        when_done="README 要改成「已实现 R/DR-learner」，并给出与 T/S/X 的对照",
+        target="ablab.causal.policy.aipw_policy_learner",
+        # R/DR-learner 这一轮做完了（``causal.hte.r_learner`` / ``dr_learner``，
+        # 见 m4 报告 3c 节），所以条目收窄成"直接优化策略价值"那一层。
+        # 锚点钉在 hte 上：模块还在、只是更进一步的策略优化没做。
+        anchor_present="ablab.causal.hte",
+        when_done=(
+            "README 要改成「实现了直接优化策略价值的策略学习」，"
+            "并给出策略价值（AIPW 意义下）相对 CATE 排序策略的实测对照"
+        ),
     ),
     UnimplementedItem(
         id="wild_cluster_bootstrap",

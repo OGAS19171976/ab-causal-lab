@@ -10,9 +10,11 @@ from ablab.causal import (
     HTEConfig,
     constant_prediction,
     dml_partial_linear,
+    dr_learner,
     generate_hte_data,
     naive_plugin,
     qini_coefficient,
+    r_learner,
     rank_correlation,
     s_learner,
     scaled_perfect,
@@ -191,6 +193,74 @@ class TestMetaLearners:
         D = np.ones(300)
         with pytest.raises(ValueError, match="至少要有 5 个"):
             t_learner(d.X, D, d.Y)
+
+
+class TestRLearnerAndDRLearner:
+    """R-learner 与 DR-learner：正交化 + 交叉拟合的元学习器。
+
+    重点钉三件事：
+    (1) 线性 τ 的 DGP 上它们能真的把 CATE 估准（而 T-learner 不能）；
+    (2) **闭式解与"伪结果 + 加权拟合"两条路径是同一个损失** ——
+        这是文档里那句"两者恰好相等"的可执行版本；
+    (3) 对照实验只许改一个变量：``n_folds=1`` 那一支的 ``ê`` 也必须照样估，
+        否则量出来的差不属于"交叉拟合"。
+    """
+
+    @staticmethod
+    def _linear_data(n: int = 1500, seed: int = 3):
+        return generate_hte_data(
+            HTEConfig(n=n, n_features=6, n_informative=3, cate_form="linear", seed=seed)
+        )
+
+    def test_r_learner_beats_t_learner_on_a_linear_cate(self):
+        d = self._linear_data()
+        r = r_learner(d.X, d.D, d.Y, seed=0)(d.X)
+        t_pred = t_learner(d.X, d.D, d.Y)(d.X)
+        mse_r = float(np.mean((r - d.tau) ** 2))
+        mse_t = float(np.mean((t_pred - d.tau) ** 2))
+        assert mse_r < mse_t, (mse_r, mse_t)
+        assert rank_correlation(d.tau, r) > 0.8
+
+    def test_dr_learner_produces_finite_cate(self):
+        d = generate_hte_data(
+            HTEConfig(n=800, n_features=6, n_informative=3, cate_form="nonlinear", seed=5)
+        )
+        pred = dr_learner(d.X, d.D, d.Y, seed=0)(d.X[:200])
+        assert pred.shape == (200,)
+        assert np.all(np.isfinite(pred))
+        assert float(np.std(pred)) > 0
+
+    def test_closed_form_matches_the_weighted_path(self):
+        """闭式解 ≡ 线性学习器 + 伪结果加权拟合（同一个 R-loss）。"""
+        from sklearn.linear_model import LinearRegression
+
+        d = self._linear_data(n=1200, seed=7)
+        closed = r_learner(d.X, d.D, d.Y, seed=0)(d.X)
+        weighted = r_learner(
+            d.X, d.D, d.Y, learner=LinearRegression(), seed=0
+        )(d.X)
+        # 两条路径的差别只来自线性代数实现，量级应当是 1e-8 而不是"差不多"
+        assert np.max(np.abs(closed - weighted)) < 1e-6, float(
+            np.max(np.abs(closed - weighted))
+        )
+
+    def test_cross_fitting_flag_actually_changes_something(self):
+        d = self._linear_data(n=1000, seed=11)
+        cf = r_learner(d.X, d.D, d.Y, n_folds=5, seed=0)(d.X)
+        no_cf = r_learner(d.X, d.D, d.Y, n_folds=1, seed=0)(d.X)
+        assert not np.allclose(cf, no_cf)
+
+    def test_clip_is_validated_and_reported(self):
+        d = self._linear_data(n=600, seed=13)
+        with pytest.raises(ValueError, match="clip"):
+            r_learner(d.X, d.D, d.Y, clip=0.6)
+        with pytest.raises(ValueError, match="clip"):
+            dr_learner(d.X, d.D, d.Y, clip=0.0)
+
+    def test_sample_size_mismatch_raises(self):
+        d = self._linear_data(n=400, seed=17)
+        with pytest.raises(ValueError, match="样本量"):
+            r_learner(d.X, d.D[:100], d.Y)
 
 
 # --------------------------------------------------------------------------- #

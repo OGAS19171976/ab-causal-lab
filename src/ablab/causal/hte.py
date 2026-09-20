@@ -41,6 +41,8 @@ __all__ = [
     "DMLResult",
     "dml_partial_linear",
     "naive_plugin",
+    "dr_learner",
+    "r_learner",
     "s_learner",
     "t_learner",
     "x_learner",
@@ -470,3 +472,213 @@ def x_learner(
         return g * tau0.predict(X_new) + (1.0 - g) * tau1.predict(X_new)
 
     return cate
+
+
+def _cross_fit_nuisances(
+    X: np.ndarray,
+    Y: np.ndarray,
+    D: np.ndarray,
+    *,
+    model_y,
+    n_folds: int,
+    seed: int,
+    propensity: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """交叉拟合 ``m̂(X)=E[Y|X]`` 与 ``ê(X)=E[D|X]``。
+
+    ``propensity`` 给定时直接用它当 ``ê``（**oracle 变体**）——
+    留着它是为了能把"nuisance 估得准不准"这件事单独量出来：
+    R-learner 的卖点之一是"准 oracle"，而那说的是**收敛速度**，
+    不是"估 nuisance 不要钱"。
+    """
+    n = Y.size
+    if n_folds <= 1:
+        # 不交叉拟合：nuisance 在**同一批数据**上拟合并预测（会过拟合）。
+        # **注意 ``ê`` 必须也照样估**：第一版这里偷懒用了常数边际处置率，
+        # 于是"不交叉拟合"这个对照同时换了两样东西（过拟合 + 常数倾向），
+        # 量出来的差就不再属于交叉拟合。对照实验只许改一个变量。
+        m_hat = model_y.fit(X, Y).predict(X)
+        if propensity is None:
+            e_hat = _default_nuisance().fit(X, D).predict(X)
+        else:
+            e_hat = np.asarray(propensity, dtype=float)
+        return m_hat, e_hat
+
+    from sklearn.model_selection import KFold
+
+    m_hat = np.empty(n)
+    kf = KFold(n_splits=n_folds, shuffle=True, random_state=seed)
+    for train, test in kf.split(X):
+        m_hat[test] = _clone_fit_predict(model_y, X[train], Y[train], X[test])
+    if propensity is None:
+        model_d = _default_nuisance()
+        e_hat = np.empty(n)
+        for train, test in kf.split(X):
+            e_hat[test] = _clone_fit_predict(model_d, X[train], D[train], X[test])
+    else:
+        e_hat = np.asarray(propensity, dtype=float)
+    return m_hat, e_hat
+
+
+def _clip_propensity(e_hat: np.ndarray, clip: float) -> np.ndarray:
+    """把倾向得分裁到 ``[clip, 1-clip]``。
+
+    必须做，而且必须在文档里说：本仓库的 HTE DGP 里倾向得分可以低到 0.014，
+    而 R/DR 两条路都要除以 ``D − ê`` —— 不裁就是拿一个 0.01 当分母。
+    裁剪会**改变估计目标**（把极端权重的样本拉回边界），
+    所以它和 ``run_signal_comparison`` 里的裁剪是同一件事的另一个入口：
+    阈值要显式、要报出来，不能藏在实现里。
+    """
+    if not 0.0 < clip < 0.5:
+        raise ValueError(f"clip 必须落在 (0, 0.5)，收到 {clip}")
+    return np.clip(np.asarray(e_hat, dtype=float), clip, 1.0 - clip)
+
+
+def r_learner(
+    X: np.ndarray,
+    D: np.ndarray,
+    Y: np.ndarray,
+    *,
+    learner=None,
+    n_folds: int = 5,
+    clip: float = 0.02,
+    seed: int = 0,
+    propensity: np.ndarray | None = None,
+) -> Callable[[np.ndarray], np.ndarray]:
+    """R-learner（Nie & Wager 2021）：把 CATE 写成一个**加权回归**问题。
+
+    损失（R-loss）：
+
+        Σ_i [ (Y_i − m̂(X_i)) − τ(X_i)·(D_i − ê(X_i)) ]²
+
+    ``m̂ = E[Y|X]``、``ê = E[D|X]`` 都是**交叉拟合**的（这是"准 oracle"的来源）。
+    对**线性** τ(x) = [1, x]'β 这个损失有闭式解：把 ``Ỹ = Y − m̂``
+    回归到 ``d̃·[1, X]`` 上（``d̃ = D − ê``）。给了 ``learner`` 时走通用路径：
+    用**伪结果** ``Ỹ/d̃`` 加权 ``d̃²`` 拟合 —— 两者**恰好**是同一个损失
+    （``d̃²(Ỹ/d̃ − τ)² = (Ỹ − d̃τ)²``），所以不是近似。
+
+    边界（写清楚，别让人以为它是万能的）：
+    * ``d̃`` 接近 0 的样本权重也接近 0，但伪结果会爆 —— 所以要裁 ``ê``。
+      裁剪**改变估计目标**（极端权重被拉回边界），本仓库在别处也踩过同一个坑；
+    * 线性闭式解假设 τ 线性；非线性 τ 需要加权 boosting 那一类做法，本仓库没有。
+    """
+    X = np.asarray(X, dtype=float)
+    D = np.asarray(D, dtype=float)
+    Y = np.asarray(Y, dtype=float)
+    n = Y.size
+    if not (D.size == n and X.shape[0] == n):
+        raise ValueError("X / D / Y 的样本量必须一致")
+
+    m_hat, e_hat = _cross_fit_nuisances(
+        X, Y, D,
+        model_y=_default_nuisance(), n_folds=n_folds, seed=seed, propensity=propensity,
+    )
+    e_clip = _clip_propensity(e_hat, clip)
+    y_res = Y - m_hat
+    d_res = D - e_clip
+
+    if learner is None:
+        design = d_res[:, None] * np.column_stack([np.ones(n), X])
+        beta = np.linalg.lstsq(design, y_res, rcond=None)[0]
+
+        def cate_linear(X_new: np.ndarray) -> np.ndarray:
+            X_new = np.atleast_2d(np.asarray(X_new, dtype=float))
+            return np.column_stack([np.ones(X_new.shape[0]), X_new]) @ beta
+
+        return cate_linear
+
+    from sklearn.base import clone
+
+    pseudo = y_res / d_res
+    weights = d_res**2
+    model = clone(learner).fit(X, pseudo, sample_weight=weights)
+
+    def cate_model(X_new: np.ndarray) -> np.ndarray:
+        return np.asarray(model.predict(np.atleast_2d(np.asarray(X_new, dtype=float))))
+
+    return cate_model
+
+
+def dr_learner(
+    X: np.ndarray,
+    D: np.ndarray,
+    Y: np.ndarray,
+    *,
+    learner=None,
+    n_folds: int = 5,
+    clip: float = 0.02,
+    seed: int = 0,
+    propensity: np.ndarray | None = None,
+) -> Callable[[np.ndarray], np.ndarray]:
+    """DR-learner（Kennedy 2023）：造一个**双稳健**的伪结果，再回归它。
+
+        ψ_i = (D_i − ê_i)/(ê_i(1 − ê_i)) · (Y_i − μ̂_{D_i}(X_i))
+              + μ̂_1(X_i) − μ̂_0(X_i)
+
+    然后在 ``(X, ψ)`` 上拟合。**双稳健**的含义：``ê`` 或 ``μ̂`` 有一个估对，
+    ψ 的期望就还是真实 CATE —— 这是它相对 T-learner 的核心优势。
+
+    与 R-learner 的分工值得说清：两者都做正交化，但
+    * R-learner 的损失里**没有**倾向得分的倒数（只用 ``d̃`` 做权重），
+      在 ``ê`` 接近 0/1 时更稳；
+    * DR-learner 的伪结果里有 ``1/(ê(1−ê))``，重叠差时方差大
+      （但偏差上双稳健）。
+    所以两条都实现 —— 这不是重复，而是"重叠差的时候选哪条"的答案。
+    """
+    X = np.asarray(X, dtype=float)
+    D = np.asarray(D, dtype=float)
+    Y = np.asarray(Y, dtype=float)
+    n = Y.size
+    if not (D.size == n and X.shape[0] == n):
+        raise ValueError("X / D / Y 的样本量必须一致")
+    treated = D > 0.5
+    if treated.sum() < 5 or (~treated).sum() < 5:
+        raise ValueError("两组的样本量都至少要有 5 个")
+
+    from sklearn.model_selection import KFold
+
+    if n_folds <= 1:
+        folds = [(np.arange(n), np.arange(n))]
+    else:
+        folds = list(KFold(n_splits=n_folds, shuffle=True, random_state=seed).split(X))
+
+    mu0 = np.empty(n)
+    mu1 = np.empty(n)
+    for train, test in folds:
+        tr_t, tr_c = train[treated[train]], train[~treated[train]]
+        if tr_t.size < 5 or tr_c.size < 5:
+            raise ValueError("某个训练折里某一臂的样本不足 5 个")
+        mu1[test] = _clone_fit_predict(_default_nuisance(), X[tr_t], Y[tr_t], X[test])
+        mu0[test] = _clone_fit_predict(_default_nuisance(), X[tr_c], Y[tr_c], X[test])
+
+    if propensity is None:
+        e_hat = np.empty(n)
+        model_d = _default_nuisance()
+        for train, test in folds:
+            e_hat[test] = _clone_fit_predict(model_d, X[train], D[train], X[test])
+    else:
+        e_hat = np.asarray(propensity, dtype=float)
+    e_clip = _clip_propensity(e_hat, clip)
+
+    mu_d = np.where(treated, mu1, mu0)
+    weight = (D - e_clip) / (e_clip * (1.0 - e_clip))
+    psi = weight * (Y - mu_d) + mu1 - mu0
+
+    if learner is None:
+        design = np.column_stack([np.ones(n), X])
+        beta = np.linalg.lstsq(design, psi, rcond=None)[0]
+
+        def cate_linear(X_new: np.ndarray) -> np.ndarray:
+            X_new = np.atleast_2d(np.asarray(X_new, dtype=float))
+            return np.column_stack([np.ones(X_new.shape[0]), X_new]) @ beta
+
+        return cate_linear
+
+    from sklearn.base import clone
+
+    model = clone(learner).fit(X, psi)
+
+    def cate_model(X_new: np.ndarray) -> np.ndarray:
+        return np.asarray(model.predict(np.atleast_2d(np.asarray(X_new, dtype=float))))
+
+    return cate_model

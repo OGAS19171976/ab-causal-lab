@@ -41,6 +41,8 @@ from .hte_audit import (
     CATEModelComparison,
     DMLEstimationAudit,
     GatesBlpResult,
+    MetaLearnerComparison,
+    MetaLearnerRow,
     SignalArmStats,
     SignalComparison,
     UpliftMetricAudit,
@@ -48,6 +50,7 @@ from .hte_audit import (
     run_cate_form_comparison,
     run_dml_audit,
     run_gates_blp_audit,
+    run_meta_learner_comparison,
     run_signal_comparison,
     run_uplift_metric_audit,
 )
@@ -88,6 +91,9 @@ from .sequential_audit import (
 )
 
 __all__ = [
+    "MetaLearnerComparison",
+    "MetaLearnerRow",
+    "run_meta_learner_comparison",
     "IVAudit",
     "IVStrengthRow",
     "run_iv_audit",
