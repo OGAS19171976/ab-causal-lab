@@ -44,7 +44,12 @@ from .panel import (
     generate_staggered_panel,
     never_treated_code,
 )
-from .sensitivity import TrendSensitivity, trend_sensitivity
+from .sensitivity import (
+    RambachanRothSensitivity,
+    TrendSensitivity,
+    rambachan_roth_smoothness,
+    trend_sensitivity,
+)
 from .synthetic import (
     LeaveOneOutResult,
     PlaceboResult,
@@ -97,7 +102,9 @@ __all__ = [
     "StaggeredPanelConfig",
     "generate_staggered_panel",
     "never_treated_code",
+    "RambachanRothSensitivity",
     "TrendSensitivity",
+    "rambachan_roth_smoothness",
     "trend_sensitivity",
     "PlaceboResult",
     "SCMConfig",

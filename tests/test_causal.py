@@ -1731,6 +1731,83 @@ class TestSensitivity:
 # --------------------------------------------------------------------------- #
 # 审计（仿真）
 # --------------------------------------------------------------------------- #
+class TestRambachanRothSensitivity:
+    """三档限制：线性违背 / 相对幅度 / 二阶差分（平滑）。
+
+    重点钉两件事：三档的**单位不同**（所以不能直接比数字），
+    以及平滑那一档能碰到"处置后突然分岔"这个事前检验的盲区。
+    """
+
+    @staticmethod
+    def _fit(**kwargs):
+        from ablab.causal import StaggeredPanelConfig, callaway_santanna, generate_staggered_panel
+
+        panel, _truth = generate_staggered_panel(StaggeredPanelConfig(**kwargs))
+        return callaway_santanna(panel), panel
+
+    def test_three_breakdowns_are_finite_and_ordered(self):
+        from ablab.causal import rambachan_roth_smoothness
+
+        res, panel = self._fit()
+        rr = rambachan_roth_smoothness(res, panel)
+        assert rr.att == pytest.approx(res.overall.absolute_effect)
+        assert np.isfinite(rr.breakdown_linear)
+        assert np.isfinite(rr.breakdown_relative_magnitude)
+        assert np.isfinite(rr.breakdown_smoothness)
+        assert rr.n_pre_coefs > 0 and rr.n_post_coefs > 0
+        assert rr.max_pre_violation >= 0
+
+    def test_identified_set_is_centered_and_monotone(self):
+        from ablab.causal import rambachan_roth_smoothness
+
+        res, panel = self._fit()
+        rr = rambachan_roth_smoothness(res, panel)
+        for restriction in ("linear", "relative_magnitude", "smoothness"):
+            lo0, hi0 = rr.identified_set(restriction, 0.0)
+            assert lo0 == pytest.approx(rr.att) and hi0 == pytest.approx(rr.att)
+            lo1, hi1 = rr.identified_set(restriction, 1.0)
+            lo2, hi2 = rr.identified_set(restriction, 2.0)
+            assert lo2 <= lo1 <= rr.att <= hi1 <= hi2
+            # 翻转点处应当刚好包含 0（数值容差内）
+            bd = rr.breakdown(restriction)
+            if np.isfinite(bd):
+                lo_b, hi_b = rr.identified_set(restriction, bd)
+                assert lo_b <= 1e-9 and hi_b >= -1e-9
+
+    def test_unknown_restriction_is_refused(self):
+        from ablab.causal import rambachan_roth_smoothness
+
+        res, panel = self._fit()
+        rr = rambachan_roth_smoothness(res, panel)
+        with pytest.raises(ValueError, match="未知限制"):
+            rr.breakdown("magic")
+        with pytest.raises(ValueError, match="未知限制"):
+            rr.identified_set("magic", 1.0)
+        with pytest.raises(ValueError, match="M 不能为负"):
+            rr.identified_set("linear", -1.0)
+
+    def test_relative_magnitude_uses_the_pre_period_ruler(self):
+        """处置前被污染时，相对幅度那一档的翻转点应当明显变小（尺子被污染）。"""
+        from ablab.causal import rambachan_roth_smoothness
+
+        clean_res, clean_panel = self._fit()
+        dirty_res, dirty_panel = self._fit(trend_violation=0.6)
+        clean = rambachan_roth_smoothness(clean_res, clean_panel)
+        dirty = rambachan_roth_smoothness(dirty_res, dirty_panel)
+        assert dirty.max_pre_violation > clean.max_pre_violation
+        assert dirty.breakdown_relative_magnitude < clean.breakdown_relative_magnitude
+
+    def test_audit_shows_the_restrictions_disagree(self):
+        """审计本体：三档在同一格里给出不同裁决（这才是这一节要说的）。"""
+        from ablab.validation import run_rambachan_roth_audit
+
+        audit = run_rambachan_roth_audit(n_trials=12)
+        assert audit.restrictions_disagree
+        assert audit.clean_regime_is_robust
+        # 平滑档在小 M 下就已经很脆（预算随期数平方增长）
+        assert audit.survives[("平行趋势成立", "smoothness")][0.5] < 0.5
+
+
 class TestCausalAudit:
     def test_twfe_bias_and_sign_flip(self):
         c = run_staggered_estimator_comparison(n_trials=25, seed=0)

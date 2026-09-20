@@ -14,6 +14,7 @@ M3 没有随机化撑腰，问题变成三个：
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 
@@ -24,7 +25,10 @@ from ..causal.did import (
     twfe_decomposition,
 )
 from ..causal.panel import StaggeredPanelConfig, generate_staggered_panel
-from ..causal.sensitivity import trend_sensitivity
+from ..causal.sensitivity import (
+    rambachan_roth_smoothness,
+    trend_sensitivity,
+)
 from ..causal.synthetic import (
     SCMConfig,
     generate_scm_scenario,
@@ -599,6 +603,135 @@ class SensitivityAudit:
             f"  这个比值在处置前趋势平坦时会**爆炸**，本身就不可用 ——"
             " 处置前看不到趋势，不代表处置后不会分岔。"
         )
+
+
+@dataclass
+class RambachanRothAudit:
+    """三档限制 × 三种 DGP：结论的稳健性各不一样。
+
+    这一节要说的**不是**"哪个限制更好"，而是"**换个限制，结论就换个说法**" ——
+    所以必须把三档并排放在同一批数据上，并标出它们在哪个格子上给出不同裁决。
+    """
+
+    n_trials: int
+    #: ``(regime, restriction) -> {M: 结论存活的份额}``
+    survives: dict[tuple[str, str], dict[float, float]]
+    #: 各档翻转点的中位数
+    median_breakdown: dict[tuple[str, str], float]
+
+    @property
+    def restrictions_disagree(self) -> bool:
+        """存在某个 (DGP, M)：三档限制给出的裁决**差得很远**（份额相差 ≥0.5）。
+
+        第一版写成"某个份额落在 (0.05, 0.95) 之间" —— 那测的是"有没有不确定性"，
+        而这一节要主张的是"**换个限制就换个说法**"：实测每个格子都是 0.00 或 1.00
+        （裁决非常干脆），分歧恰恰体现在"同一格里三档不一样"。
+        判据要对着要主张的东西写。
+        """
+        regimes = {regime for regime, _ in self.survives}
+        ms = {m for table in self.survives.values() for m in table}
+        for regime in regimes:
+            for m in ms:
+                shares = [
+                    self.survives[(regime, r)][m]
+                    for r in ("linear", "relative_magnitude", "smoothness")
+                    if (regime, r) in self.survives
+                ]
+                if max(shares) - min(shares) >= 0.5:
+                    return True
+        return False
+
+    def _row(self, regime: str, restriction: str, m: float) -> float:
+        return self.survives[(regime, restriction)][m]
+
+    @property
+    def clean_regime_is_robust(self) -> bool:
+        """平行趋势成立时，相对幅度那一档在小 M 下应当撑住。"""
+        return self._row("平行趋势成立", "relative_magnitude", 2.0) > 0.8
+
+    @property
+    def violated_pretrend_is_fragile(self) -> bool:
+        """处置前趋势被违反时，相对幅度那一档**很脆**（分数尺子已经被污染）。"""
+        return (
+            self.median_breakdown[("处置前趋势被违反", "relative_magnitude")] < 1.0
+        )
+
+    @property
+    def smoothness_flags_the_post_only_blind_spot(self) -> bool:
+        """只有处置后分岔时：线性/相对幅度还在撑，平滑已经开始报警。
+
+        这正是平行趋势检验的**盲区**（事前检验对它零功效），
+        而平滑限制是这三档里唯一能碰到它的 —— 因为它约束的是"拐弯"，
+        而"处置后突然分岔"就是一个拐弯。
+        """
+        return (
+            self._row("只有处置后分岔", "smoothness", 1.0) < 0.5
+            and self._row("只有处置后分岔", "relative_magnitude", 1.0) > 0.8
+        )
+
+    def summary(self) -> str:
+        ms = sorted({m for table in self.survives.values() for m in table})
+        lines = [
+            f"Rambachan-Roth 三档敏感性（各 {self.n_trials} 次）",
+            f"  {'DGP':<22}{'限制':<20}" + "".join(f"{('M=' + str(m)):>9}" for m in ms),
+        ]
+        for regime in dict.fromkeys(r for r, _ in self.survives):
+            for restriction in ("linear", "relative_magnitude", "smoothness"):
+                row = self.survives.get((regime, restriction))
+                if row is None:
+                    continue
+                cells = "".join(f"{row[m]:>9.2f}" for m in ms)
+                lines.append(f"  {regime:<22}{restriction:<20}{cells}")
+        lines.append("  每格 = 结论符号仍然站得住的份额（1.00 = 全部撑住）")
+        lines.append("  读法：**换个限制，结论就换个说法** —— 所以报告必须写清用的是哪一档。")
+        return "\n".join(lines)
+
+
+def run_rambachan_roth_audit(
+    *,
+    n_trials: int = 30,
+    ms: tuple[float, ...] = (0.5, 1.0, 2.0),
+    seed: int = 0,
+) -> RambachanRothAudit:
+    """三种 DGP × 三档限制，量"结论还站得住"的份额。"""
+    # 三种 DGP 各自覆盖 ``StaggeredPanelConfig`` 的**不同**字段，所以这里的
+    # 值只能是"展开成关键字参数的一包东西"；用 ``Any`` 而不是 ``float`` ——
+    # 后者会让 mypy 认为它想喂给**每一个**字段（实测报 3 个 arg-type）。
+    regimes: dict[str, dict[str, Any]] = {
+        "平行趋势成立": {},
+        "处置前趋势被违反": {"trend_violation": 0.6},
+        "只有处置后分岔": {"post_divergence": 0.8},
+    }
+    survives: dict[tuple[str, str], dict[float, float]] = {}
+    medians: dict[tuple[str, str], float] = {}
+
+    for regime, kwargs in regimes.items():
+        counts = {
+            (regime, r): {m: 0 for m in ms}
+            for r in ("linear", "relative_magnitude", "smoothness")
+        }
+        breakdowns: dict[str, list[float]] = {
+            r: [] for r in ("linear", "relative_magnitude", "smoothness")
+        }
+        for i in range(n_trials):
+            panel, _truth = generate_staggered_panel(
+                StaggeredPanelConfig(**kwargs), seed=seed + i
+            )
+            res = callaway_santanna(panel)
+            rr = rambachan_roth_smoothness(res, panel)
+            for r in breakdowns:
+                breakdowns[r].append(rr.breakdown(r))
+                for m in ms:
+                    counts[(regime, r)][m] += int(rr.survives(r, m))
+        for r in breakdowns:
+            survives[(regime, r)] = {
+                m: counts[(regime, r)][m] / n_trials for m in ms
+            }
+            medians[(regime, r)] = float(np.median(breakdowns[r]))
+
+    return RambachanRothAudit(
+        n_trials=n_trials, survives=survives, median_breakdown=medians
+    )
 
 
 def run_sensitivity_audit(

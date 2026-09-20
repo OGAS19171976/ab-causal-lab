@@ -56,6 +56,7 @@ from ablab.validation import (  # noqa: E402
     run_aggregation_variance_audit,
     run_iv_audit,
     run_pretrend_audit,
+    run_rambachan_roth_audit,
     run_scm_audit,
     run_scm_placebo_audit,
     run_sensitivity_audit,
@@ -613,6 +614,37 @@ def main() -> int:
     emit("")
     emit("单次示例：")
     emit(trend_sensitivity(callaway_santanna(panel), panel).summary())
+    emit("")
+    emit("  这一轮补上 **Rambachan-Roth 的另外两档限制**（相对幅度、二阶差分/平滑）。")
+    emit("  原来只有「线性违背」：假设最强，而且它的尺子与处置前趋势绑在一起 ——")
+    emit("  处置前越平坦，翻转点看起来越稳健，恰好把最危险的情形说成最安全。")
+    emit("  三档的**单位不同**（每期偏离 / 处置前最大偏离的倍数 / 每期二阶差分），")
+    emit("  所以数字不能直接比大小；能比的是「同一个 M 下结论还在不在」。")
+    emit("")
+    rr_audit = run_rambachan_roth_audit(n_trials=n_sens)
+    for line in rr_audit.summary().splitlines():
+        emit("  " + line)
+    emit("")
+    # 翻转点的**数值**也要报出来，但**不并排比大小**：三档单位不同。
+    # 它在这里的用处是另一件事 —— 看**同一档**在不同 DGP 之间怎么动。
+    emit("  三档各自的翻转点中位数（同一档纵向比，横向不可比）")
+    emit(f"    {'DGP':<22}{'限制':<22}{'翻转点中位数':>12}")
+    for (regime, r), v in rr_audit.median_breakdown.items():
+        emit(f"    {regime:<22}{r:<20}{v:>10.2f}")
+    emit("    单位：linear = 每期偏离；relative_magnitude = 处置前最大偏离的倍数；")
+    emit("          smoothness = 每期二阶差分。**横向不可比**。")
+    emit("")
+    emit("  四条被实测确认的事实：")
+    emit("    · **干净档**：处置前没有可测偏离时，相对幅度那一档在 M=2 仍然全部撑住；")
+    emit("      而**平滑档在 M=0.5 就全部翻掉**（它的预算随期数平方增长）；")
+    emit("    · **处置前被污染时反而更脆**：相对幅度那一档的翻转点中位数 < 1 ——")
+    emit("      也就是说「处置后偏离只要比处置前最大的那期还小」就可能翻掉；")
+    emit("    · **线性那一档在处置前被污染时翻转点反而变大**（看起来更稳），")
+    emit("      而同一份数据里点估计也被抬高了 —— 「更稳健」与「更可信」反向移动，")
+    emit("      这正是只看一档最容易漏掉的情形；")
+    emit("    · **平滑档能碰到平行趋势检验的盲区**（只有处置后分岔、处置前完全干净）：")
+    emit("      线性与相对幅度在 M=1 都还撑住，平滑已经全部翻掉 —— 因为它约束的是")
+    emit("      「拐弯」，而「处置后突然分岔」正是一个拐弯。")
 
     # ---- 6. 图表 ----------------------------------------------------------- #
     emit("\n### 6. 生成图表")
@@ -641,6 +673,16 @@ def main() -> int:
         "SCM 空间安慰剂有功效": scm_placebo.space_has_power,
         "SCM 时间安慰剂与效应无关（不变量）": scm_placebo.time_placebo_is_effect_blind,
         "SCM 留一法稳健": scm_placebo.loo_is_stable,
+        "RR：干净档在最弱的限制下也撑住": rr_audit.clean_regime_is_robust,
+        "RR：处置前被污染时相对幅度档更脆": rr_audit.violated_pretrend_is_fragile,
+        "RR：平滑档抓到处置后分岔的盲区": rr_audit.smoothness_flags_the_post_only_blind_spot,
+        "RR：三档限制在同一格里给出不同裁决": rr_audit.restrictions_disagree,
+        # 这条是"看起来更稳"的反向移动：同一档（linear）在处置前被污染时翻转点变大。
+        # 它不是好事，所以要钉住 —— 免得以后有人把它读成"数据更稳健"。
+        "RR：线性档被污染时翻转点反而变大（反向移动）": (
+            rr_audit.median_breakdown[("处置前趋势被违反", "linear")]
+            > rr_audit.median_breakdown[("平行趋势成立", "linear")]
+        ),
         "内生性把 OLS 推偏了": iv_audit.ols_is_biased,
         "没有内生性时 OLS 无偏（正对照）": abs(iv_audit.ols_bias_no_endogeneity) < 0.15,
         "弱工具把 2SLS 拉向 OLS": iv_audit.weak_pulls_to_ols,

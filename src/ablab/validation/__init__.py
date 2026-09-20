@@ -27,11 +27,13 @@ from .causal_audit import (
     AggregationVarianceAudit,
     EstimatorComparison,
     PretrendAudit,
+    RambachanRothAudit,
     SCMAudit,
     SCMPlaceboAudit,
     SensitivityAudit,
     run_aggregation_variance_audit,
     run_pretrend_audit,
+    run_rambachan_roth_audit,
     run_scm_audit,
     run_scm_placebo_audit,
     run_sensitivity_audit,
@@ -98,6 +100,8 @@ from .sequential_audit import (
 )
 
 __all__ = [
+    "RambachanRothAudit",
+    "run_rambachan_roth_audit",
     "SCMPlaceboAudit",
     "run_scm_placebo_audit",
     "TauRuleAudit",

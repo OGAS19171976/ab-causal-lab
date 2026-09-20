@@ -39,7 +39,13 @@ import numpy as np
 from .did import CSResult
 from .panel import Panel
 
-__all__ = ["TrendSensitivity", "trend_sensitivity"]
+__all__ = [
+    "RESTRICTIONS",
+    "RambachanRothSensitivity",
+    "TrendSensitivity",
+    "rambachan_roth_smoothness",
+    "trend_sensitivity",
+]
 
 
 @dataclass(frozen=True)
@@ -135,4 +141,162 @@ def trend_sensitivity(res: CSResult, panel: Panel | None = None) -> TrendSensiti
         scale=scale,
         n_post_coefs=len(post),
         n_pre_coefs=len(pre),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Rambachan-Roth 的另外两种限制：相对幅度与平滑
+# --------------------------------------------------------------------------- #
+#: 三种限制的名字。**它们的单位不一样**，所以数字不可直接比大小 ——
+#: 能比的是"同一个 M 下结论还在不在"。
+RESTRICTIONS: tuple[str, ...] = ("linear", "relative_magnitude", "smoothness")
+
+
+@dataclass(frozen=True)
+class RambachanRothSensitivity:
+    """平行趋势的三档敏感性：线性违背、相对幅度、二阶差分（平滑）。
+
+    为什么不能只有一档
+    ------------------
+    原来只有"线性违背"（``TrendSensitivity``）：假设处置后的偏离沿一条直线增长。
+    这个假设**很强**，而且它与"处置前趋势"的刻度绑在一起 ——
+    处置前越平坦，它给出的翻转点看起来越稳健，恰好把最危险的情形说成最安全。
+
+    Rambachan & Roth (2023) 的贡献是把"允许多大的违背"写成**可解释的约束**：
+
+    * ``relative_magnitude``：处置后每期的偏离 ≤ ``M ×`` **处置前最大的那期偏离**。
+      它把"处置前趋势"当作刻度尺 —— 处置前越干净，这把尺子越严（这是对的）；
+    * ``smoothness``：偏离序列的**二阶差分** ≤ ``M``。
+      它允许"线性趋势继续走"，只禁止突然拐弯。第 ``h`` 期的偏离上界是
+      ``M·(h+1)(h+2)/2``（对最后两期处置前取值做线性外推之后）——
+      所以它随期数**平方增长**，远期的结论本来就该更脆。
+
+    翻转点（breakdown）的含义是：**M 大到多少，ATT 的识别集才会包含 0**。
+
+    说清近似：这里给的是**识别集**（把标准误当已知），不是 RR 原文那种
+    同时处理抽样不确定性的"诚实置信集"（那要解线性规划）。所以这些数是
+    "结论对违背的敏感度"，不是"置信区间"。**本仓库没有做线性规划版本** ——
+    这一点写在 README 的已知边界里，不假装做了。
+    """
+
+    att: float
+    #: 各档限制下的翻转点（单位各不相同，见类文档）
+    breakdown_linear: float
+    breakdown_relative_magnitude: float
+    breakdown_smoothness: float
+    #: 处置前最大的单期偏离（相对幅度那一档的刻度尺）
+    max_pre_violation: float
+    #: 未归一化的权重和（``Σ w_k (k+1)(k+2)/2`` 之类），供复核
+    post_weight_sum: float
+    n_post_coefs: int
+    n_pre_coefs: int
+    pre_coefs: dict[int, float]
+    post_coefs: dict[int, float]
+    weights: dict[int, float]
+
+    def breakdown(self, restriction: str) -> float:
+        if restriction == "linear":
+            return self.breakdown_linear
+        if restriction == "relative_magnitude":
+            return self.breakdown_relative_magnitude
+        if restriction == "smoothness":
+            return self.breakdown_smoothness
+        raise ValueError(f"未知限制：{restriction!r}（可选 {RESTRICTIONS}）")
+
+    def identified_set(self, restriction: str, m: float) -> tuple[float, float]:
+        """在强度 ``M`` 下 ATT 的识别集（把标准误当已知）。"""
+        if m < 0:
+            raise ValueError("M 不能为负")
+        if restriction == "linear":
+            half = m * self.post_weight_sum
+        elif restriction == "relative_magnitude":
+            half = m * self.max_pre_violation
+        elif restriction == "smoothness":
+            # Σ_k w_k·(k+1)(k+2)/2 ÷ Σ_k w_k：加权平均的"平方增长"系数
+            total_w = sum(self.weights.get(k, 0.0) for k in self.post_coefs) or 1.0
+            grow = (
+                sum(
+                    self.weights.get(k, 0.0) * (k + 1) * (k + 2) / 2.0
+                    for k in self.post_coefs
+                )
+                / total_w
+            )
+            half = m * grow
+        else:
+            raise ValueError(f"未知限制：{restriction!r}（可选 {RESTRICTIONS}）")
+        return (self.att - half, self.att + half)
+
+    def survives(self, restriction: str, m: float) -> bool:
+        """在这个限制与强度下，结论的**符号**还站得住吗（0 不在识别集里）。"""
+        lo, hi = self.identified_set(restriction, m)
+        return bool(lo > 0 or hi < 0)
+
+    def summary(self) -> str:
+        lines = [
+            f"Rambachan-Roth 三档敏感性（{self.n_post_coefs} 个处置后、"
+            f"{self.n_pre_coefs} 个处置前系数）",
+            f"  ATT = {self.att:+.4f}",
+            f"  ① 线性违背：每期多偏离 {self.breakdown_linear:+.4f} 就归零"
+            "（假设最强）",
+            f"  ② 相对幅度：处置后偏离达到处置前最大偏离"
+            f"（{self.max_pre_violation:.4f}）的 {self.breakdown_relative_magnitude:.2f} 倍才归零",
+            f"  ③ 平滑（二阶差分）：每期二阶差分到 {self.breakdown_smoothness:.3f} 才归零"
+            "（随期数平方增长，远期更脆）",
+            "  注意：三档的**单位不同**，数字不能直接比大小；能比的是"
+            "「同一个 M 下结论还在不在」。",
+        ]
+        if not np.isfinite(self.breakdown_relative_magnitude):
+            lines.append(
+                "  处置前没有任何可测偏离 ⇒ 相对幅度那一档退化成点识别："
+                "**一点点处置后偏离就能推翻结论**（这不是稳健，是尺子为零）。"
+            )
+        return "\n".join(lines)
+
+
+def rambachan_roth_smoothness(
+    res: CSResult, panel: Panel | None = None
+) -> RambachanRothSensitivity:
+    """由 CS 的事件研究算三档翻转点。"""
+    es = res.event_study
+    weights = {k: float(e.n_treatment) for k, e in es.items()}
+    coefs = {k: float(e.absolute_effect) for k, e in es.items()}
+    post = {k: v for k, v in coefs.items() if k >= 0}
+    pre = {k: v for k, v in coefs.items() if k < 0}
+    if not post:
+        raise ValueError("没有任何处置后系数，无法做敏感性分析")
+
+    att = float(res.overall.absolute_effect)
+    # ① 线性：加权平均后每期多偏离多少 ⇒ 与 TrendSensitivity 同一口径
+    linear = _weighted_delta(post, weights)
+
+    # ② 相对幅度：刻度尺 = 处置前最大单期偏离
+    max_pre = max((abs(v) for v in pre.values()), default=0.0)
+    rm = abs(att) / max_pre if max_pre > 0 else float("inf")
+
+    # ③ 平滑：第 k 期的偏离上界 M·(k+1)(k+2)/2（对最后两期处置前取值线性外推之后）
+    total_w = sum(weights.get(k, 0.0) for k in post) or float(len(post))
+    grow = (
+        sum(weights.get(k, 0.0) * (k + 1) * (k + 2) / 2.0 for k in post) / total_w
+    )
+    smooth = abs(att) / grow if grow > 0 else float("inf")
+
+    # linear 那一档的识别集半宽 = M·Σ w_k (k+1)/Σ w_k
+    lin_grow = (
+        sum(weights.get(k, 0.0) * (k + 1) for k in post) / total_w
+        if total_w
+        else float("nan")
+    )
+
+    return RambachanRothSensitivity(
+        att=att,
+        breakdown_linear=float(linear),
+        breakdown_relative_magnitude=float(rm),
+        breakdown_smoothness=float(smooth),
+        max_pre_violation=float(max_pre),
+        post_weight_sum=float(lin_grow),
+        n_post_coefs=len(post),
+        n_pre_coefs=len(pre),
+        pre_coefs={int(k): float(v) for k, v in pre.items()},
+        post_coefs={int(k): float(v) for k, v in post.items()},
+        weights={int(k): float(v) for k, v in weights.items()},
     )

@@ -85,14 +85,6 @@ ITEMS: tuple[UnimplementedItem, ...] = (
             "并给出策略价值（AIPW 意义下）相对 CATE 排序策略的实测对照"
         ),
     ),
-    UnimplementedItem(
-        id="sensitivity_smoothness",
-        readme_phrase="敏感性分析只做了线性违背",
-        kind="symbol_absent",
-        target="ablab.causal.sensitivity.rambachan_roth_smoothness",
-        anchor_present="ablab.causal.sensitivity",
-        when_done="README 要补相对幅度/平滑约束版本的实测",
-    ),
 )
 
 
