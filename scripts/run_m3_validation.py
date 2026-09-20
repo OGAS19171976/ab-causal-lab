@@ -395,8 +395,14 @@ def main() -> int:
 
     emit(f"    未处置当基准（默认）：与 IW 的最大逐 k 差 {_kdiff(iw_nn, naive_nn):.3f}")
     _d_naive, _d_last = _kdiff(iw_nn, naive_nn), _kdiff(iw_nn, last_nn)
+    # **取整到 10 位并写"约"**：这个比值实测在 50.4~50.9 之间，而 `:.0f`
+    # 正好卡在舍入边界上 —— 本地打 50、CI 上打 51，声明清单里的
+    # "改善了 50 倍"于是在 CI 上变红（#45 就是这么红的）。
+    # 把计算出来的数按原始精度写进声明 = 定时炸弹；取整到十位之后，
+    # 比值要跑出 [45, 55) 才会翻面。
+    _improve = _d_naive / _d_last
     emit(f"    最后队列当基准（新）：与 IW 的最大逐 k 差 {_d_last:.3f}"
-         f"（改善了 {_d_naive / _d_last:.0f} 倍）")
+         f"（改善了约 {_improve / 10:.0f}0 倍）")
     emit(f"    整体 ATT：IW {iw_nn.overall.absolute_effect:+.4f} vs "
          f"新口径 {last_nn.overall.absolute_effect:+.4f}（真值 {truth_nn.overall_att:+.4f}）")
     emit("    代价是**事件窗变短**（最后队列的处置后期数不再可估）——")
