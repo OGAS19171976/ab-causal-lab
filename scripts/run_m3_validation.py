@@ -45,11 +45,14 @@ from ablab.causal import (  # noqa: E402
     trend_sensitivity,
     twfe,
     twfe_decomposition,
+    two_sls,
 )
 from ablab.plotting import bin_edges, label, plt, save, setup_style  # noqa: E402
 from ablab.reporting import for_report  # noqa: E402
+from ablab.sim import IVScenarioConfig, generate_iv_scenario  # noqa: E402
 from ablab.validation import (  # noqa: E402
     run_aggregation_variance_audit,
+    run_iv_audit,
     run_pretrend_audit,
     run_scm_audit,
     run_sensitivity_audit,
@@ -247,6 +250,7 @@ def main() -> int:
     # 聚合方差审计比别的贵（每次仿真都要算全部 ATT(g,t) 及其影响函数），
     # 但它是这一节唯一的证据来源，所以不放进 --quick 里省掉。
     n_aggvar = 40 if args.quick else 200
+    n_iv = 40 if args.quick else 150
 
     setup_style()
     log: list[str] = []
@@ -532,6 +536,34 @@ def main() -> int:
     else:
         emit("  （这份面板的处置前格子没有触发对照泄漏，用测试里的面板验证）")
 
+    # ---- 2.8 工具变量：横截面上的内生性 ------------------------------------ #
+    #
+    # 前面几节处理的都是**面板**（有时间前后）。横截面上的一次性决策
+    #（"上过培训班的人收入更高"）没有处置前趋势可用，只能靠工具变量。
+    # 而这个方法最容易骗人的地方是：**"我用了工具变量"被当成了结论**。
+    # 工具很弱时，2SLS 的中位偏差会朝 OLS 靠、均值与 RMSE 会爆炸，
+    # 报告上却仍然写着"95% 置信区间"。
+    emit(f"\n### 2.8 工具变量（2SLS + Anderson-Rubin）：{n_iv} 次重抽")
+    emit("  横截面上的内生处置：D = pi·Z + u，Y = tau·D + rho·u + e。")
+    emit("  rho=0.8 时 OLS 把混淆记在 D 头上；工具 Z 只通过 D 影响 Y（由构造保证）。")
+    emit("")
+    iv_audit = run_iv_audit(n=1500, n_replications=n_iv)
+    emit(iv_audit.summary())
+    emit("")
+    emit("  单个示例（最弱那一档，看看 AR 区间到底长什么样）：")
+    demo_iv = generate_iv_scenario(
+        IVScenarioConfig(n=2000, pi=0.05, rho=0.8, tau=2.0, seed=5)
+    )
+    emit(two_sls(demo_iv.Y, demo_iv.D, demo_iv.Z, demo_iv.X).summary())
+    emit("")
+    emit("  **这一节的判据被实测改写了一次**（值得单独记）：动手前写的是")
+    emit("  「弱工具会让 Wald 区间覆盖率崩到 0.6 上下」（教科书结论）。")
+    emit("  实测最弱档位（F≈1.2）Wald 覆盖率 **0.9733**，同方差口径与稳健口径")
+    emit("  一模一样 —— 因为 SE 与点估计的尾部**一起**变大，区间宽到盖得住。")
+    emit("  真正崩掉的是三件别的事：中位偏差朝 OLS 靠到 **72.2%**、")
+    emit("  均值偏差与 RMSE 爆炸、AR 区间 **89% 无界**（= 排除不掉任何 β）。")
+    emit("  所以照抄教科书会把报告写错，而量一遍只要 30 秒。")
+
     # ---- 3. 平行趋势检验的盲区 --------------------------------------------- #
     emit(f"\n### 3. 平行趋势检验：能发现什么、发现不了什么（{n_pre} 次/场景）")
     pretrend = run_pretrend_audit(n_trials=n_pre, seed=0)
@@ -580,6 +612,12 @@ def main() -> int:
         "检验对不可见违背无功效": pretrend.blind_spot,
         "合成控制安慰剂假阳性率接近名义": abs(scm_audit.false_positive_rate - 0.05) < 0.06,
         "敏感性分析给出有限翻转点": np.isfinite(sens_audit.median_breakdown),
+        "内生性把 OLS 推偏了": iv_audit.ols_is_biased,
+        "没有内生性时 OLS 无偏（正对照）": abs(iv_audit.ols_bias_no_endogeneity) < 0.15,
+        "弱工具把 2SLS 拉向 OLS": iv_audit.weak_pulls_to_ols,
+        "AR 区间全程守住名义覆盖": iv_audit.ar_holds_throughout,
+        "AR 的代价（无界）看得见": iv_audit.ar_cost_is_visible,
+        "Wald 在这个设计下没有崩（实测记录）": iv_audit.wald_does_not_break,
     }
     verdict = "PASS" if all(checks.values()) else "FAIL"
 
@@ -603,6 +641,14 @@ def main() -> int:
     emit(f"[5] 敏感性分析：实际违背 {sens_audit.actual_violation:+.3f}/期，"
          f"翻转点中位数 {sens_audit.median_breakdown:+.3f}/期，"
          f"结论扛住 {sens_audit.robust_share:.0%}")
+    worst = iv_audit.rows[0]
+    emit(f"[6] 工具变量：OLS 偏差 {worst.ols_bias:+.4f}（与工具强度无关），"
+         f"最弱档位（F={worst.first_stage_f:.2f}）2SLS 中位偏差 {worst.tsls_median_bias:+.4f}"
+         f"= OLS 的 {worst.median_bias_ratio:+.1%}，RMSE {worst.tsls_rmse:.2f}")
+    emit(f"    Wald 覆盖 {worst.wald_coverage:.4f}（**没崩**）而 AR 覆盖 "
+         f"{worst.ar_coverage:.4f} —— 代价是 {worst.ar_unbounded_share:.0%} 的 AR 区间无界。")
+    emit("    -> 弱工具伤的是**点估计与可用性**，不是覆盖率：")
+    emit("       「我用了工具变量」不是结论，「工具有多强」才是。")
     emit(f"\n逐项检查: {checks}")
     emit(f"总体判定: {verdict}")
     emit(f"总耗时 {time.perf_counter() - t0:.1f}s")

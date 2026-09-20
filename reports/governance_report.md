@@ -149,7 +149,7 @@ ab-causal-lab · 治理验证：操作审计（append-only）+ 护栏指标显�
   （某个符号确实不存在 / 某个串搜不到 / 某个文件不存在），
   一旦不成立就在检查集里报错并指出该改哪一句。
 
-  [OK  ] iv_and_rdd: 符号 ablab.causal.iv 仍不存在 ✓
+  [OK  ] rdd: 符号 ablab.causal.rdd 仍不存在 ✓
   [OK  ] policy_learning: 符号 ablab.causal.uplift.RLearner 仍不存在 ✓
   [OK  ] wild_cluster_bootstrap: 符号 ablab.inference.clustered.wild_cluster_bootstrap 仍不存在 ✓
   [OK  ] multivariate_cuped: 符号 ablab.inference.cuped.multivariate_theta 仍不存在 ✓

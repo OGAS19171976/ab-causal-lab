@@ -51,6 +51,7 @@ from .hte_audit import (
     run_signal_comparison,
     run_uplift_metric_audit,
 )
+from .iv_audit import IVAudit, IVStrengthRow, run_iv_audit
 from .methods import (
     CLUSTER_LEVEL,
     CLUSTER_NAIVE,
@@ -87,6 +88,9 @@ from .sequential_audit import (
 )
 
 __all__ = [
+    "IVAudit",
+    "IVStrengthRow",
+    "run_iv_audit",
     "AAResult",
     "PowerResult",
     "power_curve",

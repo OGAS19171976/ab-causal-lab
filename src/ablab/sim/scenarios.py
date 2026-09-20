@@ -20,8 +20,11 @@ __all__ = [
     "RatioSample",
     "ClusterScenarioConfig",
     "ClusterSample",
+    "IVScenarioConfig",
+    "IVSample",
     "generate_ratio_scenario",
     "generate_cluster_scenario",
+    "generate_iv_scenario",
     "two_arm",
 ]
 
@@ -290,3 +293,87 @@ def generate_cluster_scenario(
         pre_outcome=pre_outcome,
         true_lift=true_lift,
     )
+
+
+# --------------------------------------------------------------------------- #
+# 场景三：横截面上的**内生处置**（工具变量）
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class IVScenarioConfig:
+    """内生处置 + 工具变量的横截面 DGP。
+
+    结构方程（逐字实现，没有"大概"）：
+
+        D = pi·Z + gamma·X + u              处置是**自己选的**：u 里藏着能力
+        Y = tau·D + beta·X + rho·u + e      能力同时影响收入 → OLS 有偏
+
+    ``rho`` 就是**内生性强度**：``rho = 0`` 时 OLS 无偏（那是正对照），
+    ``rho = 0.8`` 时 OLS 的偏差是 ``rho·Var(u)/Var(D)``，可能比真实效应还大。
+    工具 ``Z`` 只通过 ``D`` 影响 ``Y``（排除性约束**由构造保证**）——
+    真实数据里这一条永远不可检验，所以这里必须显式说清它是"造出来的"。
+
+    ``pi`` 是**工具强度**：它决定第一阶段 F。弱工具下 2SLS 的中位偏差会朝
+    OLS 靠，而且 Wald 型区间的覆盖率会崩 —— 这两件事在审计里都会被量出来，
+    因为"用了工具变量"本身不是结论，"工具有多强"才是。
+    """
+
+    n: int = 2000
+    tau: float = 2.0
+    pi: float = 0.20
+    gamma: float = 0.5
+    beta: float = 0.5
+    rho: float = 0.8
+    n_instruments: int = 1
+    noise_sd: float = 1.0
+    seed: int = 0
+
+    def __post_init__(self) -> None:
+        if self.n < 50:
+            raise ValueError("样本量太小")
+        if not 0.0 <= self.rho <= 1.0:
+            raise ValueError("rho 必须落在 [0, 1]")
+        if self.n_instruments < 1:
+            raise ValueError("至少要一个工具")
+
+
+@dataclass(frozen=True)
+class IVSample:
+    """带真值的工具变量数据。"""
+
+    X: np.ndarray      # (n,) 外生协变量
+    Z: np.ndarray      # (n, k) 工具
+    D: np.ndarray      # (n,) 内生处置
+    Y: np.ndarray      # (n,) 结果
+    tau: float         # 真实处置效应
+    u: np.ndarray      # 未观测混淆项（真实数据里看不到；这里留着做诊断）
+    config: IVScenarioConfig
+
+    @property
+    def n(self) -> int:
+        return int(self.D.size)
+
+    def __str__(self) -> str:  # pragma: no cover - 只用于人工打印
+        return (
+            f"IV 数据：n={self.n}, k={self.Z.shape[1]}, 真实效应 {self.tau:+.4f}, "
+            f"pi={self.config.pi:g}, rho={self.config.rho:g}"
+        )
+
+
+def generate_iv_scenario(
+    config: IVScenarioConfig | None = None, **overrides
+) -> IVSample:
+    """生成一份横截面 IV 数据（处置内生、工具外生）。"""
+    cfg = config or IVScenarioConfig(**overrides)
+    rng = np.random.default_rng(cfg.seed)
+
+    x = rng.normal(0.0, 1.0, cfg.n)
+    # 工具：0/1 各半（真实实验里常见的形式）。多个工具时是相互独立的两个。
+    z = rng.integers(0, 2, size=(cfg.n, cfg.n_instruments)).astype(float)
+
+    u = rng.normal(0.0, 1.0, cfg.n)
+    d = cfg.pi * z.sum(axis=1) + cfg.gamma * x + u
+
+    e = rng.normal(0.0, cfg.noise_sd, cfg.n)
+    y = cfg.tau * d + cfg.beta * x + cfg.rho * u + e
+
+    return IVSample(X=x, Z=z, D=d, Y=y, tau=cfg.tau, u=u, config=cfg)

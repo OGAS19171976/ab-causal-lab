@@ -61,12 +61,15 @@ class UnimplementedItem:
 #: 清单本体。**只放能机检的**；无法机检的归到人工核对，不混进来充数。
 ITEMS: tuple[UnimplementedItem, ...] = (
     UnimplementedItem(
-        id="iv_and_rdd",
-        readme_phrase="工具变量、断点回归都还没有",
+        id="rdd",
+        readme_phrase="断点回归还没有",
         kind="symbol_absent",
-        target="ablab.causal.iv",
-        anchor_present="ablab.causal.did",
-        when_done="README 的 M3 那条要改成「已实现 IV / RDD」，并补验收证据",
+        target="ablab.causal.rdd",
+        # IV 那一半已经做出来了（ablab.causal.iv，见 m3 报告 2.8 节），
+        # 所以这条从 "IV/RDD" 收窄成 "RDD"；锚点换成 iv 是为了钉住
+        # "模块还在、只是 RDD 那一半没做"，避免改名骗过检查。
+        anchor_present="ablab.causal.iv",
+        when_done="README 的 M3 那条要改成「已实现 RDD」，并补验收证据",
     ),
     UnimplementedItem(
         id="policy_learning",

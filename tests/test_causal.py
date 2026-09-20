@@ -732,6 +732,123 @@ class TestForestInfluenceSe:
         assert len(seen) > n // 2, f"叶子只覆盖了 {len(seen)}/{n} 个单元"
 
 
+class TestIV:
+    """工具变量：横截面上的内生性。
+
+    这一组的重点是**两件事分开钉**：
+    (1) 工具够强时 2SLS 能救回点估计，而 OLS 救不回（这是"为什么需要工具"）；
+    (2) 工具很弱时 2SLS 的中位偏差朝 OLS 靠、AR 区间变得无界 ——
+        而 Wald 区间的覆盖率**并不**像教科书说的那样崩（实测记录，见 m3 报告 2.8 节）。
+    """
+
+    @staticmethod
+    def _sample(**kwargs):
+        from ablab.sim import IVScenarioConfig, generate_iv_scenario
+
+        base = {"n": 3000, "tau": 2.0, "rho": 0.8, "seed": 11}
+        base.update(kwargs)
+        return generate_iv_scenario(IVScenarioConfig(**base))
+
+    def test_ols_is_biased_and_2sls_recovers_with_a_strong_instrument(self):
+        """同一个 DGP 上：OLS 被混淆推偏，2SLS（工具够强）拉回来。"""
+        import numpy as np
+
+        from ablab.causal import two_sls
+
+        s = self._sample(pi=0.5)
+        ols = float(
+            np.linalg.lstsq(
+                np.column_stack([s.D, s.X, np.ones(s.n)]), s.Y, rcond=None
+            )[0][0]
+        )
+        res = two_sls(s.Y, s.D, s.Z, s.X)
+        assert abs(ols - 2.0) > 0.4, f"OLS 应当明显偏（实测 {ols:.4f}）"
+        # 判据用「4 倍稳健 SE 之内」而不是一个拍出来的绝对阈值：
+        # 单次抽取的 2SLS 本来就有抽样波动，而 SE 正是它该有的尺度。
+        assert abs(res.beta - 2.0) < 4 * res.se, (res.beta, res.se)
+        assert abs(res.beta - 2.0) < abs(ols - 2.0), (res.beta, ols)
+        assert res.first_stage_f > 50, res.first_stage_f
+        assert not res.weak
+
+    def test_ols_is_unbiased_without_endogeneity(self):
+        """正对照：rho = 0 时 OLS 无偏 —— 偏差确实来自混淆，不是 OLS 本身。"""
+        import numpy as np
+
+        s = self._sample(pi=0.3, rho=0.0)
+        ols = float(
+            np.linalg.lstsq(
+                np.column_stack([s.D, s.X, np.ones(s.n)]), s.Y, rcond=None
+            )[0][0]
+        )
+        assert abs(ols - 2.0) < 0.15, ols
+
+    def test_first_stage_f_orders_the_instrument_strength(self):
+        """F 必须随工具强度单调上升 —— 它是所有弱工具诊断的输入。"""
+        from ablab.causal import two_sls
+
+        fs = [two_sls(s.Y, s.D, s.Z, s.X).first_stage_f
+              for s in (self._sample(pi=p) for p in (0.05, 0.2, 0.5))]
+        assert fs[0] < fs[1] < fs[2], fs
+        assert fs[0] < 10.0 < fs[2], fs
+
+    def test_weak_flag_follows_the_first_stage_f(self):
+        from ablab.causal import two_sls
+
+        weak = two_sls(*self._as_args(self._sample(pi=0.03)))
+        strong = two_sls(*self._as_args(self._sample(pi=0.5)))
+        assert weak.weak and weak.first_stage_f < 10.0
+        assert not strong.weak and strong.first_stage_f > 10.0
+        assert "弱工具" in weak.summary()
+
+    @staticmethod
+    def _as_args(s):
+        return s.Y, s.D, s.Z, s.X
+
+    def test_ar_interval_is_unbounded_when_the_instrument_is_useless(self):
+        """工具与处置**无关**时，AR 区间应当无界 —— "数据排除不掉任何 β"。
+
+        这是 AR 最容易被误读的地方：它给的覆盖率是对的，代价是区间可能无界。
+        无界时 ``ar_width`` 记 ``inf``（端点只是网格边界，不是数据的结论）。
+        """
+        import numpy as np
+
+        from ablab.causal import two_sls
+
+        s = self._sample(pi=0.0)
+        rng = np.random.default_rng(0)
+        z_irrelevant = rng.integers(0, 2, size=s.n).astype(float)
+        res = two_sls(s.Y, s.D, z_irrelevant, s.X)
+        # 注意：与处置**无关**的工具，它的第一阶段 F 服从 χ²(1)（期望 1、尾部很重），
+        # 所以一次抽取拿到 F=3 完全正常 —— 这正是"F 大不等于工具强"的那件事。
+        # 这里只钉住"它被判成弱工具"与"AR 区间无界"这两条确定的东西。
+        assert res.weak, res.first_stage_f
+        assert res.ar_ci is not None
+        assert res.ar_unbounded, res.ar_ci
+        assert np.isinf(res.ar_width)
+
+    def test_sargan_does_not_reject_valid_instruments(self):
+        """两个**都有效**的工具：过度识别检验不应当拒绝（p 大）。"""
+        from ablab.causal import two_sls
+
+        res = two_sls(*self._as_args(self._sample(pi=0.3, n_instruments=2, n=4000)))
+        assert res.sargan_p is not None
+        assert res.sargan_p > 0.05, res.sargan_p
+        assert res.n_instruments == 2
+
+    def test_input_validation(self):
+        import numpy as np
+        import pytest
+
+        from ablab.causal import two_sls
+
+        s = self._sample(pi=0.3, n=200)
+        with pytest.raises(ValueError, match="样本量"):
+            two_sls(s.Y, s.D[:100], s.Z, s.X)
+        with pytest.raises(ValueError, match="工具"):
+            two_sls(s.Y, s.D, np.empty((s.n, 0)), s.X)
+        assert np.isfinite(two_sls(s.Y, s.D, s.Z, s.X).beta)
+
+
 class TestConformalITE:
     """个体效应的**保形预测区间**：解析区间做不到的事，换对象就做到了。
 

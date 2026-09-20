@@ -15,9 +15,12 @@ from .generator import (
 from .scenarios import (
     ClusterSample,
     ClusterScenarioConfig,
+    IVSample,
+    IVScenarioConfig,
     RatioSample,
     RatioScenarioConfig,
     generate_cluster_scenario,
+    generate_iv_scenario,
     generate_ratio_scenario,
 )
 from .sequential import (
@@ -40,10 +43,13 @@ __all__ = [
     "simulate_outcomes_treated",
     "two_arm_spec",
     "ClusterSample",
+    "IVSample",
+    "IVScenarioConfig",
     "ClusterScenarioConfig",
     "RatioSample",
     "RatioScenarioConfig",
     "generate_cluster_scenario",
+    "generate_iv_scenario",
     "generate_ratio_scenario",
     "CanonicalSequences",
     "LookSequence",

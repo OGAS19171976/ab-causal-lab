@@ -101,6 +101,15 @@ CLAIMS: list[tuple[str, str, str]] = [
     # 组级校准（BLP/GATES）：同样只加文本类声明 —— 覆盖率与斜率会随
     # --quick（分裂次数 6 vs 30）变，把数字写进清单就是第 31 条那个假红灯。
     # SA 回归版：最后队列当基准（数值随面板固定，稳定）
+    # 工具变量（2.8 节）：**只加文本类声明** —— 该节的数值随 --quick 变
+    # （重抽 40 vs 150 次），把数字写进清单就会在快速模式下变成假红灯。
+    ("M3·IV：工具变量已实现", "m3_validation.md", "2.8 工具变量"),
+    ("M3·IV：弱工具把中位偏差拉向 OLS", "m3_validation.md", "占 OLS 的"),
+    ("M3·IV：Wald 覆盖率没有崩（实测改写教科书判据）",
+     "m3_validation.md", "Wald 覆盖率没有崩"),
+    ("M3·IV：AR 的代价是无界", "m3_validation.md", "的 AR 区间无界"),
+    ("M3·IV：正对照（没有内生性时 OLS 无偏）",
+     "m3_validation.md", "正对照（rho=0，没有内生性）"),
     ("M3·SA：最后队列当基准", "m3_validation.md", "最后队列当基准"),
     ("M3·SA：改善倍数", "m3_validation.md", "改善了 50 倍"),
     ("M3·BJS：插补估计量已补", "m3_validation.md", "BJS 插补"),

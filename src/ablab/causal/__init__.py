@@ -34,6 +34,7 @@ from .hte import (
     t_learner,
     x_learner,
 )
+from .iv import IVResult, anderson_rubin_ci, two_sls
 from .panel import (
     GroundTruth,
     Panel,
@@ -62,6 +63,9 @@ from .uplift import (
 )
 
 __all__ = [
+    "IVResult",
+    "anderson_rubin_ci",
+    "two_sls",
     "CSResult",
     "SAResult",
     "sun_abraham",
