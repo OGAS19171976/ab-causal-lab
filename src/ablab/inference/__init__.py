@@ -9,7 +9,15 @@ from .clustered import (
     estimate_icc,
     wild_cluster_bootstrap,
 )
-from .cuped import CupedFit, cuped_estimate, cuped_ttest, fit_cuped
+from .cuped import (
+    CupedFit,
+    MultivariateCupedFit,
+    cuped_estimate,
+    cuped_ttest,
+    fit_cuped,
+    fit_multivariate_cuped,
+    multivariate_theta,
+)
 from .power import mde, required_n_per_arm, se_of_mean_diff, z_power
 from .ratio import NaiveRatioResult, naive_unit_ratio_ttest, ratio_delta_method
 from .result import Diagnostic, Estimate, Status
@@ -31,9 +39,12 @@ __all__ = [
     "cluster_robust_ttest",
     "estimate_icc",
     "CupedFit",
+    "MultivariateCupedFit",
     "cuped_estimate",
     "cuped_ttest",
     "fit_cuped",
+    "fit_multivariate_cuped",
+    "multivariate_theta",
     "mde",
     "required_n_per_arm",
     "se_of_mean_diff",

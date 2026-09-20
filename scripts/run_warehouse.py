@@ -27,6 +27,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from ablab.inference import fit_multivariate_cuped  # noqa: E402
 from ablab.reporting import for_report  # noqa: E402
 from ablab.warehouse import (  # noqa: E402
     DEFAULT_EXPERIMENTS,
@@ -197,6 +198,37 @@ def main() -> int:
     emit(f"      校正前 {adj2.realized_post_gap:+.4f} -> 校正后 {adj2.realized_adjusted_gap:+.4f}"
          f"，更接近真值")
     emit("  * -> M1 将把这个诊断正式实现为 CUPED，并作为默认分析口径")
+
+    # 多协变量 CUPED：**真实数据上**的两个协变量（前置互动值 + 前置互动次数）
+    #
+    # 为什么单独写一节：上面的诊断只用了一个协变量（pre_metric）。
+    # 数仓的 DWD 里其实还落着 pre_cnt，两个一起用能多拿多少方差缩减
+    # 是个能用真实数据回答的问题 —— 而不是靠仿真说"理论上更多"。
+    emit("")
+    emit("  **多协变量 CUPED（真实数据：pre_metric + pre_cnt）**")
+    emit("  上面的诊断只用了一个协变量；DWD 里还落着 pre_cnt（前置互动次数）。")
+    emit("  两个协变量一起用能多拿多少？用**交叉拟合**的 θ̂（诚实口径）量：")
+    detail = con.execute(
+        "SELECT variant, pre_metric, pre_cnt, post_metric FROM dwd_experiment_user"
+        " WHERE experiment = 'exp_rank_v2'"
+    ).df()
+    X_two = detail[["pre_metric", "pre_cnt"]].to_numpy(dtype=float)
+    y_post = detail["post_metric"].to_numpy(dtype=float)
+    mv_one = fit_multivariate_cuped(X_two[:, :1], y_post, n_folds=5, seed=0)
+    mv_two = fit_multivariate_cuped(X_two, y_post, n_folds=5, seed=0)
+    mv_in = fit_multivariate_cuped(X_two, y_post, n_folds=1)
+    # **三位小数**：这几个数是从 DWD 明细算出来的，DuckDB 并行聚合的浮点末位
+    # 会让第 4 位漂（实测 0.7438 / 0.7440）。声明清单钉的是逐字字符串，
+    # 所以这里按"不会翻面"的精度报 —— 与 SA 那个"改善了 50 倍"是同一个教训。
+    emit(f"    单协变量（pre_metric）：诚实方差缩减 {mv_one.variance_reduction:.3f}"
+         f"（最好的单协变量 {mv_one.best_univariate_reduction:.3f}）")
+    emit(f"    两协变量（+pre_cnt）  ：诚实方差缩减 {mv_two.variance_reduction:.3f}"
+         f"，多拿 {mv_two.extra_from_multivariate:+.3f}")
+    emit(f"    同一个拟合的**样本内**缩减 {mv_in.variance_reduction:.3f}"
+         f"（过拟合 {mv_in.variance_reduction - mv_two.variance_reduction:+.3f}）"
+         f"，条件数 {mv_two.condition_number:.2f}")
+    emit("    -> 多一个真实协变量确实多拿了一点；而样本内与交叉拟合的差就是"
+         "「多协变量看起来更有效」的那一部分。")
 
     # ---- 6. 比值链路（06/07）的交叉验证 -------------------------------- #
     #

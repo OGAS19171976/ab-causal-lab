@@ -12,6 +12,8 @@ from ablab.inference import (
     cuped_ttest,
     estimate_icc,
     fit_cuped,
+    fit_multivariate_cuped,
+    multivariate_theta,
     naive_unit_ratio_ttest,
     ratio_delta_method,
     t_inference,
@@ -311,6 +313,100 @@ class TestCuped:
 # --------------------------------------------------------------------------- #
 # 比值指标
 # --------------------------------------------------------------------------- #
+class TestMultivariateCuped:
+    """多协变量 CUPED：θ = Σ_X⁻¹ Cov(X, Y)，以及两个必须量的风险。
+
+    "看起来生效"是这个做法最危险的地方 —— 所以测试也围绕它写：
+    样本内 vs 交叉拟合、条件数、以及 p ≥ n 时**不会报错**的数值奇异。
+    """
+
+    @staticmethod
+    def _data(n=2000, p=3, n_informative=3, noise=1.0, seed=0, collinear=0.0):
+        rng = np.random.default_rng(seed)
+        if collinear == 0.0:
+            X = rng.normal(0.0, 1.0, (n, p))
+        else:
+            f = rng.normal(0.0, 1.0, (n, 1))
+            e = rng.normal(0.0, 1.0, (n, p))
+            X = np.sqrt(collinear) * f + np.sqrt(1.0 - collinear) * e
+        beta = np.zeros(p)
+        beta[:n_informative] = 1.0
+        y = X @ beta + rng.normal(0.0, noise, n)
+        return X, y
+
+    def test_single_covariate_matches_the_univariate_formula(self):
+        """一个协变量时必须退化成 Cov(x,y)/Var(x) —— 与 fit_cuped 同一件事。"""
+        X, y = self._data(p=1)
+        theta = multivariate_theta(X, y)
+        x = X[:, 0]
+        expected = float(np.cov(x, y, ddof=0)[0, 1] / x.var())
+        assert float(theta[0]) == pytest.approx(expected, rel=1e-9)
+
+    def test_adjustment_removes_the_sample_covariance(self):
+        X, y = self._data(p=2)
+        theta = multivariate_theta(X, y)
+        y_adj = y - (X - X.mean(axis=0)) @ theta
+        for j in range(X.shape[1]):
+            assert abs(np.cov(X[:, j], y_adj, ddof=0)[0, 1]) < 1e-9
+
+    def test_reduction_beats_the_best_univariate(self):
+        X, y = self._data(p=3, n_informative=3)
+        fit = fit_multivariate_cuped(X, y, n_folds=5)
+        assert fit.variance_reduction > fit.best_univariate_reduction
+        assert fit.variance_reduction > 0.4
+
+    def test_cross_fitting_is_not_more_optimistic_than_in_sample(self):
+        """交叉拟合的缩减必须 ≤ 样本内（否则说明折用反了）。"""
+        X, y = self._data(n=200, p=20, n_informative=0, seed=3)
+        in_sample = fit_multivariate_cuped(X, y, n_folds=1)
+        cross = fit_multivariate_cuped(X, y, n_folds=5, seed=3)
+        assert cross.variance_reduction < in_sample.variance_reduction
+        assert in_sample.variance_reduction > 0.0  # 噪声也能"赚"到一点
+        assert cross.variance_reduction < 0.05  # 诚实口径下几乎没有收益
+
+    def test_ill_conditioned_is_flagged_when_p_exceeds_n(self):
+        """p ≥ n：条件数爆表 → ``ill_conditioned`` 必须为真，摘要里要有警告。
+
+        **这条最关键**：``np.linalg.solve`` 对数值奇异的矩阵不报错，
+        所以闸门只能自己建。
+        """
+        X, y = self._data(n=60, p=100, n_informative=0, seed=5)
+        fit = fit_multivariate_cuped(X, y, n_folds=1)
+        assert fit.condition_number > 1e10
+        assert fit.ill_conditioned
+        assert "条件数" in fit.summary()
+        # 样本内"完美"，而这不是好消息
+        assert fit.variance_reduction > 0.99
+
+    def test_ridge_improves_the_condition_number(self):
+        X, y = self._data(n=60, p=100, n_informative=0, seed=5)
+        plain = fit_multivariate_cuped(X, y, n_folds=1)
+        ridged = fit_multivariate_cuped(X, y, ridge=0.1, n_folds=1)
+        assert ridged.condition_number < plain.condition_number
+        assert ridged.variance_reduction < plain.variance_reduction
+
+    def test_input_validation(self):
+        X, y = self._data(n=100, p=2)
+        with pytest.raises(ValueError, match="样本量"):
+            multivariate_theta(X, y[:50])
+        with pytest.raises(ValueError, match="ridge"):
+            multivariate_theta(X, y, ridge=-1.0)
+        with pytest.raises(ValueError, match="至少要一个协变量"):
+            multivariate_theta(np.empty((100, 0)), y)
+        with pytest.raises(ValueError, match="n_folds"):
+            fit_multivariate_cuped(X, y, n_folds=0)
+
+    def test_audit_reports_the_three_priors(self):
+        """审计本体的三个结论必须是量出来的（而不是写死的）。"""
+        from ablab.validation import run_multivariate_cuped_audit
+
+        audit = run_multivariate_cuped_audit(n_trials=50)
+        assert audit.multivariate_beats_univariate
+        assert audit.noise_covariates_overfit_in_sample
+        assert audit.p_over_n_looks_perfect
+        assert audit.ridge_tames_p_over_n_but_stays_honest
+
+
 class TestRatioMetric:
     def make_ratio_data(self, *, n=20_000, seed=0):
         rng = np.random.default_rng(seed)

@@ -73,6 +73,11 @@ from .methods import (
     run_ratio_comparison,
     run_ratio_power_comparison,
 )
+from .multivariate_cuped_audit import (
+    MultivariateCupedAudit,
+    MultivariateCupedRow,
+    run_multivariate_cuped_audit,
+)
 from .peeking import (
     PeekResult,
     calibrate_constant_boundary,
@@ -91,6 +96,9 @@ from .sequential_audit import (
 )
 
 __all__ = [
+    "MultivariateCupedAudit",
+    "MultivariateCupedRow",
+    "run_multivariate_cuped_audit",
     "MetaLearnerComparison",
     "MetaLearnerRow",
     "run_meta_learner_comparison",

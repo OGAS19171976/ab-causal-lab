@@ -170,7 +170,15 @@ CLAIMS: list[tuple[str, str, str]] = [
     ("治理·决策层：护栏能停实验", "governance_report.md", "决策层：护栏触发"),
     ("治理·决策层：服务端复核", "governance_report.md", "服务端自己复核"),
     ("治理·没做清单：检查器会抓过时声明", "governance_report.md", "没做」的清单"),
-    ("治理·没做清单：7 条机检", "governance_report.md", "机检 7 条"),
+    ("治理·没做清单：6 条机检", "governance_report.md", "机检 6 条"),
+    # 多协变量 CUPED（m1 3b 节随 --quick 变 → 只加文本类；数仓那份是稳定数值）
+    ("M1·多协变量 CUPED：危险的是 p 接近 n",
+     "m1_validation.md", "危险的不是共线，是 p 接近 n"),
+    ("M1·多协变量 CUPED：奇异矩阵不会报错",
+     "m1_validation.md", "solve 不会报错"),
+    # 三位小数：这两个数从 DWD 明细算出来，第 4 位会随 DuckDB 并行聚合漂
+    ("数仓·多协变量 CUPED：两个协变量的诚实缩减",
+     "warehouse_report.md", "诚实方差缩减 0.744"),
     # 真实数据入口（warehouse 报告第 8 节）：数值稳定（不随 --quick 变）
     ("数仓·真实数据入口：两条路径数字相同",
      "warehouse_report.md", "两条完全不同的数据路径"),

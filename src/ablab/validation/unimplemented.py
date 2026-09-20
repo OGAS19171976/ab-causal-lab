@@ -86,14 +86,6 @@ ITEMS: tuple[UnimplementedItem, ...] = (
         ),
     ),
     UnimplementedItem(
-        id="multivariate_cuped",
-        readme_phrase="CUPED 只支持单协变量",
-        kind="symbol_absent",
-        target="ablab.inference.cuped.multivariate_theta",
-        anchor_present="ablab.inference.cuped",
-        when_done="README 要给出多协变量的方差缩减实测（θ = Σ_X⁻¹Cov(X,Y)）",
-    ),
-    UnimplementedItem(
         id="msprt_tau_choice",
         readme_phrase="mSPRT 的 `tau` 没有自动选择",
         kind="symbol_absent",

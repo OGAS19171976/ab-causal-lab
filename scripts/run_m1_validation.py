@@ -45,6 +45,7 @@ from ablab.validation import (  # noqa: E402
     run_cuped_bias_decomposition,
     run_cuped_comparison,
     run_cuped_power_comparison,
+    run_multivariate_cuped_audit,
     run_ratio_comparison,
     run_ratio_power_comparison,
 )
@@ -245,6 +246,7 @@ def main() -> int:
     n_units = 6_000 if args.quick else 20_000
     n_cuped = 400 if args.quick else 1_500
     n_power = 120 if args.quick else 300
+    n_mv_cuped = 100 if args.quick else 300
     n_ratio = 400 if args.quick else 1_000
     n_cluster = 300 if args.quick else 800
 
@@ -312,6 +314,20 @@ def main() -> int:
         )
         emit(f"{r['lift']:>7.2f} {r['naive_power']:>12.4f} {r['cuped_power']:>12.4f} "
              f"{gain:>9.1%}")
+
+    # ---- 3b. 多协变量 CUPED ------------------------------------------------- #
+    #
+    # 单协变量时"方差缩减 = rho^2"是个能用眼睛验证的等式；协变量一多，
+    # 有两件事会悄悄发生：样本内 theta 过拟合（噪声协变量也"贡献"收益）、
+    # 以及 p 接近 n 时 Sigma_X 数值奇异（**solve 不会报错**）。
+    # 这一节的三个结论都推翻了动手前的预期，逐条写在报告里。
+    emit("\n### 3b. 多协变量 CUPED：危险的不是共线，是 p 接近 n")
+    emit("  theta = Sigma_X^{-1} Cov(X, Y)；`n_folds>1` 时用交叉拟合的 theta。")
+    emit("  每个档位同时给三个数：样本内缩减、交叉拟合缩减（诚实口径）、")
+    emit("  以及**重随机化实测的 ATE 方差缩减** —— 三者分开才有意义。")
+    emit("")
+    mv = run_multivariate_cuped_audit(n_trials=n_mv_cuped)
+    emit(mv.summary())
 
     # ---- 4. 比值指标 ------------------------------------------------------ #
     emit("\n### 4. 比值指标：delta method vs 用户级比值 t 检验")
@@ -390,6 +406,13 @@ def main() -> int:
         "delta method 校准": 0.025 <= ratio_cmp.get(RATIO_DELTA).fpr() <= 0.085,
         "CR1 校准": 0.02 <= r_cr.fpr() <= 0.09,
         "聚类反例确实崩溃": r_naive.fpr() > 0.25,
+        "多协变量优于最好的单协变量": mv.multivariate_beats_univariate,
+        "噪声协变量档位：样本内过拟合可见": mv.noise_covariates_overfit_in_sample,
+        "共线可见但不致命": mv.collinearity_is_visible,
+        "p≥n：样本内完美、留出集灾难": mv.p_over_n_looks_perfect,
+        "ridge 压住 p≥n 且不给假收益": mv.ridge_tames_p_over_n_but_stays_honest,
+        "ridge 在共线档位略有帮助": mv.ridge_helps_under_collinearity,
+        "理论代理与实测 ATE 方差缩减同量级": mv.proxy_tracks_the_real_thing,
     }
     verdict = "PASS" if all(checks.values()) else "FAIL"
 
@@ -424,6 +447,15 @@ def main() -> int:
     emit(f"[5] 聚类随机化：用户级 t 检验 I 类错误 {r_naive.fpr():.1%}"
          f"（覆盖率 {r_naive.coverage():.1%}）-> CR1 {r_cr.fpr():.4f}，"
          f"簇级 {cluster_cmp.get('簇级 Welch').fpr():.4f}")
+    mv_noise = next(r for r in mv.rows if "噪声" in r.regime)
+    mv_pn = next(r for r in mv.rows if "p≥n" in r.regime and r.ridge == 0)
+    emit(f"[6] 多协变量 CUPED：正常档位诚实缩减 {mv.rows[0].reduction_cross_fitted:.4f}"
+         f"（最好的单协变量 {mv.rows[0].best_univariate:.4f}）；")
+    emit(f"    噪声协变量档位：样本内 {mv_noise.reduction_in_sample:+.4f} 而交叉拟合 "
+         f"{mv_noise.reduction_cross_fitted:+.4f}（过拟合 {mv_noise.overfitting:+.4f}）；")
+    emit(f"    p≥n 档位：样本内 {mv_pn.reduction_in_sample:+.4f}、留出集 "
+         f"{mv_pn.reduction_cross_fitted:+.1f} —— **Sigma_X 奇异时 solve 不会报错**，")
+    emit("    所以必须有条件数这道闸门（`ill_conditioned`）。")
     emit(f"\n逐项检查: {checks}")
     emit(f"总体判定: {verdict}")
     emit(f"总耗时 {time.perf_counter() - t0:.1f}s")
