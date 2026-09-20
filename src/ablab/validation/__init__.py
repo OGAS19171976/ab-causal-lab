@@ -87,6 +87,7 @@ from .peeking import (
     calibrate_constant_boundary,
     run_peeking_simulation,
 )
+from .policy_audit import PolicyAudit, run_policy_audit
 from .sequential_audit import (
     BoundaryAccuracy,
     MonitoringPoint,
@@ -100,6 +101,8 @@ from .sequential_audit import (
 )
 
 __all__ = [
+    "PolicyAudit",
+    "run_policy_audit",
     "RambachanRothAudit",
     "run_rambachan_roth_audit",
     "SCMPlaceboAudit",

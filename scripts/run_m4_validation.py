@@ -47,6 +47,7 @@ from ablab.validation import (  # noqa: E402
     run_cate_form_comparison,
     run_dml_audit,
     run_meta_learner_comparison,
+    run_policy_audit,
     run_uplift_metric_audit,
 )
 
@@ -208,6 +209,9 @@ def main() -> int:
     # 快速档位刻意缩小 —— 它只为"跑得动"，不作为证据。
     n_cate = 1200 if args.quick else 1500
     n_cate_scen = 2 if args.quick else 5
+    # 策略学习（3d）：一次仿真的开销是"5 折 × 3 个随机森林"量级，
+    # 所以次数比别的小节少，但两种 DGP × 三种容量都留着（那才是对照）。
+    n_policy = 10
     boot_cate = 8 if args.quick else 25
 
     setup_style()
@@ -295,6 +299,44 @@ def main() -> int:
     emit("      第一版的对照顺手把不交叉拟合那一支的 ê 换成了常数边际处置率，")
     emit("      等于一次改了两个变量 —— 对照实验只许改一个。")
 
+    # ---- 3d. 策略学习：直接优化价值 ------------------------------------------ #
+    emit("\n### 3d. 策略学习：直接优化策略价值（AIPW）")
+    emit("  前面所有 CATE 方法都在回答「谁受益更多」，然后靠排序当策略。")
+    emit("  这一节换一个问题：**把策略价值写成目标函数，直接在策略类上最大化它。**")
+    emit("  口径是相对「谁都不投」的增量 Δ(π) = E[τ(X)π(X)]，用交叉拟合的")
+    emit("  AIPW 伪结果 Γ 估计：Δ̂(π) = mean(π(X)·Γ)，SE 直接来自影响函数。")
+    emit("")
+    policy_audit = run_policy_audit(
+        n_trials=n_policy if not args.quick else 3,
+        n=500 if not args.quick else 300,
+        n_grid=10 if not args.quick else 6,
+        n_folds=3 if not args.quick else 2,
+    )
+    for line in policy_audit.summary().splitlines():
+        emit("  " + line)
+    emit("")
+    emit("  这一节的四句话：")
+    emit(f"    · **学到的策略是真的**：真实价值达到 oracle 的 "
+         f"{policy_audit.signal['oracle 占比·深度1']:.1%}，"
+         f"是全投基线的 {policy_audit.signal['真实价值·深度1'] / policy_audit.signal['真实价值·全投']:.1f} 倍；")
+    emit(f"    · **样本内价值不是价值**：τ≡0 时它仍然给出 "
+         f"{policy_audit.noise['样本内价值·深度1']:+.3f}"
+         f"（无限制那一支 {policy_audit.noise['样本内价值·无限制']:+.3f}，真值精确为 0）；")
+    emit(f"    · **分离样本只治一半**：它把 {policy_audit.noise['样本内价值·深度1']:+.3f} "
+         f"压到 {policy_audit.noise['分离样本价值·深度1']:+.3f}，")
+    emit(f"      剩下的与预指定偏差曲线的峰（{max(policy_audit.bias_curve):+.3f}）同量级 ——")
+    emit("      **分离治的是选择偏差，不治 nuisance 偏差**；")
+    emit(f"    · **覆盖率那两栏要一起读**：预指定策略 "
+         f"{policy_audit.coverage['固定策略·覆盖率']:.2f}，深度1 "
+         f"{policy_audit.coverage['选中策略·覆盖率']:.2f}，深度2 "
+         f"{policy_audit.coverage['大容量类·覆盖率']:.2f}，无限制 "
+         f"{policy_audit.coverage['无限制·覆盖率']:.2f} ——")
+    emit("      同一个估计量、同一批数据，差别只在「有没有选过」。")
+    emit("  还有一条要写进报告而不是留在读者以为里：正对照（**预指定**策略）")
+    emit(f"  的价值是 {policy_audit.noise['样本内价值·固定策略']:+.4f} 而不是 0 ——")
+    emit("  这就是这套 nuisance 在这个 n 下的偏差本身；它的区间仍然覆盖 0，")
+    emit("  但那是因为 SE 更大 —— **偏差小不等于偏差不存在**。")
+
     # ---- 4. 图表 ------------------------------------------------------------ #
     emit("\n### 4. 生成图表")
     data = generate_hte_data(HTEConfig(n=n_uplift, cate_form="nonlinear", seed=0))
@@ -331,6 +373,8 @@ def main() -> int:
         "R(森林) 不差于 T-learner（同基学习器，四个形式）": meta.r_beats_t_with_same_learner,
         "元学习器没有单一赢家": len({meta.best(f).method for f in meta.forms}) > 1,
         "交叉拟合在 MSE 口径上不赚（实测记录）": meta.cross_fitting_costs_mse,
+        # 策略学习（3d）：把"审计的判据"接进整套检查里 —— 有一条不通就红。
+        **{f"策略学习：{k}": v for k, v in policy_audit.passed().items()},
     }
     verdict = "PASS" if all(checks.values()) else "FAIL"
 
@@ -376,6 +420,16 @@ def main() -> int:
          f"每个形式的最小 MSE 方法：{meta_winners}")
     emit("    -> **没有单一赢家**（M4 的老结论），而**交叉拟合在 MSE 上不赚**：")
     emit("       它买到的是推断的有效性，不是这个口径上的点估计。")
+    emit(f"[6] 策略学习（3d）：学到的策略真实价值是 oracle 的 "
+         f"{policy_audit.signal['oracle 占比·深度1']:.1%}；"
+         f"而 τ≡0 时样本内价值仍有 {policy_audit.noise['样本内价值·深度1']:+.3f}"
+         f"（真值 0），分离样本后 {policy_audit.noise['分离样本价值·深度1']:+.3f}，"
+         f"与偏差面峰同量级")
+    emit("    -> **策略学习的头条数字必须是分离样本价值**；"
+         "「样本内提升了 X」只说明搜索空间有多大。")
+    emit("       覆盖率的对照更直白：预指定策略 "
+         f"{policy_audit.coverage['固定策略·覆盖率']:.2f} vs 无限制类 "
+         f"{policy_audit.coverage['无限制·覆盖率']:.2f}。")
     emit(f"\n逐项检查: {checks}")
     emit(f"总体判定: {verdict}")
     emit(f"总耗时 {time.perf_counter() - t0:.1f}s")

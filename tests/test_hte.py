@@ -264,6 +264,147 @@ class TestRLearnerAndDRLearner:
 
 
 # --------------------------------------------------------------------------- #
+# 策略学习（AIPW）
+# --------------------------------------------------------------------------- #
+class TestAipwPolicyLearning:
+    """钉住三件事：固定策略的估计是无偏的、选择会带来乐观偏差、
+    以及"Γ>0 就投"根本不是一个策略。"""
+
+    @staticmethod
+    def _data(n: int, scale: float, seed: int):
+        from ablab.causal import HTEConfig, generate_hte_data
+
+        return generate_hte_data(
+            HTEConfig(
+                n=n,
+                cate_form="threshold",
+                cate_scale=scale,
+                propensity_strength=0.6,
+                seed=seed,
+            )
+        )
+
+    def test_fixed_policy_value_is_close_and_covers(self):
+        """预指定策略（不含选择）：AIPW 价值应当贴近真值，区间盖住真值。"""
+        from ablab.causal import ThresholdPolicy
+        from ablab.causal.policy import aipw_effect_scores, policy_value
+
+        d = self._data(n=8000, scale=1.0, seed=3)
+        scores = aipw_effect_scores(d.Y, d.D, d.X, seed=0)
+        pol = ThresholdPolicy(feature=0, threshold=0.0)
+        pv = policy_value(scores, d.X, pol)
+        truth = float((d.tau * pol(d.X)).mean())
+        assert abs(pv.value - truth) < 3.0 * pv.se
+        assert pv.covers(truth)
+        assert pv.se < 0.25  # 这个 n 下 SE 应当很小
+
+    def test_se_shrinks_with_sample_size(self):
+        """影响函数 SE 的 1/√n 行为（否则它不是 SE，只是个数字）。"""
+        from ablab.causal import ThresholdPolicy
+        from ablab.causal.policy import aipw_effect_scores, policy_value
+
+        pol = ThresholdPolicy(feature=0, threshold=0.0)
+        ses = []
+        for n in (1000, 4000):
+            d = self._data(n=n, scale=1.0, seed=5)
+            scores = aipw_effect_scores(d.Y, d.D, d.X, seed=0)
+            ses.append(policy_value(scores, d.X, pol).se)
+        ratio = ses[0] / ses[1]
+        assert 1.5 < ratio < 2.6, ratio
+
+    def test_mask_must_be_binary_and_aligned(self):
+        from ablab.causal.policy import aipw_effect_scores, policy_value
+
+        d = self._data(n=400, scale=1.0, seed=7)
+        scores = aipw_effect_scores(d.Y, d.D, d.X, seed=0)
+        with pytest.raises(ValueError, match="长度"):
+            policy_value(scores, d.X, np.ones(10))
+        with pytest.raises(ValueError, match="0/1"):
+            policy_value(scores, d.X, np.full(400, 0.5))
+
+    def test_ranking_mask_takes_the_top_share(self):
+        from ablab.causal.policy import ranking_mask
+
+        score = np.array([0.1, 0.9, 0.5, 0.3, 0.7, 0.2])
+        mask = ranking_mask(score, share=0.5)
+        assert mask.sum() == 3
+        assert set(np.flatnonzero(mask)) == {1, 2, 4}
+        with pytest.raises(ValueError, match="share"):
+            ranking_mask(score, share=1.2)
+
+    def test_learned_policy_reaches_oracle_on_signal(self):
+        """有信号时：学到的策略要真的拿到 oracle 的大部分（不是样本内数字）。"""
+        from ablab.causal.policy import aipw_policy_learner
+
+        d = self._data(n=2000, scale=1.0, seed=11)
+        learned = aipw_policy_learner(d.Y, d.D, d.X, depth=1, n_grid=12, seed=0)
+        mask = learned.policy(d.X)
+        true_value = float((d.tau * mask).mean())
+        oracle = float((d.tau * (d.tau > 0)).mean())
+        treat_all = float(d.tau.mean())
+        assert true_value >= 0.80 * oracle, (true_value, oracle)
+        assert true_value > 3.0 * treat_all, (true_value, treat_all)
+        assert 0.05 < mask.mean() < 0.95  # 不是"全投"或"全不投"这种平凡解
+
+    def test_noise_regime_shows_optimism_and_splitting_shrinks_it(self):
+        """τ ≡ 0：样本内价值为正（真值为 0），分离样本价值明显更小。"""
+        from ablab.causal.policy import aipw_policy_learner
+
+        d = self._data(n=1500, scale=0.0, seed=13)
+        learned = aipw_policy_learner(d.Y, d.D, d.X, depth=1, n_grid=12, seed=0)
+        assert learned.in_sample.value > 0.05
+        assert learned.split.value < learned.in_sample.value
+        assert learned.optimism > 0.0
+        # 真值精确为 0（τ ≡ 0 是构造出来的，不是估出来的）
+        assert float((d.tau * learned.policy(d.X)).mean()) == pytest.approx(0.0)
+
+    def test_capacity_increases_the_optimism(self):
+        """同一份噪声数据：深度 2 的样本内价值高于深度 1（容量换偏差）。"""
+        from ablab.causal.policy import (
+            aipw_effect_scores,
+            learn_threshold_policy,
+            policy_value,
+        )
+
+        d = self._data(n=1200, scale=0.0, seed=17)
+        scores = aipw_effect_scores(d.Y, d.D, d.X, seed=0)
+        values = {}
+        for depth in (1, 2):
+            pol, cands = learn_threshold_policy(scores, d.X, depth=depth, n_grid=10)
+            values[depth] = (policy_value(scores, d.X, pol).value, cands)
+        assert values[2][0] > values[1][0]
+        assert values[2][1] > values[1][1]  # 候选数也更多（容量确实更大）
+
+    def test_unrestricted_rule_is_not_a_policy(self):
+        """「Γ>0 就投」要求知道单元自己的 Γ —— 样本内价值很高，真实价值是 0。"""
+        from ablab.causal.policy import (
+            aipw_effect_scores,
+            policy_value,
+            unrestricted_mask,
+        )
+
+        d = self._data(n=1200, scale=0.0, seed=19)
+        scores = aipw_effect_scores(d.Y, d.D, d.X, seed=0)
+        mask = unrestricted_mask(scores)
+        pv = policy_value(scores, d.X, mask)
+        assert pv.value > 0.3
+        assert float((d.tau * mask).mean()) == pytest.approx(0.0)
+
+    def test_audit_reports_the_decomposition(self):
+        """审计本体（小规模）：偏差面 + 选择乐观这个分解要真的看得见。"""
+        from ablab.validation.policy_audit import run_policy_audit
+
+        audit = run_policy_audit(n_trials=2, n=300, n_grid=6, n_folds=2)
+        passed = audit.passed()
+        assert passed["噪声档：样本内价值为正（真值恒为 0）"]
+        assert passed["机制：偏差曲线不是平的（选区域能捡到）"]
+        assert passed["大容量类的区间排除真值（覆盖率崩）"]
+        # 覆盖率的两端：预指定策略守住，无限制那一支崩掉
+        assert audit.coverage["固定策略·覆盖率"] >= audit.coverage["无限制·覆盖率"]
+        assert audit.noise["样本内价值·无限制"] > audit.noise["样本内价值·深度1"]
+
+
+# --------------------------------------------------------------------------- #
 # 因果森林
 # --------------------------------------------------------------------------- #
 class TestCausalForest:
