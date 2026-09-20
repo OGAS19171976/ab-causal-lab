@@ -409,9 +409,17 @@ def main() -> int:
     emit("[3] CUPED 提功效：见上表，同流量下检出率全面更高")
     delta_ref = ratio_cmp.get(RATIO_DELTA)
     naive_ref = ratio_cmp.get(RATIO_NAIVE)
+    # 两个"口径差"不是同一个量，必须分别标出来（否则读者无从判断该引哪一个）：
+    #   * 单次实现：notes 里印的那个数，一次抽样内 Σy/Σx 与 mean(y_i/x_i) 之差；
+    #   * 重复平均：各次重复 control_level 的均值之比。
+    # README 引的是**前者**，声明清单钉的也是它。
+    single_gap = ratio_cmp.extras["single_realization_gap_relative"]
+    avg_gap = (naive_ref.control_level - delta_ref.control_level) / delta_ref.control_level
     emit(f"[4] 比值指标：naive 的 I 类错误也是校准的（{naive_ref.fpr():.4f}），"
-         f"但它报的口径差 "
-         f"{(naive_ref.control_level - delta_ref.control_level) / delta_ref.control_level:+.2%}")
+         f"但它报的是另一个量：单次实现的口径差 {single_gap:+.2%}"
+         f"（{ratio_cmp.extras['estimand_gap']:+.6f}，README 引的是这个数）；"
+         f"{n_ratio} 次重复的 control_level 平均之比是 {avg_gap:+.2%}")
+    emit("    两个数不是同一个量（单次抽样的 Σy/Σx vs mean(y_i/x_i) / 各次重复的均值之比）——")
     emit("    -> 校准不等于正确：一个检验可以既不偏高也不偏低，却系统性报出错误的量")
     emit(f"[5] 聚类随机化：用户级 t 检验 I 类错误 {r_naive.fpr():.1%}"
          f"（覆盖率 {r_naive.coverage():.1%}）-> CR1 {r_cr.fpr():.4f}，"

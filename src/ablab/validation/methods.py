@@ -558,6 +558,18 @@ def run_ratio_comparison(
             "**校准不等于正确** —— 一个检验可以既不偏高也不偏低，"
             "却系统性地报出错误的量。这是本节最值得记住的一句。",
         ),
+        # 单次实现的口径差（上面 notes 里印的那个数）与「重复若干次之后
+        # control_level 的平均之比」**不是同一个量**：前者是一次抽样里
+        # Σy/Σx 与 mean(y_i/x_i) 之差，后者是各次重复的均值之差。
+        # 两个都放进 extras，让调用方能把它们分别标清楚 ——
+        # 否则同一份报告里会出现两个都叫"口径差"的数（M1 报告曾经如此：
+        # notes 里 -12.61%、结论行 -12.77%，读者无从判断哪个是哪个）。
+        extras={
+            "pooled_control": pooled_control,
+            "unit_control": unit_control,
+            "estimand_gap": gap,
+            "single_realization_gap_relative": gap / pooled_control,
+        },
     )
 
 
