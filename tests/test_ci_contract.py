@@ -85,15 +85,27 @@ class TestCheckPlan:
         assert [s.key for s in runner.steps()][0] == "lock"
 
     def test_fast_checks_run_first(self, runner):
-        """秒级的检查（锁文件、lint、类型检查、声明核对、"没做"清单）
-        与前置条件排在前面。
+        """秒级的检查（锁文件、lint、类型检查、"没做"清单）与前置条件排在前面。
 
         早失败就早反馈 —— 不用等五分钟的 pytest 跑完才发现少了个导入。
+        **声明核对（claims）不在这里**：它要读的 reports/ 是后面那些步骤写的，
+        所以它必须收尾（见下一条测试）。
         """
         keys = [s.key for s in runner.steps()]
-        assert keys[:8] == [
-            "lock", "lint", "types", "claims", "unimplemented", "warehouse", "gov", "cate"
-        ], keys[:8]
+        assert keys[:7] == [
+            "lock", "lint", "types", "unimplemented", "warehouse", "gov", "cate"
+        ], keys[:7]
+
+    def test_claims_runs_last(self, runner):
+        """**声明核对必须排在最后**：它检查的"README 数字能否在报告里找到"
+        依赖前面所有会重写 reports/ 的步骤。
+
+        第一版把它放在最前面，于是"改了报告内容 + 同时加声明"时
+        **第一次跑必红、第二次才绿** —— 那是最难查的一类假红灯：
+        看起来像声明写错了，其实只是顺序。
+        """
+        keys = [s.key for s in runner.steps()]
+        assert keys[-1] == "claims", keys[-3:]
 
     def test_unimplemented_step_exists(self, runner):
         """**"没做"的清单也必须在检查集里** —— 与声明核对同一个理由：

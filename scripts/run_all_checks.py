@@ -110,7 +110,14 @@ class Step:
 #: 是本项目最该防的行为，所以顺序在这里写死并加了断言。
 #: ``gov``（治理：审计 + 护栏）不依赖数仓，但它是秒级的、且属于"平台自己会不会
 #: 静默骗人"那一类，所以跟静态检查一起放在前面，早失败早反馈。
-_ORDER_HEAD = ("lock", "lint", "types", "claims", "unimplemented", "warehouse", "gov", "cate")
+#
+# ``claims`` **故意排在最后**（在所有会重写 reports/ 的步骤之后）：
+# 它检查的是"README 里的数字能不能在 reports/ 里逐字找到"，
+# 而那些报告正是后面这些步骤生成的。第一版把 claims 放在最前面，
+# 于是"改了报告内容 + 同时加声明"时**第一次跑必红、第二次才绿** ——
+# 本轮又踩了两次（治理清单的条数、m6 的新节）。那是最难查的一类假红灯：
+# 看起来像声明写错了，其实只是顺序。
+_ORDER_HEAD = ("lock", "lint", "types", "unimplemented", "warehouse", "gov", "cate")
 
 
 def steps() -> list[Step]:
@@ -157,9 +164,12 @@ def steps() -> list[Step]:
              (py, "scripts/run_m6_validation.py"), accepts_quick=True),
     ]
     head = [s for k in _ORDER_HEAD for s in every if s.key == k]
-    rest = [s for s in every if s.key not in _ORDER_HEAD]
-    ordered = head + rest
+    # claims 收尾：它要读的 reports/ 由前面所有步骤生成
+    tail = [s for s in every if s.key == "claims"]
+    rest = [s for s in every if s.key not in _ORDER_HEAD and s.key != "claims"]
+    ordered = head + rest + tail
     assert [s.key for s in ordered[: len(_ORDER_HEAD)]] == list(_ORDER_HEAD), "前置顺序被破坏"
+    assert ordered[-1].key == "claims", "claims 必须是最后一步（它读别的步骤写的报告）"
     return ordered
 
 

@@ -348,6 +348,174 @@ class TestAnalysisOutput:
             assert row["pre_post_cov"] == pytest.approx(expected, rel=1e-12)
 
 
+class TestRealDataIngest:
+    """真实数据入口：把外部文件接成数仓能读的布局。
+
+    这一组钉的是那句被反复引用的主张 —— **换数据源不改链路**。
+    在 `warehouse/ingest.py` 之前，它只被"合成数据写得像真实数据"支持着。
+    """
+
+    @staticmethod
+    def _export(source_dir, target_dir, *, fmt="csv", stray_event=True, extra_cols=True):
+        """把合成器的落地文件导出成"外部文件"：列顺序打乱、多几列、混一个未声明事件。"""
+        import pandas as pd
+
+        target_dir.mkdir(parents=True, exist_ok=True)
+        exposure = pd.read_parquet(source_dir / "exposure_log" / "part-0000.parquet")
+        events = pd.read_parquet(source_dir / "event_log" / "part-0000.parquet")
+        profile = pd.read_parquet(source_dir / "user_profile" / "part-0000.parquet")
+        if extra_cols:
+            exposure = exposure.assign(device="web", app_version="9.9")
+            events = events.assign(platform="ios")
+            profile = profile.assign(country="CN")
+        if stray_event:
+            stray = events.head(200).assign(event_name="page_view", metric_value=1.0)
+            events = pd.concat([events, stray], ignore_index=True)
+        if fmt == "csv":
+            exposure.to_csv(target_dir / "exposure_log.csv", index=False)
+            events.to_csv(target_dir / "event_log.csv", index=False)
+            profile.to_csv(target_dir / "user_profile.csv", index=False)
+        else:
+            exposure.to_parquet(target_dir / "exposure_log.parquet", index=False)
+            events.to_parquet(target_dir / "event_log.parquet", index=False)
+            profile.to_parquet(target_dir / "user_profile.parquet", index=False)
+        return target_dir
+
+    @staticmethod
+    def _declarations():
+        from ablab.warehouse import DEFAULT_EXPERIMENTS, ExternalExperiment
+
+        return tuple(
+            ExternalExperiment(e.name, {"control": 0.5, "treatment": 0.5}, layer=e.layer)
+            for e in DEFAULT_EXPERIMENTS
+        )
+
+    def _build_standard(self, work_dir, sql_dir, n_users=800):
+        cfg = WarehouseConfig(n_users=n_users, seed=5)
+        con = build_warehouse(
+            db_path=work_dir / "std.duckdb", data_dir=work_dir / "std_source",
+            sql_dir=sql_dir, config=cfg, force_data=True, verbose=False,
+        )
+        ads = con.execute(
+            "SELECT experiment, variant, user_cnt, post_sum FROM ads_experiment_result"
+            " ORDER BY experiment, variant"
+        ).df()
+        con.close()
+        return ads, cfg
+
+    def test_round_trip_reproduces_the_synthetic_numbers(self, work_dir, sql_dir):
+        """**这一步才是证据**：两条完全不同的数据路径，同一套 SQL，数字要相同。"""
+        import pandas as pd
+
+        from ablab.warehouse import build_warehouse as bw
+        from ablab.warehouse import load_real_traffic
+
+        std, cfg = self._build_standard(work_dir, sql_dir)
+        self._export(work_dir / "std_source", work_dir / "external", fmt="csv")
+        report = load_real_traffic(
+            work_dir / "external", target_dir=work_dir / "external_source", fmt="csv",
+            experiments=self._declarations(), metric_event="interaction",
+            guardrail_events=("latency_p99", "complaint_rate"),
+        )
+        assert report.row_counts["event_log"] > 0
+        assert "page_view" in report.undeclared_events
+        assert report.duplicate_exposures >= 0
+
+        con = bw(
+            db_path=work_dir / "ext.duckdb", data_dir=work_dir / "external_source",
+            sql_dir=sql_dir, config=cfg, generate=False, verbose=False,
+        )
+        ext = con.execute(
+            "SELECT experiment, variant, user_cnt, post_sum FROM ads_experiment_result"
+            " ORDER BY experiment, variant"
+        ).df()
+        con.close()
+
+        merged = std.merge(ext, on=["experiment", "variant"], suffixes=("_std", "_ext"))
+        assert len(merged) == len(std) == len(ext)
+        assert np.array_equal(merged["user_cnt_std"], merged["user_cnt_ext"])
+        rel = (
+            (merged["post_sum_ext"] - merged["post_sum_std"]).abs()
+            / merged["post_sum_std"].abs()
+        )
+        assert rel.max() < 1e-12, rel.max()
+        assert pd.notna(merged["post_sum_std"]).all()
+
+    def test_true_lift_is_empty_on_the_external_path(self, work_dir, sql_dir):
+        """真实数据没有"演示真值" —— 那一列必须写空，不能假装知道。"""
+        import pandas as pd
+
+        from ablab.warehouse import load_real_traffic
+
+        self._build_standard(work_dir, sql_dir)
+        self._export(work_dir / "std_source", work_dir / "external", fmt="parquet")
+        load_real_traffic(
+            work_dir / "external", target_dir=work_dir / "ext2", fmt="parquet",
+            experiments=self._declarations(),
+        )
+        cfg_frame = pd.read_parquet(work_dir / "ext2" / "experiment_config" / "part-0000.parquet")
+        assert cfg_frame["true_lift"].isna().all()
+        assert set(cfg_frame["variant"]) == {"control", "treatment"}
+        # 设计权重来自声明
+        assert cfg_frame["design_weight"].eq(0.5).all()
+
+    def test_missing_column_names_itself(self, work_dir, sql_dir):
+        import pandas as pd
+        import pytest
+
+        from ablab.warehouse import load_real_traffic
+
+        self._build_standard(work_dir, sql_dir)
+        self._export(work_dir / "std_source", work_dir / "external")
+        events = pd.read_csv(work_dir / "external" / "event_log.csv").drop(
+            columns=["metric_value"]
+        )
+        events.to_csv(work_dir / "external" / "event_log.csv", index=False)
+        with pytest.raises(ValueError, match="metric_value"):
+            load_real_traffic(
+                work_dir / "external", target_dir=work_dir / "bad", fmt="csv",
+                experiments=self._declarations(),
+            )
+
+    def test_undeclared_variant_is_refused(self, work_dir, sql_dir):
+        import pandas as pd
+        import pytest
+
+        from ablab.warehouse import load_real_traffic
+
+        self._build_standard(work_dir, sql_dir)
+        self._export(work_dir / "std_source", work_dir / "external")
+        exposure = pd.read_csv(work_dir / "external" / "exposure_log.csv")
+        exposure.loc[exposure.index[:5], "variant"] = "holdout"
+        exposure.to_csv(work_dir / "external" / "exposure_log.csv", index=False)
+        with pytest.raises(ValueError, match="变体名"):
+            load_real_traffic(
+                work_dir / "external", target_dir=work_dir / "bad2", fmt="csv",
+                experiments=self._declarations(),
+            )
+
+    def test_generate_false_requires_ingested_files(self, work_dir, sql_dir):
+        import pytest
+
+        (work_dir / "empty").mkdir(parents=True, exist_ok=True)
+        with pytest.raises(FileNotFoundError, match="load_real_traffic"):
+            build_warehouse(
+                db_path=work_dir / "x.duckdb", data_dir=work_dir / "empty",
+                sql_dir=sql_dir, force_data=False, generate=False, verbose=False,
+            )
+
+    def test_external_experiment_validates_declarations(self):
+        import pytest
+
+        from ablab.warehouse import ExternalExperiment
+
+        with pytest.raises(ValueError, match="权重之和"):
+            ExternalExperiment("e", {"control": 0.5, "treatment": 0.3})
+        with pytest.raises(ValueError, match="方向"):
+            ExternalExperiment("e", {"control": 0.5, "treatment": 0.5},
+                               guardrails=(("latency", "sideways", 0.05),))
+
+
 class TestIdempotency:
     def test_rebuild_is_safe(self, work_dir, sql_dir):
         """重复构建不应报错，也不应重复累加数据。"""

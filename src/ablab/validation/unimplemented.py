@@ -132,15 +132,6 @@ ITEMS: tuple[UnimplementedItem, ...] = (
             "合成路径上量过（reports/m6_validation.md 第 7 节，误停率 0.0400）",
         ],
     ),
-    UnimplementedItem(
-        id="no_real_traffic_code",
-        readme_phrase="全部数据都是合成数据",
-        kind="text_absent",
-        target="load_real_traffic",
-        scope="src",
-        when_done="接了真实流量之后，这条要从清单里删掉并改 README",
-        notes=["只钉「没有加载真实流量的入口」，不声称「没有真实数据文件」"],
-    ),
 )
 
 

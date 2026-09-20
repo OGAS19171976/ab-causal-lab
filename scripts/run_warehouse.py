@@ -17,9 +17,12 @@ Python 负责推断（t 检验、置信区间、SRM 体检），
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
 import time
 from pathlib import Path
+
+import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -27,10 +30,12 @@ sys.path.insert(0, str(ROOT / "src"))
 from ablab.reporting import for_report  # noqa: E402
 from ablab.warehouse import (  # noqa: E402
     DEFAULT_EXPERIMENTS,
+    ExternalExperiment,
     WarehouseConfig,
     analyse_ads,
     build_warehouse,
     covariate_adjustment_report,
+    load_real_traffic,
     ratio_replicate_experiments,
     ratio_replicate_experiments_with_lift,
     render_report,
@@ -495,6 +500,100 @@ def main() -> int:
     except Exception as exc:
         emit(f"  （这份数仓里没有簇级实验：{type(exc).__name__}: {exc}）")
 
+    # ---- 8. 真实数据入口：换数据源不改链路 ---------------------------------- #
+    #
+    # 这一节是抽象主张的**可执行版本**：把同一份合成源导出成"外部文件"
+    # （CSV、列顺序打乱、多几列没用的、混一个未声明事件），走
+    # ``load_real_traffic`` 接进来，再用**同一套 SQL** 建一次数仓，
+    # 最后把两次的 ADS 逐行比。数字对得上，才叫「换数据源不改链路」；
+    # 对不上，说明链路里还藏着对合成器形状的假设。
+    emit("\n### 8. 真实数据入口：换数据源不改链路（端到端）")
+    emit("  做法：小规模（n_users=3000）先建一条标准数仓作为对照；")
+    emit("  把它的源数据导出成 CSV（列顺序打乱、多两列设备信息、")
+    emit("  事件表里混一个未声明的 page_view），走 load_real_traffic 接入，")
+    emit("  再用**同一套 SQL**（build_warehouse(generate=False)）建第二条。")
+    emit("")
+
+    ext_root = ROOT / "build" / "ingest_demo"
+    if ext_root.exists():
+        shutil.rmtree(ext_root, ignore_errors=True)
+    ext_root.mkdir(parents=True, exist_ok=True)
+    std_cfg = WarehouseConfig(n_users=3000)
+    std_con = build_warehouse(
+        db_path=ext_root / "std.duckdb", data_dir=ext_root / "std_source",
+        sql_dir=ROOT / "sql", config=std_cfg, force_data=True, verbose=False,
+    )
+    std_ads = std_con.execute(
+        "SELECT experiment, variant, user_cnt, post_sum FROM ads_experiment_result"
+        " ORDER BY experiment, variant"
+    ).df()
+    std_con.close()
+
+    external_dir = ext_root / "external"
+    external_dir.mkdir(parents=True, exist_ok=True)
+    src_dir = ext_root / "std_source"
+    exposure = pd.read_parquet(src_dir / "exposure_log" / "part-0000.parquet")
+    events = pd.read_parquet(src_dir / "event_log" / "part-0000.parquet")
+    profile = pd.read_parquet(src_dir / "user_profile" / "part-0000.parquet")
+    exposure.assign(device="web", app_version="9.9").to_csv(
+        external_dir / "exposure_log.csv", index=False
+    )
+    stray = events.head(500).assign(event_name="page_view", metric_value=1.0)
+    pd.concat([events, stray], ignore_index=True).assign(platform="ios").to_csv(
+        external_dir / "event_log.csv", index=False
+    )
+    profile.assign(country="CN").to_csv(external_dir / "user_profile.csv", index=False)
+
+    ingest_report = load_real_traffic(
+        external_dir,
+        target_dir=ext_root / "external_source",
+        fmt="csv",
+        # **三个实验都要声明**：第一版按"只走单元级链路"把簇级实验滤掉了，
+        # 结果接入时直接报「曝光表里出现了没有声明的实验：exp_city_ctr」——
+        # 这正是"口径必须来自声明"该有的行为（数据里有、声明里没有 = 拦下来）。
+        experiments=tuple(
+            ExternalExperiment(e.name, {"control": 0.5, "treatment": 0.5}, layer=e.layer)
+            for e in DEFAULT_EXPERIMENTS
+        ),
+        metric_event="interaction",
+        guardrail_events=("latency_p99", "complaint_rate"),
+    )
+    for line in ingest_report.summary().splitlines():
+        emit("  " + line)
+    emit("")
+    ext_con = build_warehouse(
+        db_path=ext_root / "external.duckdb",
+        data_dir=ext_root / "external_source",
+        sql_dir=ROOT / "sql",
+        config=std_cfg,
+        generate=False,
+        verbose=False,
+    )
+    ext_ads = ext_con.execute(
+        "SELECT experiment, variant, user_cnt, post_sum FROM ads_experiment_result"
+        " ORDER BY experiment, variant"
+    ).df()
+    ext_con.close()
+
+    merged = std_ads.merge(ext_ads, on=["experiment", "variant"], suffixes=("_std", "_ext"))
+    rel = (
+        (merged["post_sum_ext"] - merged["post_sum_std"]).abs()
+        / merged["post_sum_std"].abs()
+    )
+    emit(f"  {'实验':<14}{'分支':<11}{'用户数':>9}{'Σy（合成）':>16}{'Σy（外部入口）':>17}{'相对差':>11}")
+    for (_, row), r in zip(merged.iterrows(), rel):
+        emit(f"  {row['experiment']:<14}{row['variant']:<11}{int(row['user_cnt_std']):>9}"
+             f"{row['post_sum_std']:>16.4f}{row['post_sum_ext']:>17.4f}{r:>11.2e}")
+    emit("")
+    emit(f"  行数一致 {len(std_ads) == len(ext_ads)}，最大相对差 {rel.max():.2e}"
+         " —— **同一套 SQL，两条完全不同的数据路径，数字到浮点末位相同**。")
+    emit("  这才是「换数据源不改链路」的证据；在这之前那句话只是主张。")
+    emit("  随之而来的三条边界也写在这里：")
+    emit("    · 真实数据**没有 true_lift**（那一列写空）—— 报告里「演示真值」在外部路径上是空的；")
+    emit("    · 变体名/实验名/事件名必须**声明**，不从数据反推：")
+    emit("      曝光里出现未声明的变体名会直接报错，未声明的事件名只报告、")
+    emit("      不会被任何指标读走（DWD 按 event_name 过滤）；")
+    emit("    · 没有 user_profile 时簇级路径不可用（城市/注册日期缺失），其余链路不受影响。")
     emit(f"\n总耗时 {time.perf_counter() - t0:.1f}s")
     con.close()
 

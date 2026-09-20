@@ -130,24 +130,48 @@ def build_warehouse(
     *,
     config: WarehouseConfig | None = None,
     force_data: bool = False,
+    generate: bool = True,
     verbose: bool = True,
 ) -> duckdb.DuckDBPyConnection:
     """建源数据 → 跑四层 SQL → 返回已就绪的 DuckDB 连接。
 
     所有 DDL 都用 ``CREATE OR REPLACE``，因此本函数**幂等**：
     重复调用会原地重建，不会出现"表已存在"的报错，也不会脏读上一次的残留。
+
+    ``generate=False`` 表示**源数据已经在那里了**（由
+    ``warehouse.ingest.load_real_traffic`` 从外部文件接进来的），
+    这一步只跑 SQL。它是"换数据源不改链路"在代码上的落点：
+    真实数据的路径与合成数据的路径到这里就汇合成同一行了。
     """
     cfg = config or WarehouseConfig()
     db_path, data_dir = Path(db_path), Path(data_dir)
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    counts = generate_source_data(data_dir, cfg, force=force_data)
-    if verbose:
-        if "__cached__" in counts:
-            print(f"  [源数据] 复用已有 Parquet: {data_dir}")
-        else:
-            for name, cnt in counts.items():
-                print(f"  [源数据] {name:<20} {cnt:>10,} 行")
+    if generate:
+        counts = generate_source_data(data_dir, cfg, force=force_data)
+        if verbose:
+            if "__cached__" in counts:
+                print(f"  [源数据] 复用已有 Parquet: {data_dir}")
+            else:
+                for name, cnt in counts.items():
+                    print(f"  [源数据] {name:<20} {cnt:>10,} 行")
+    else:
+        # 外部数据路径：**不生成、也不校验指纹**（指纹是给合成器判缓存用的）。
+        # 但要确认文件真的在 —— 否则后面 SQL 会以"文件不存在"的形式失败，
+        # 那个报错读起来像是链路坏了，而不是"你忘了先接入"。
+        required = ("event_log", "exposure_log", "experiment_config")
+        missing = [
+            name
+            for name in required
+            if not any((data_dir / name).glob("*.parquet"))
+        ]
+        if missing:
+            raise FileNotFoundError(
+                f"generate=False 但 {data_dir} 里缺少 {missing} —— "
+                "先调用 warehouse.ingest.load_real_traffic 接入外部数据"
+            )
+        if verbose:
+            print(f"  [源数据] 外部数据（不生成）：{data_dir}")
 
     con = duckdb.connect(str(db_path))
     # threads=4 沿用原值 —— **曾经想改它，但对照实验不支持**。

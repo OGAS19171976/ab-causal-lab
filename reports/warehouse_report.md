@@ -135,7 +135,7 @@ exp_rec_emb 的真实效应是 0（负对照）。如果 post-only 分析给出�
     exp_rec_emb   treatment  Σy=3,418,995.7  Σx=66,747  比值 Σy/Σx=51.223211
 
   实验                    平台比值     平台 SE        独立实现        偏差         p
-  exp_rank_v2       2.297438  0.243832    2.297438  0.00e+00  5.01e-21
+  exp_rank_v2       2.297438  0.243832    2.297438  7.11e-15  5.01e-21
     末次查看 == 主结论：True；监控口径=ratio_delta；查看次数=5
   exp_rec_emb      -0.671170  0.283959   -0.671170  1.42e-14    0.0181
     末次查看 == 主结论：True；监控口径=ratio_delta；查看次数=5
@@ -272,4 +272,41 @@ exp_rec_emb 的真实效应是 0（负对照）。如果 post-only 分析给出�
   所以这里只报「与 post-only 相比方差确实降了」，不声称名义覆盖率；
   簇级 CUPED 的 A/A 校准目前走**合成路径**（reports/m6_validation.md 第 7 节，
   200 次换 salt：误停率 0.0400，Wilson [0.0204, 0.0769] 盖住名义 5%）。
+
+### 8. 真实数据入口：换数据源不改链路（端到端）
+  做法：小规模（n_users=3000）先建一条标准数仓作为对照；
+  把它的源数据导出成 CSV（列顺序打乱、多两列设备信息、
+  事件表里混一个未声明的 page_view），走 load_real_traffic 接入，
+  再用**同一套 SQL**（build_warehouse(generate=False)）建第二条。
+
+  真实数据入口：build/ingest_demo/external → build/ingest_demo/external_source（csv）
+    exposure_log       7,893 行，ds 2026-03-01 ~ 2026-03-21
+    event_log        176,173 行，ds 2026-02-15 ~ 2026-04-03
+    user_profile       3,000 行
+    实验（来自声明）：exp_city_ctr, exp_rank_v2, exp_rec_emb
+    指标事件：interaction, latency_p99, complaint_rate
+    **未声明的事件名**（不会被算进任何指标，但要说出来）：page_view
+    重复曝光 718 行（DWD 按首次曝光去重，这里只是报告数据长什么样）
+    exposure_log 丢掉的多余列：device, app_version
+    event_log 丢掉的多余列：platform
+    user_profile 丢掉的多余列：country
+    · 未声明的事件名**不会**被任何指标读走（DWD 按 event_name 过滤），列在这里是为了让你核对它们该不该被声明
+    · 写成与合成器一致的落地布局 ⇒ 下游 SQL 一行不用改；true_lift 全部为空（真实数据没有演示真值）
+
+  实验            分支               用户数          Σy（合成）         Σy（外部入口）        相对差
+  exp_city_ctr  control         1584     897722.2192      897722.2192   2.59e-16
+  exp_city_ctr  treatment       1416     827982.5329      827982.5329   2.81e-16
+  exp_rank_v2   control         1222     692047.7221      692047.7221   3.36e-16
+  exp_rank_v2   treatment       1214     716327.9987      716327.9987   1.63e-16
+  exp_rec_emb   control          868     503735.4536      503735.4536   1.16e-16
+  exp_rec_emb   treatment        871     497754.6880      497754.6880   2.34e-16
+
+  行数一致 True，最大相对差 3.36e-16 —— **同一套 SQL，两条完全不同的数据路径，数字到浮点末位相同**。
+  这才是「换数据源不改链路」的证据；在这之前那句话只是主张。
+  随之而来的三条边界也写在这里：
+    · 真实数据**没有 true_lift**（那一列写空）—— 报告里「演示真值」在外部路径上是空的；
+    · 变体名/实验名/事件名必须**声明**，不从数据反推：
+      曝光里出现未声明的变体名会直接报错，未声明的事件名只报告、
+      不会被任何指标读走（DWD 按 event_name 过滤）；
+    · 没有 user_profile 时簇级路径不可用（城市/注册日期缺失），其余链路不受影响。
 ```

@@ -169,7 +169,17 @@ CLAIMS: list[tuple[str, str, str]] = [
     ("治理·决策层：护栏能停实验", "governance_report.md", "决策层：护栏触发"),
     ("治理·决策层：服务端复核", "governance_report.md", "服务端自己复核"),
     ("治理·没做清单：检查器会抓过时声明", "governance_report.md", "没做」的清单"),
-    ("治理·没做清单：8 条机检", "governance_report.md", "机检 8 条"),
+    ("治理·没做清单：7 条机检", "governance_report.md", "机检 7 条"),
+    # 真实数据入口（warehouse 报告第 8 节）：数值稳定（不随 --quick 变）
+    ("数仓·真实数据入口：两条路径数字相同",
+     "warehouse_report.md", "两条完全不同的数据路径"),
+    # 最大相对差**不写进数值类声明**：它是浮点末位噪声，每次跑都可能变
+    # （实测 2.81e-16 / 3.47e-16）。这与 M5 三路径最大偏差那条同一个理由 ——
+    # 把漂移的数写进清单，检查器就会随机变红（第 31 条）。
+    ("数仓·真实数据入口：最大相对差（量级口径）",
+     "warehouse_report.md", "最大相对差"),
+    ("数仓·真实数据入口：true_lift 在外部路径上为空",
+     "warehouse_report.md", "真实数据没有演示真值"),
     # 少簇推断（m6 7b 节）：该节n与重复数随 --quick 变，所以只加文本类声明。
     ("M6·少簇：wild cluster bootstrap 已实现",
      "m6_validation.md", "CR1 到底有多过度拒绝"),

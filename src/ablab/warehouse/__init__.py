@@ -30,8 +30,16 @@ from .generate import (
     ratio_replicate_experiments,
     ratio_replicate_experiments_with_lift,
 )
+from .ingest import (
+    ExternalExperiment,
+    IngestReport,
+    load_real_traffic,
+)
 
 __all__ = [
+    "ExternalExperiment",
+    "IngestReport",
+    "load_real_traffic",
     "SQL_ORDER",
     "CrossValidation",
     "CovariateAdjustmentReport",
