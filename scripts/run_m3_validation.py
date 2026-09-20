@@ -598,14 +598,22 @@ def main() -> int:
     emit(f"    · **MSE 最优带宽是给点估计的**：同一个带宽下朴素区间覆盖率 "
          f"{rdd_audit.estimators['朴素·plug-in h']['覆盖率']:.4f}，"
          f"换成 2h 掉到 {rdd_audit.estimators['朴素·2h']['覆盖率']:.4f}；")
-    emit(f"    · **偏差校正只修了一半**（这是判据被实测改写的那一条）："
+    emit(f"    · **偏差校正 + 稳健方差**（上一轮记下的欠账在这一轮补完了）："
          f"校正把偏差从 {rdd_audit.estimators['朴素·plug-in h']['偏差']:+.4f} 压到 "
-         f"{rdd_audit.estimators['CCT 偏差校正']['偏差']:+.4f}，"
-         f"但覆盖率 **{rdd_audit.estimators['CCT 偏差校正']['覆盖率']:.4f}** 反而低于"
-         f"朴素区间 {rdd_audit.estimators['朴素·plug-in h']['覆盖率']:.4f} ——")
-    emit("      因为这次只减了偏差，方差还是校正前那个，而偏差是**估**出来的；")
-    emit("      CCT 之所以要另给一个稳健方差，正是因为这个。本仓库没做那一步，")
-    emit("      所以如实报出来，而不是把「校正后覆盖率应该更好」写进结论；")
+         f"{rdd_audit.estimators['CCT 校正·稳健方差']['偏差']:+.4f}，"
+         f"覆盖率从 {rdd_audit.estimators['朴素·plug-in h']['覆盖率']:.4f} 回到 "
+         f"**{rdd_audit.estimators['CCT 校正·稳健方差']['覆盖率']:.4f}**；")
+    emit("      而**同一个点估计**只换方差（不算「估偏差」那一块）是 "
+         f"{rdd_audit.estimators['CCT 校正·常规方差']['覆盖率']:.4f} —— "
+         "少算的方差就是少掉的覆盖率。")
+    emit("      代价写在表里：SE 从 "
+         f"{rdd_audit.estimators['朴素·plug-in h']['平均 SE']:.4f} 涨到 "
+         f"{rdd_audit.estimators['CCT 校正·稳健方差']['平均 SE']:.4f}；")
+    emit("      偏差带宽 b 也有置换（见上面那张小表），默认取 b=h 是**量出来的**：")
+    emit("      b 越大区间越短、覆盖率越低。")
+    emit("      做法不是手推那些 Γ/Λ/Ω 矩阵，而是把校正后的估计写成数据的线性泛函")
+    emit("      （组合影响函数）再做三明治 —— 于是 Var(偏差估计) 与它与 τ̂ 的协方差")
+    emit("      **自动**进来，不用推也就不会推错；与 bootstrap 的核对见测试。")
     emit(f"    · **操纵检验两端都量**：密度连续时误报率 "
          f"{rdd_audit.manipulation['误报率']:.4f}，有人把单元挪过线时检出率 "
          f"{rdd_audit.manipulation['检出率（有人挪过线）']:.4f}。")

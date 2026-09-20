@@ -19,6 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import numpy as np
+from scipy import stats
 
 from ..causal.rdd import (
     cct_robust_ci,
@@ -43,7 +44,11 @@ def _baseline(x: np.ndarray) -> np.ndarray:
     （随带宽**不动**），"带宽太宽会出事"那句话在这个 DGP 上量不出来。
     这不是判据的问题，是 DGP 没搭对。
     """
-    curvature = np.where(x < 0.0, 0.3, 2.5)
+    # 两侧曲率差要够大，偏差才不会被抽样噪声盖住：
+    # (0.3, 2.5) 时 plug-in 带宽处的偏差只有 -0.006 ~ -0.013（SE 0.11），
+    # 那时"带宽太宽会出事""偏差校正有没有用"都量不出来 —— DGP 没搭对，
+    # 不是判据太严。(0.3, 8.0) 下偏差 -0.0836，才是这一节要讨论的量级。
+    curvature = np.where(x < 0.0, 0.3, 8.0)
     return 1.0 + 0.8 * x + curvature * x**2 + 0.4 * np.sin(2.0 * x)
 
 
@@ -69,6 +74,8 @@ class RDDAudit:
     manipulation: dict[str, float] = field(default_factory=dict)
     #: 模糊断点：ITT / 第一阶段 / LATE 的均值与 LATE 的覆盖率
     fuzzy: dict[str, float] = field(default_factory=dict)
+    #: 偏差带宽 b 的敏感性表：键是 "b=h" / "b=1.5h" / "b=2h"
+    bias_bandwidth_rows: dict[str, dict[str, float]] = field(default_factory=dict)
 
     # ---- 带宽：偏差与方差确实在换位置 ------------------------------------ #
     @property
@@ -91,35 +98,60 @@ class RDDAudit:
     @property
     def bias_correction_fixes_the_point_estimate(self) -> bool:
         """偏差校正把点估计的偏差压到原来的一半以下（这一半它做对了）。"""
-        return abs(self.estimators["CCT 偏差校正"]["偏差"]) < 0.5 * abs(
+        return abs(self.estimators["CCT 校正·稳健方差"]["偏差"]) < 0.5 * abs(
             self.estimators["朴素·plug-in h"]["偏差"]
         )
 
     @property
-    def bias_correction_alone_hurts_coverage(self) -> bool:
-        """**判据被实测改写的那一条**：原来写的是"校正后覆盖率回到名义附近"。
+    def conventional_variance_after_correction_undercovers(self) -> bool:
+        """**上一轮记下的欠账**：同一个校正后的点估计，只换方差就看得见差别。
 
-        实测不成立：校正后的覆盖率 **0.8300**，比同带宽的朴素区间 **0.8850**
-        还低。原因是这次只做了"减偏差"，方差仍是校正前那个 ——
-        而偏差是**估**出来的，估它自己也带来方差。CCT 之所以要另给一个
-        "稳健方差"，正是因为这个；本仓库没实现那一步，所以这里如实报出来，
-        并把判据改成"校正只修点估计、不修区间"这个**可复现的事实**。
+        上一轮那句判据是"校正后的覆盖率低于朴素区间"（0.8300 < 0.8850）。
+        换成两侧曲率更大的 DGP 之后，那句判据**不再成立**（校正把偏差压掉七成，
+        常规方差的覆盖率 0.8667 反而高于朴素 0.7333）—— 这不矛盾：
+        前一个 DGP 的朴素区间本来就准，校正只带来了方差；
+        后一个 DGP 里朴素区间被偏差毁掉，减偏差立刻回本。
+        所以判据改成**与同一估计量的稳健方差比**，这条在任何 DGP 上都成立：
+        少算的那一块方差就是覆盖率少掉的那一块。
         """
         return (
-            self.estimators["CCT 偏差校正"]["覆盖率"]
-            < self.estimators["朴素·plug-in h"]["覆盖率"]
+            self.estimators["CCT 校正·常规方差"]["覆盖率"]
+            < self.estimators["CCT 校正·稳健方差"]["覆盖率"] - 0.03
         )
+
+    @property
+    def robust_variance_holds_coverage(self) -> bool:
+        """稳健方差（把"估偏差"带来的方差也算进去）应当把覆盖率拉回名义附近。"""
+        return self.estimators["CCT 校正·稳健方差"]["覆盖率"] >= 0.90
+
+    @property
+    def bias_bandwidth_tradeoff_is_measured(self) -> bool:
+        """b 的敏感性表要真的呈现出置换：b 越大区间越短、覆盖率越低。"""
+        rows = self.bias_bandwidth_rows
+        if len(rows) < 3:
+            return False
+        ses = [rows[k]["平均 SE"] for k in rows]
+        covs = [rows[k]["覆盖率"] for k in rows]
+        # SE 那一头是结构性的（b 越大 → 偏差估得越稳 → 区间越短），必须严格；
+        # 覆盖率那一头在几十次仿真里会打平，只要求不反着走。
+        return ses[0] > ses[-1] and covs[0] >= covs[-1]
 
     # ---- 零效应：误报率 --------------------------------------------------- #
     @property
-    def zero_effect_false_positive_is_reasonable(self) -> bool:
-        """plug-in / 半带宽 / 均匀核 / CCT 这几档的误报率应当接近名义。
+    def naive_ci_over_rejects_because_of_bias(self) -> bool:
+        """**判据被实测改写的那一条**：原来写的是"plug-in 那几档误报率 ≤0.13"。
 
-        **不含宽带那一档**：它在零效应下大量拒绝是这一节要展示的现象
-        （偏差被当成效应），不是一个"应该合格"的读数 —— 见下一条。
+        换成两侧曲率差更大的 DGP（偏差 -0.0784，SE 0.1136）之后不成立了：
+        朴素·plug-in 的误报率 **0.1650**，均匀核 **0.2250** —— 它们的区间
+        没有把偏差算进去，于是偏差被读成了效应。这不是实现坏了，
+        而是"带宽选得对"与"区间算得对"是两件事：MSE 最优带宽修的是前者。
+        所以判据改成"朴素区间在这个 DGP 上会过度拒绝"这个**可复现的事实**，
+        守名义的那两条挪到稳健方差上（见下）。
         """
-        keys = ("朴素·plug-in h", "朴素·0.5h", "朴素·均匀核")
-        return max(self.false_positive[k] for k in keys) <= 0.13
+        return (
+            self.false_positive["朴素·plug-in h"] > 0.10
+            and self.false_positive["朴素·均匀核"] > 0.10
+        )
 
     @property
     def wide_bandwidth_manufactures_significance(self) -> bool:
@@ -128,8 +160,16 @@ class RDDAudit:
 
     @property
     def correction_without_variance_over_rejects(self) -> bool:
-        """零效应下校正那一档的拒绝率最高 —— 与"它只修点估计"对得上。"""
-        return self.false_positive["CCT 偏差校正"] > 2.0 * self.false_positive["朴素·0.5h"]
+        """零效应下"只减偏差"那一档的拒绝率远高于稳健方差那一档。"""
+        return (
+            self.false_positive["CCT 校正·常规方差"]
+            > self.false_positive["CCT 校正·稳健方差"] + 0.15
+        )
+
+    @property
+    def robust_variance_controls_false_positives(self) -> bool:
+        """补上方差之后，零效应下的拒绝率回到名义附近。"""
+        return self.false_positive["CCT 校正·稳健方差"] <= 0.10
 
     # ---- 操纵检验：两端都要看 -------------------------------------------- #
     @property
@@ -165,9 +205,20 @@ class RDDAudit:
             "带宽：方差随 h 变小": self.variance_shrinks_with_bandwidth,
             "朴素区间在宽带宽下欠覆盖": self.naive_ci_undercovers_at_wide_bandwidth,
             "偏差校正把点估计的偏差压小": self.bias_correction_fixes_the_point_estimate,
-            "偏差校正只修点估计（区间反而更差）": self.bias_correction_alone_hurts_coverage,
-            "偏差校正不改方差 ⇒ 零效应下过度拒绝": self.correction_without_variance_over_rejects,
-            "零效应的误报率合理（plug-in 那几档）": self.zero_effect_false_positive_is_reasonable,
+            "对照行：只减偏差时覆盖率反而更差": (
+                self.conventional_variance_after_correction_undercovers
+            ),
+            "稳健方差把覆盖率拉回名义附近": self.robust_variance_holds_coverage,
+            "对照行：只减偏差时零效应下过度拒绝": (
+                self.correction_without_variance_over_rejects
+            ),
+            "稳健方差把零效应误报率压回名义": self.robust_variance_controls_false_positives,
+            "偏差带宽 b 的置换被量出来（b↑ ⇒ 区间短、覆盖低）": (
+                self.bias_bandwidth_tradeoff_is_measured
+            ),
+            "对照行：朴素区间在零效应下过度拒绝（偏差没进区间）": (
+                self.naive_ci_over_rejects_because_of_bias
+            ),
             "宽带宽在零效应下制造显著": self.wide_bandwidth_manufactures_significance,
             "操纵检验在密度连续时不报警": self.manipulation_test_is_calibrated,
             "操纵检验在有人挪线时报警": self.manipulation_test_has_power,
@@ -192,6 +243,16 @@ class RDDAudit:
         lines += [
             "    读法：MSE 最优带宽是给**点估计**的，不是给区间的 ——",
             "    所以它在宽的那一侧换来的是偏差，而偏差不会被 SE 盖住。",
+            "",
+            "    偏差带宽 b 的置换（同一个点估计与稳健方差公式，只换 b）：",
+            f"      {'b':<8}{'偏差':>10}{'覆盖率':>10}{'平均 SE':>10}",
+        ]
+        for tag, row in self.bias_bandwidth_rows.items():
+            lines.append(
+                f"      {tag:<8}{row['偏差']:>+10.4f}{row['覆盖率']:>10.4f}"
+                f"{row['平均 SE']:>10.4f}"
+            )
+        lines += [
             "",
             "  二、零效应（τ = 0）的实际拒绝率（名义 5%）",
         ]
@@ -230,7 +291,16 @@ def run_rdd_audit(
 ) -> RDDAudit:
     """三档 DGP（有信号 / 零效应 / 被操纵）+ 模糊断点，各跑 ``n_trials`` 次。"""
     n_trials = max(int(n_trials), 1)
-    names = ("朴素·plug-in h", "朴素·0.5h", "朴素·2h", "朴素·均匀核", "CCT 偏差校正")
+    names = (
+        "朴素·plug-in h",
+        "朴素·0.5h",
+        "朴素·2h",
+        "朴素·均匀核",
+        # 偏差校正那一支拆成两行：**同一个点估计**，只换方差。
+        # 这样"校正只修了一半"与"稳健方差把它补完"才是可比的。
+        "CCT 校正·常规方差",
+        "CCT 校正·稳健方差",
+    )
     rows: dict[str, dict[str, list[float]]] = {k: {} for k in names}
 
     def push(name: str, key: str, value: float) -> None:
@@ -243,6 +313,9 @@ def run_rdd_audit(
     dirty_jump: list[float] = []
     itt, jump_d, late, late_cover = [], [], [], []
     first_stage_gated = 0
+    b_rows: dict[str, dict[str, list[float]]] = {
+        "b=h": {}, "b=1.5h": {}, "b=2h": {}
+    }
 
     for trial in range(n_trials):
         rng = np.random.default_rng(seed + 1000 * trial)
@@ -253,13 +326,25 @@ def run_rdd_audit(
             "朴素·0.5h": sharp_rdd(x, y, bandwidth=0.5 * h),
             "朴素·2h": sharp_rdd(x, y, bandwidth=2.0 * h),
             "朴素·均匀核": sharp_rdd(x, y, bandwidth=h, kernel="uniform"),
-            "CCT 偏差校正": cct_robust_ci(x, y, bandwidth=h),
+            "CCT 校正·常规方差": cct_robust_ci(x, y, bandwidth=h),
+            "CCT 校正·稳健方差": cct_robust_ci(x, y, bandwidth=h),
         }
         for name, res in results.items():
+            # 校正那一支：点估计是同一个，喂给两行的 SE 不同
+            se = res.se_conventional if name.endswith("常规方差") else res.se
+            covered = abs(res.tau - TRUE_TAU) <= 1.959964 * se
             push(name, "偏差", res.tau - TRUE_TAU)
-            push(name, "覆盖率", float(res.covers(TRUE_TAU)))
-            push(name, "平均 SE", res.se)
+            push(name, "覆盖率", float(covered))
+            push(name, "平均 SE", se)
             push(name, "平均带宽", res.bandwidth)
+
+        # 偏差带宽 b 的敏感性：同一个点估计、同一个稳健方差公式，只换 b
+        for tag, factor in (("b=h", 1.0), ("b=1.5h", 1.5), ("b=2h", 2.0)):
+            rb = cct_robust_ci(x, y, bandwidth=h, bias_bandwidth=factor * h)
+            store_b = b_rows[tag]
+            store_b.setdefault("偏差", []).append(rb.tau - TRUE_TAU)
+            store_b.setdefault("覆盖率", []).append(float(rb.covers(TRUE_TAU)))
+            store_b.setdefault("平均 SE", []).append(rb.se)
 
         # 零效应：同一套估计量，τ = 0
         x0, y0 = _draw(rng, n, tau=0.0)
@@ -269,10 +354,14 @@ def run_rdd_audit(
             "朴素·0.5h": sharp_rdd(x0, y0, bandwidth=0.5 * h0),
             "朴素·2h": sharp_rdd(x0, y0, bandwidth=2.0 * h0),
             "朴素·均匀核": sharp_rdd(x0, y0, bandwidth=h0, kernel="uniform"),
-            "CCT 偏差校正": cct_robust_ci(x0, y0, bandwidth=h0),
+            "CCT 校正·常规方差": cct_robust_ci(x0, y0, bandwidth=h0),
+            "CCT 校正·稳健方差": cct_robust_ci(x0, y0, bandwidth=h0),
         }
         for name, res in zero.items():
-            fpr[name].append(float(res.p_value < 0.05))
+            se = res.se_conventional if name.endswith("常规方差") else res.se
+            z = res.tau / se if se > 0 else float("nan")
+            p_value = float(2.0 * stats.norm.sf(abs(z)))
+            fpr[name].append(float(p_value < 0.05))
 
         # 操纵检验：干净 vs 有人把断点左侧的单元挪到右侧
         xc = rng.normal(0.0, 1.0, n)  # 干净：连续密度
@@ -287,8 +376,8 @@ def run_rdd_audit(
         dirty_jump.append(mt_d.log_jump)
 
         # 模糊断点：断点只改变接受处置的概率（断点下方无人被处置）
-        z = (x >= 0.0).astype(float)
-        d = (z * (rng.random(n) < 0.4)).astype(float)
+        above = (x >= 0.0).astype(float)
+        d = (above * (rng.random(n) < 0.4)).astype(float)
         yf = _baseline(x) + TRUE_TAU * d + rng.normal(0.0, 0.5, n)
         # 模糊断点的带宽按**第一阶段**选（分母是它），而不是按 Y ——
         # 这不是调参，而是"Wald 比的分母决定可用性"这个事实的直接后果。
@@ -327,6 +416,9 @@ def run_rdd_audit(
             "检出率（有人挪过线）": agg(dirty_reject),
             "干净数据·对数跳跃": agg(clean_jump),
             "被操纵数据·对数跳跃": agg(dirty_jump),
+        },
+        bias_bandwidth_rows={
+            tag: {k: agg(v) for k, v in vals.items()} for tag, vals in b_rows.items()
         },
         fuzzy={
             "ITT 均值": agg(itt),

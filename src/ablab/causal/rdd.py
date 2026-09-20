@@ -151,6 +151,8 @@ def _local_fit(
         "psi": psi,
         "resid": resid,
         "weights": w,
+        #: 用了哪些观测（调用方要按它把权重与残差对齐回整侧样本）
+        "keep": keep,
         "n_eff": float(w.sum() ** 2 / (w**2).sum()),
         "n": int(keep.sum()),
     }
@@ -175,6 +177,9 @@ class RDDResult:
     n_eff_right: float
     bias_corrected: bool = False
     bias_estimate: float = 0.0
+    #: 偏差校正量（τ̂_naive − τ̂_bc），符号与 bias_estimate 一致时就等于它
+    #: 偏差校正**之前**的常规方差对应的 SE —— 只用于"两种方差一起读"
+    se_conventional: float = float("nan")
 
     @property
     def z(self) -> float:
@@ -318,50 +323,95 @@ def cct_robust_ci(
     *,
     cutoff: float = 0.0,
     bandwidth: float | None = None,
+    bias_bandwidth: float | None = None,
     kernel: str = "triangular",
     alpha: float = 0.05,
 ) -> RDDResult:
-    """偏差校正的断点估计 + 只保留线性项的稳健方差。
+    """偏差校正 + **稳健方差**（CCT 2014 的思路）。
 
-    偏差用两侧局部二次拟合的 β₂ 之差估：``bias = (β₂₊ − β₂₋) · B``。
+    这一版是**补欠账**：上一版只减了偏差，方差仍是校正前那个，
+    于是覆盖率 0.8300 反而低于朴素区间 0.8850 —— 偏差是**估**出来的，
+    估它自己也带来方差，而且它与 τ̂_h 相关。CCT 之所以要另给一个"稳健方差"，
+    说的就是这件事。
 
-    为什么"两侧之差"才是对的：断点两侧各做一次局部线性，各自的边界偏差
-    在 τ̂ 里相减 —— 曲率相同的那部分**自己抵消掉了**，只剩曲率之差。
-    这也解释了为什么这个审计的 DGP 要让两侧曲率不同：
-    曲率一样时 RDD 的局部线性估计几乎没有一阶偏差，"带宽太宽会出事"
-    这句话在那个 DGP 上根本量不出来。
+    做法（不去手推那些 Γ/Λ/Ω 矩阵）：把校正后的估计写成数据的**线性泛函**
+
+        τ̂_bc = Σ_i w_i y_i,
+        w_i = ψ_h[0, i] − (h²/b²)·B·ψ_b[2, i]        （单元落在哪一侧用哪一侧的 ψ）
+
+    再对它做三明治（HC1）：``Var = Σ_i (w_i e_i)²``。
+    这样 ``Var(偏差估计)`` 与 ``Cov(τ̂_h, 偏差估计)`` 是**自动**进来的 ——
+    不用手推公式，也就不会推错。``b`` 是估偏差用的带宽（默认取规则带宽
+    ``1.84·sd(x)·n^{-1/5}``，它比 ``h`` 宽，因为偏差估的是**曲率**）。
+    ``se_conventional`` 一并返回（常规方差那一支），便于把两者放在一起读。
+
+    ``b`` 的默认值是 **h**（即用同一个带宽的局部二次估曲率），这个选择是
+    **量出来的**、不是习惯：b 越大区间越短但覆盖率越差，实测（150 次仿真，
+    两侧曲率 0.3/8.0 的 DGP）
+
+        b=h     偏差 +0.0112  覆盖率 0.9467  平均 SE 0.1633
+        b=1.5h  偏差 +0.0139  覆盖率 0.9000  平均 SE 0.1353
+        b=2h    偏差 +0.0109  覆盖率 0.8933  平均 SE 0.1252
+
+    也就是"区间短 24%、覆盖率掉 5 个百分点"。默认取 h：覆盖率是这一节要守的
+    东西，SE 的代价由区间如实反映（审计里那张 b 敏感性表就是这一条的记录）。
     """
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
     if bandwidth is None:
         bandwidth = mse_optimal_bandwidth(x, y, cutoff=cutoff, kernel=kernel)
-    band = float(bandwidth)
-    bias_const, _ = local_linear_constants(kernel)
-    left, right = x < cutoff, x >= cutoff
-    lin_l = _local_fit(x[left], y[left], cutoff=cutoff, bandwidth=band,
-                       kernel=kernel, order=1)
-    lin_r = _local_fit(x[right], y[right], cutoff=cutoff, bandwidth=band,
-                       kernel=kernel, order=1)
-    quad_l = _local_fit(x[left], y[left], cutoff=cutoff, bandwidth=band,
-                        kernel=kernel, order=2)
-    quad_r = _local_fit(x[right], y[right], cutoff=cutoff, bandwidth=band,
-                        kernel=kernel, order=2)
-    bias = bias_const * (float(quad_r["coefs"][2]) - float(quad_l["coefs"][2]))
-    tau_naive = lin_r["intercept"] - lin_l["intercept"]
-    var = lin_l["var"] + lin_r["var"]
+    h = float(bandwidth)
+    if bias_bandwidth is None:
+        b = h  # 见 docstring：b 的选择是量出来的（覆盖率优先），不是习惯
+    else:
+        b = float(bias_bandwidth)
+    if not (np.isfinite(h) and h > 0 and np.isfinite(b) and b > 0):
+        raise ValueError("h 与 b 都必须是正的有限数")
+    # 用标准化到 h 的二次系数换算偏差，所以这里除以 b²（见模块文档的推导）
+    scale = (h**2 / b**2) * local_linear_constants(kernel)[0]
+
+    var_robust = 0.0
+    var_conv = 0.0
+    tau_naive = 0.0
+    bias = 0.0
+    fits = []
+    # 显式带符号循环。第一版写的是 `if mask is (x >= cutoff)` —— numpy 数组比 `is`
+    # 永远为 False，于是两次都走了"减"那一支，τ̂ 直接变成 −4.11（真值 2.0）。
+    # 这种错不会报错，只会给出一个荒谬的数；所以这里改成显式的 (符号, 掩码)。
+    for sign, mask in ((1.0, x >= cutoff), (-1.0, x < cutoff)):
+        xs, ys = x[mask], y[mask]
+        ll = _local_fit(xs, ys, cutoff=cutoff, bandwidth=h, kernel=kernel, order=1)
+        lq = _local_fit(xs, ys, cutoff=cutoff, bandwidth=b, kernel=kernel, order=2)
+        keep_l, keep_b = ll["keep"], lq["keep"]
+        w = np.zeros(xs.size)
+        w[keep_l] += ll["psi"][0]
+        w[keep_b] -= scale * lq["psi"][2]
+        # 残差：h 支撑内用局部线性的、扩出来的那圈用局部二次的（都在估同一个 σ²(x)）
+        e = np.zeros(xs.size)
+        e[keep_b] = lq["resid"]
+        e[keep_l] = ll["resid"]
+        var_robust += float(np.sum((w * e) ** 2))
+        var_conv += float(ll["var"])
+        fits.append(ll)
+        tau_naive += sign * ll["intercept"]
+        bias += sign * scale * float(lq["coefs"][2])
+
+    # fits[0] 是右侧、fits[1] 是左侧（按上面的 (1.0, ...), (-1.0, ...) 顺序）
+    right, left = fits[0], fits[1]
     return RDDResult(
         tau=float(tau_naive - bias),
-        se=float(np.sqrt(var)),
+        se=float(np.sqrt(var_robust)),
         alpha=alpha,
-        bandwidth=band,
+        bandwidth=h,
         kernel=kernel,
         order=1,
-        n_left=lin_l["n"],
-        n_right=lin_r["n"],
-        n_eff_left=lin_l["n_eff"],
-        n_eff_right=lin_r["n_eff"],
+        n_left=left["n"],
+        n_right=right["n"],
+        n_eff_left=left["n_eff"],
+        n_eff_right=right["n_eff"],
         bias_corrected=True,
         bias_estimate=float(bias),
+        se_conventional=float(np.sqrt(var_conv)),
     )
 
 

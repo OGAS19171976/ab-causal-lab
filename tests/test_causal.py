@@ -1858,6 +1858,41 @@ class TestRegressionDiscontinuity:
         with pytest.raises(ValueError, match="样本不足"):
             sharp_rdd(x, y, bandwidth=1e-6)
 
+    def test_robust_variance_matches_the_bootstrap(self):
+        """稳健方差 = 组合影响函数的三明治 —— 用重抽单元的 bootstrap 独立核对。
+
+        这条测的是"多算的那一块方差是不是算对了"：差值（0.1476 vs bootstrap
+        0.1473）比任何公式推导都直接。常规方差**必须更小**：它没把
+        "估偏差"那一项算进去，这正是上一轮记下的那笔欠账。
+        """
+        from ablab.causal.rdd import cct_robust_ci, mse_optimal_bandwidth
+
+        x, y = self._data(n=2000, kink=True, seed=5)
+        h = mse_optimal_bandwidth(x, y)
+        res = cct_robust_ci(x, y, bandwidth=h)
+        assert res.se > res.se_conventional
+        rng = np.random.default_rng(0)
+        taus = [
+            cct_robust_ci(
+                x[idx], y[idx], bandwidth=h
+            ).tau
+            for idx in (rng.integers(0, x.size, x.size) for _ in range(120))
+        ]
+        boot = float(np.std(taus, ddof=1))
+        assert 0.6 * boot < res.se < 1.6 * boot, (res.se, boot)
+
+    def test_bias_bandwidth_changes_the_interval(self):
+        """b 越大区间越短（覆盖率那一头由审计量）。"""
+        from ablab.causal.rdd import cct_robust_ci, mse_optimal_bandwidth
+
+        x, y = self._data(n=3000, kink=True, seed=7)
+        h = mse_optimal_bandwidth(x, y)
+        narrow = cct_robust_ci(x, y, bandwidth=h, bias_bandwidth=h)
+        wide = cct_robust_ci(x, y, bandwidth=h, bias_bandwidth=2.0 * h)
+        assert wide.se < narrow.se
+        with pytest.raises(ValueError, match="正的有限数"):
+            cct_robust_ci(x, y, bandwidth=h, bias_bandwidth=-1.0)
+
     def test_audit_properties_on_a_small_run(self):
         """审计本体（小规模）：带宽置换与两个前提都要看得见。"""
         from ablab.validation.rdd_audit import run_rdd_audit
@@ -1866,6 +1901,9 @@ class TestRegressionDiscontinuity:
         passed = audit.passed()
         assert passed["带宽：偏差随 h 变大"]
         assert passed["带宽：方差随 h 变小"]
+        assert passed["稳健方差把覆盖率拉回名义附近"]
+        assert passed["对照行：只减偏差时覆盖率反而更差"]
+        assert passed["偏差带宽 b 的置换被量出来（b↑ ⇒ 区间短、覆盖低）"]
         assert passed["操纵检验在有人挪线时报警"]
         assert passed["模糊断点：ITT 被稀释"]
         # 误报率是个比例，30 次里只能要个量级
