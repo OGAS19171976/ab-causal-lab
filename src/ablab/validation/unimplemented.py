@@ -59,18 +59,14 @@ class UnimplementedItem:
 
 
 #: 清单本体。**只放能机检的**；无法机检的归到人工核对，不混进来充数。
+#:
+#: 现在的状态：**空**。曾经挂在里面的五条（簇级 CUPED、M2 决策层、数仓比值链路、
+#: mSPRT 的 tau、时间安慰剂、非线性敏感性、策略学习、RDD）都被做出来了，
+#: 每一次都是这条检查先把 README 顶红、再改文档 —— 清单空着不是"没有未做事项"，
+#: 而是"所有**能机检**的未做事项都被清掉了"；剩下三条无法机检的见
+#: ``human_reviewed_notes()``。清单空着也意味着检查器现在抓不到新的过时声明，
+#: 所以新增"没做"时**照旧要往这里加一条**，否则那句话又回到没人管的状态。
 ITEMS: tuple[UnimplementedItem, ...] = (
-    UnimplementedItem(
-        id="rdd",
-        readme_phrase="断点回归还没有",
-        kind="symbol_absent",
-        target="ablab.causal.rdd",
-        # IV 那一半已经做出来了（ablab.causal.iv，见 m3 报告 2.8 节），
-        # 所以这条从 "IV/RDD" 收窄成 "RDD"；锚点换成 iv 是为了钉住
-        # "模块还在、只是 RDD 那一半没做"，避免改名骗过检查。
-        anchor_present="ablab.causal.iv",
-        when_done="README 的 M3 那条要改成「已实现 RDD」，并补验收证据",
-    ),
 )
 
 

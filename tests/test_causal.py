@@ -1731,6 +1731,147 @@ class TestSensitivity:
 # --------------------------------------------------------------------------- #
 # 审计（仿真）
 # --------------------------------------------------------------------------- #
+class TestRegressionDiscontinuity:
+    """断点回归：先钉住"核常数算对了"，再钉住带宽置换与两个前提。"""
+
+    @staticmethod
+    def _data(
+        n: int = 8000,
+        *,
+        tau: float = 2.0,
+        kink: bool = False,
+        noise: float = 0.5,
+        seed: int = 0,
+    ):
+        rng = np.random.default_rng(seed)
+        x = rng.uniform(-1.0, 1.0, n)
+        curvature = np.where(x < 0.0, 0.3, 2.5) if kink else 0.6
+        base = 1.0 + 0.8 * x + curvature * x**2 + 0.4 * np.sin(2.0 * x)
+        y = base + tau * (x >= 0.0)
+        if noise > 0:
+            y = y + rng.normal(0.0, noise, n)
+        return x, y
+
+    def test_kernel_constants_match_hand_calculation(self):
+        """核矩是数值积分算的 —— 必须能对上三角核的手算值（B=-0.1, Vc=4.8）。
+
+        这一条是防"抄错常数"的：常数错了没有任何别的东西会报错，
+        只会让 SE 悄悄差几倍。第一版确实把口径写成了内部问题（Vc=0.667）。
+        """
+        from ablab.causal.rdd import local_linear_constants
+
+        b_tri, v_tri = local_linear_constants("triangular")
+        assert b_tri == pytest.approx(-0.1, abs=1e-6)
+        assert v_tri == pytest.approx(4.8, abs=1e-6)
+        b_uni, v_uni = local_linear_constants("uniform")
+        assert b_uni == pytest.approx(-1.0 / 6.0, abs=1e-6)
+        assert v_uni == pytest.approx(4.0, abs=1e-6)
+
+    def test_sharp_rdd_recovers_the_jump(self):
+        from ablab.causal.rdd import sharp_rdd
+
+        x, y = self._data(n=20000)
+        res = sharp_rdd(x, y)
+        assert abs(res.tau - 2.0) < 3.0 * res.se
+        assert res.covers(2.0)
+        assert res.bandwidth > 0
+        assert res.n_left > 0 and res.n_right > 0
+
+    def test_bandwidth_tradeoff_in_both_directions(self):
+        """带宽换的是偏差与方差：SE 随 h 单调下降，|偏差| 随 h 上升。
+
+        偏差那一头要**跨种子平均**才看得见：h 处的偏差量级只有 0.02，
+        而单次抽样的 SE 有 0.06 —— 拿一次实现比 |偏差|，比的是噪声。
+        """
+        from ablab.causal.rdd import mse_optimal_bandwidth, sharp_rdd
+
+        ses = {"narrow": [], "plug": [], "wide": []}
+        for seed in range(6):
+            x, y = self._data(n=20000, kink=True, seed=seed)
+            h = mse_optimal_bandwidth(x, y)
+            for tag, factor in (("narrow", 0.5), ("plug", 1.0), ("wide", 2.0)):
+                ses[tag].append(sharp_rdd(x, y, bandwidth=factor * h).se)
+        assert np.mean(ses["narrow"]) > np.mean(ses["plug"]) > np.mean(ses["wide"])
+
+        # 偏差那一头：把噪声关掉，估计量的输出**就是**偏差本身
+        # （带噪声时 h 处的偏差 0.007 被 0.037 的抽样噪声完全盖住，
+        #   拿 |τ̂−τ| 比大小比的是噪声，不是偏差）
+        x, y = self._data(n=20000, kink=True, noise=0.0, seed=3)
+        h = mse_optimal_bandwidth(x, y)
+        bias = {
+            f: sharp_rdd(x, y, bandwidth=f * h).tau - 2.0 for f in (0.5, 1.0, 2.0)
+        }
+        assert bias[2.0] < 0 and bias[0.5] < 0  # 两侧曲率不同 ⇒ 偏差有方向
+        assert abs(bias[1.0]) > 3.0 * abs(bias[0.5])
+        assert abs(bias[2.0]) > 3.0 * abs(bias[1.0])
+
+    def test_manipulation_test_both_ends(self):
+        """操纵检验：密度连续时不报警，有人挪过线时报警。"""
+        from ablab.causal.rdd import manipulation_test
+
+        rng = np.random.default_rng(11)
+        clean = manipulation_test(rng.normal(0.0, 1.0, 4000))
+        assert not clean.rejects
+
+        rng = np.random.default_rng(12)
+        x = rng.normal(0.0, 1.0, 4000)
+        moved = (x > -0.4) & (x < 0.0) & (rng.random(4000) < 0.7)
+        x[moved] = 0.4 * rng.random(int(moved.sum()))
+        dirty = manipulation_test(x)
+        assert dirty.rejects
+        assert dirty.log_jump > 0  # 断点右侧密度被堆高了
+
+    def test_fuzzy_rdd_separates_itt_from_late(self):
+        """断点只改变接受处置的概率：ITT 被稀释，Wald 比恢复 LATE。"""
+        from ablab.causal.rdd import fuzzy_rdd
+
+        rng = np.random.default_rng(21)
+        n = 20000
+        x = rng.uniform(-1.0, 1.0, n)
+        base = 1.0 + 0.8 * x + 0.6 * x**2
+        d = ((x >= 0.0) & (rng.random(n) < 0.4)).astype(float)
+        y = base + 2.0 * d + rng.normal(0.0, 0.5, n)
+        res = fuzzy_rdd(x, y, d)
+        assert res.tau_itt < 0.75 * res.tau_late
+        assert abs(res.tau_late - 2.0) < 3.0 * res.se_late
+        assert res.covers(2.0)
+
+    def test_fuzzy_without_first_stage_is_refused(self):
+        from ablab.causal.rdd import fuzzy_rdd
+
+        rng = np.random.default_rng(31)
+        n = 3000
+        x = rng.uniform(-1.0, 1.0, n)
+        d = (rng.random(n) < 0.5).astype(float)  # 与断点无关
+        y = 1.0 + x + 2.0 * d + rng.normal(0.0, 0.5, n)
+        with pytest.raises(ValueError, match="第一阶段"):
+            fuzzy_rdd(x, y, d)
+
+    def test_input_validation(self):
+        from ablab.causal.rdd import sharp_rdd
+
+        x, y = self._data(n=500)
+        with pytest.raises(ValueError, match="样本量"):
+            sharp_rdd(x, y[:100])
+        with pytest.raises(ValueError, match="带宽"):
+            sharp_rdd(x, y, bandwidth=-1.0)
+        with pytest.raises(ValueError, match="样本不足"):
+            sharp_rdd(x, y, bandwidth=1e-6)
+
+    def test_audit_properties_on_a_small_run(self):
+        """审计本体（小规模）：带宽置换与两个前提都要看得见。"""
+        from ablab.validation.rdd_audit import run_rdd_audit
+
+        audit = run_rdd_audit(n_trials=30, n=800)
+        passed = audit.passed()
+        assert passed["带宽：偏差随 h 变大"]
+        assert passed["带宽：方差随 h 变小"]
+        assert passed["操纵检验在有人挪线时报警"]
+        assert passed["模糊断点：ITT 被稀释"]
+        # 误报率是个比例，30 次里只能要个量级
+        assert 0.0 <= audit.manipulation["误报率"] <= 0.25
+
+
 class TestRambachanRothSensitivity:
     """三档限制：线性违背 / 相对幅度 / 二阶差分（平滑）。
 

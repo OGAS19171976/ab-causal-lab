@@ -88,6 +88,7 @@ from .peeking import (
     run_peeking_simulation,
 )
 from .policy_audit import PolicyAudit, run_policy_audit
+from .rdd_audit import RDDAudit, run_rdd_audit
 from .sequential_audit import (
     BoundaryAccuracy,
     MonitoringPoint,
@@ -101,6 +102,8 @@ from .sequential_audit import (
 )
 
 __all__ = [
+    "RDDAudit",
+    "run_rdd_audit",
     "PolicyAudit",
     "run_policy_audit",
     "RambachanRothAudit",

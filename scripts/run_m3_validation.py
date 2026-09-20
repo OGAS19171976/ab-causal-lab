@@ -57,6 +57,7 @@ from ablab.validation import (  # noqa: E402
     run_iv_audit,
     run_pretrend_audit,
     run_rambachan_roth_audit,
+    run_rdd_audit,
     run_scm_audit,
     run_scm_placebo_audit,
     run_sensitivity_audit,
@@ -251,6 +252,9 @@ def main() -> int:
     n_pre = 80 if args.quick else 300
     n_scm = 30 if args.quick else 100
     n_sens = 40 if args.quick else 150
+    # 断点回归的审计很便宜（纯 numpy、无森林），所以次数给足：
+    # 覆盖率与误报率这类读数在 200 次以下没什么信息量。
+    n_rdd = 60 if args.quick else 200
     # 聚合方差审计比别的贵（每次仿真都要算全部 ATT(g,t) 及其影响函数），
     # 但它是这一节唯一的证据来源，所以不放进 --quick 里省掉。
     n_aggvar = 40 if args.quick else 200
@@ -574,6 +578,46 @@ def main() -> int:
     emit("  均值偏差与 RMSE 爆炸、AR 区间 **89% 无界**（= 排除不掉任何 β）。")
     emit("  所以照抄教科书会把报告写错，而量一遍只要 30 秒。")
 
+    # ---- 2.9 断点回归 ------------------------------------------------------ #
+    emit(f"\n### 2.9 断点回归（局部线性 + 带宽 + 操纵检验）：{n_rdd} 次仿真")
+    emit("  断点买的是「断点附近谁落在哪一侧近似随机」，代价是两个前提：")
+    emit("  **带宽**（离断点远了线性近似会坏）与**操纵**（单元能不能选边站）。")
+    emit("  所以这一节的 C 位不是点估计，而是带宽的偏差-方差置换、")
+    emit("  以及一个两端都要看的操纵检验。")
+    emit("")
+    rdd_audit = run_rdd_audit(n_trials=n_rdd, n=1500)
+    for line in rdd_audit.summary().splitlines():
+        emit("  " + line)
+    emit("")
+    emit("  四条要一起读的东西：")
+    emit(f"    · **带宽就是偏差-方差置换**：0.5h 的 SE "
+         f"{rdd_audit.estimators['朴素·0.5h']['平均 SE']:.4f} → 2h 的 "
+         f"{rdd_audit.estimators['朴素·2h']['平均 SE']:.4f}，"
+         f"而偏差 {rdd_audit.estimators['朴素·0.5h']['偏差']:+.4f} → "
+         f"{rdd_audit.estimators['朴素·2h']['偏差']:+.4f}；")
+    emit(f"    · **MSE 最优带宽是给点估计的**：同一个带宽下朴素区间覆盖率 "
+         f"{rdd_audit.estimators['朴素·plug-in h']['覆盖率']:.4f}，"
+         f"换成 2h 掉到 {rdd_audit.estimators['朴素·2h']['覆盖率']:.4f}；")
+    emit(f"    · **偏差校正只修了一半**（这是判据被实测改写的那一条）："
+         f"校正把偏差从 {rdd_audit.estimators['朴素·plug-in h']['偏差']:+.4f} 压到 "
+         f"{rdd_audit.estimators['CCT 偏差校正']['偏差']:+.4f}，"
+         f"但覆盖率 **{rdd_audit.estimators['CCT 偏差校正']['覆盖率']:.4f}** 反而低于"
+         f"朴素区间 {rdd_audit.estimators['朴素·plug-in h']['覆盖率']:.4f} ——")
+    emit("      因为这次只减了偏差，方差还是校正前那个，而偏差是**估**出来的；")
+    emit("      CCT 之所以要另给一个稳健方差，正是因为这个。本仓库没做那一步，")
+    emit("      所以如实报出来，而不是把「校正后覆盖率应该更好」写进结论；")
+    emit(f"    · **操纵检验两端都量**：密度连续时误报率 "
+         f"{rdd_audit.manipulation['误报率']:.4f}，有人把单元挪过线时检出率 "
+         f"{rdd_audit.manipulation['检出率（有人挪过线）']:.4f}。")
+    emit("  操纵检验的第一版用**残差三明治**估方差，实测误报率 0.1250（名义 0.05）——")
+    emit("  分箱后的残差比 Poisson 噪声小，方差被系统性低估。换成 Poisson 理论方差")
+    emit("  （权重取计数时协方差恰好是 (M'WM)^{-1}）后是 0.0600。这是实测出来的，")
+    emit("  不是推导出来的：两次都跑了 200 次仿真，只有方差那两行代码不同。")
+    emit("  模糊断点那一档还把 ITT 与 LATE 的区别量了出来：")
+    emit(f"    ITT {rdd_audit.fuzzy['ITT 均值']:+.4f} vs LATE "
+         f"{rdd_audit.fuzzy['LATE 均值']:+.4f}（真值 {rdd_audit.tau:+.4f}）——")
+    emit("    「断点显著」说的是 ITT，「处置有效」说的是 LATE，两者差一个合规份额。")
+
     # ---- 3. 平行趋势检验的盲区 --------------------------------------------- #
     emit(f"\n### 3. 平行趋势检验：能发现什么、发现不了什么（{n_pre} 次/场景）")
     pretrend = run_pretrend_audit(n_trials=n_pre, seed=0)
@@ -688,6 +732,7 @@ def main() -> int:
         "弱工具把 2SLS 拉向 OLS": iv_audit.weak_pulls_to_ols,
         "AR 区间全程守住名义覆盖": iv_audit.ar_holds_throughout,
         "AR 的代价（无界）看得见": iv_audit.ar_cost_is_visible,
+        **{f"RDD：{k}": v for k, v in rdd_audit.passed().items()},
         "Wald 在这个设计下没有崩（实测记录）": iv_audit.wald_does_not_break,
     }
     verdict = "PASS" if all(checks.values()) else "FAIL"
