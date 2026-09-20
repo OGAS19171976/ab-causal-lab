@@ -96,6 +96,9 @@ from .sequential_audit import (
 )
 
 __all__ = [
+    "TauRuleAudit",
+    "TauRuleRow",
+    "run_tau_rule_audit",
     "MultivariateCupedAudit",
     "MultivariateCupedRow",
     "run_multivariate_cuped_audit",
@@ -177,3 +180,4 @@ __all__ = [
     "run_dml_audit",
     "run_uplift_metric_audit",
 ]
+from .tau_rule_audit import TauRuleAudit, TauRuleRow, run_tau_rule_audit

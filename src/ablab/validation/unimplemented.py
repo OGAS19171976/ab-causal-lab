@@ -86,14 +86,6 @@ ITEMS: tuple[UnimplementedItem, ...] = (
         ),
     ),
     UnimplementedItem(
-        id="msprt_tau_choice",
-        readme_phrase="mSPRT 的 `tau` 没有自动选择",
-        kind="symbol_absent",
-        target="ablab.inference.tests.choose_tau",
-        anchor_present="ablab.inference.tests",
-        when_done="README 要说明 tau 的选择规则与它对功效的影响实测",
-    ),
-    UnimplementedItem(
         id="scm_time_placebo",
         readme_phrase="合成控制只做了空间安慰剂",
         kind="symbol_absent",

@@ -170,7 +170,11 @@ CLAIMS: list[tuple[str, str, str]] = [
     ("治理·决策层：护栏能停实验", "governance_report.md", "决策层：护栏触发"),
     ("治理·决策层：服务端复核", "governance_report.md", "服务端自己复核"),
     ("治理·没做清单：检查器会抓过时声明", "governance_report.md", "没做」的清单"),
-    ("治理·没做清单：6 条机检", "governance_report.md", "机检 6 条"),
+    ("治理·没做清单：5 条机检", "governance_report.md", "机检 5 条"),
+    # tau 规则（m2 第 7 节，随 --quick 变 → 只加文本类声明）
+    ("M2·tau 规则：命中功效的经验最优", "m2_validation.md", "与功效的经验最优"),
+    ("M2·tau 规则：让数据选先验会毁掉保证",
+     "m2_validation.md", "让数据选先验会毁掉 always-valid 保证"),
     # 多协变量 CUPED（m1 3b 节随 --quick 变 → 只加文本类；数仓那份是稳定数值）
     ("M1·多协变量 CUPED：危险的是 p 接近 n",
      "m1_validation.md", "危险的不是共线，是 p 接近 n"),

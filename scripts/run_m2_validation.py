@@ -46,6 +46,7 @@ from ablab.sim.sequential import (  # noqa: E402
 from ablab.validation import (  # noqa: E402
     run_monitoring_intensity,
     run_stopping_rule_comparison,
+    run_tau_rule_audit,
     run_tau_sensitivity,
     verify_adjusted_p_value,
     verify_boundary_accuracy,
@@ -296,6 +297,22 @@ def main() -> int:
     for tp in tau_points:
         emit(f"{tp.tau_over_se:>8.2f} {tp.msprt_fwer:>12.4f} {tp.msprt_power:>11.4f} "
              f"{tp.bayes_fwer:>12.4f} {tp.bayes_power:>11.4f}")
+    emit("")
+    emit("  上面这张表说明**功效极度依赖 tau**，但没说**该怎么选**。这一轮补上规则：")
+    emit("  tau* = 使拒绝阈值最小的那个 tau（固定 SE 与 alpha 时可解析求解），")
+    emit("  alpha=0.05 时它等于 **2.87×SE** —— 而线上原来取的 2×SE 恰好偏低一截。")
+    emit("")
+    tau_audit = run_tau_rule_audit(n_trials=n_trials)
+    for line in tau_audit.summary().splitlines():
+        emit("  " + line)
+    emit("")
+    emit("  两条结论：")
+    emit("    · **规则就是经验最优**：阈值最小化给出的 tau 与网格上的功效极大点重合")
+    emit(f"      （{tau_audit.rule_power:.4f} vs {tau_audit.empirical_best_power:.4f}）；")
+    emit("    · **陷阱**：让数据选先验（用当前观测到的效应定 tau）会让 FWER 系统性变大 ——")
+    emit("      5/25/100 次查看下分别 x1.38 / x1.72 / x2.15。注意主张的强度：")
+    emit("      不是「一定超过 alpha」（小查看次数下 mSPRT 本身很保守），")
+    emit("      而是**那个 always-valid 的承诺不再成立**。")
 
     # ---- 8. 用户级端到端 --------------------------------------------------- #
     emit("\n### 8. 用户级端到端：真实分流 + 真实抽样")
@@ -341,6 +358,10 @@ def main() -> int:
         "mSPRT 保证成立（不超 alpha）": msprt_max <= alpha,
         "贝叶斯阈值并非自动校准": abs(bayes_max - alpha) > 0.02,
         "群序贯功效优于 mSPRT": alt_by_label["sequential"].rate > alt_by_label["always_valid"].rate,
+        "tau 规则命中经验最优（1 个百分点内）": tau_audit.rule_is_near_the_empirical_optimum,
+        "固定 tau 时有效性不依赖 tau": tau_audit.validity_holds_for_any_fixed_tau,
+        "线上旧口径 2×SE 不算错（差距 ≤5pp）": tau_audit.online_heuristic_is_not_far_off,
+        "让数据选先验会毁掉 always-valid 保证": tau_audit.data_dependent_tau_voids_the_guarantee,
     }
     verdict = "PASS" if all(checks.values()) else "FAIL"
 
@@ -359,6 +380,15 @@ def main() -> int:
     emit(f"[4] 贝叶斯阈值：P(delta>0)>=0.95 的错误率随先验从 "
          f"{min(p.bayes_fwer for p in tau_points):.4f} 到 {bayes_max:.4f}")
     emit("    -> 后验任何时候都自洽，但「反复看到阈值就停」这个决策规则不是自动校准的")
+    emit(f"[5] mSPRT 的 tau：规则（阈值最小化）给出 {tau_audit.rule_tau_over_se:.2f}×SE，"
+         f"与功效的经验最优 {tau_audit.empirical_best_tau_over_se:.2f}×SE 重合"
+         f"（{tau_audit.rule_power:.4f} vs {tau_audit.empirical_best_power:.4f}）；")
+    emit(f"    线上旧口径 2×SE 的功效是 {tau_audit.online_power:.4f}"
+         f"（差 {tau_audit.empirical_best_power - tau_audit.online_power:+.4f}）——"
+         "它不算错，只是没人量过。")
+    emit("    陷阱：让**当前**观测到的效应决定 tau（= 事后挑备择假设）会让 FWER")
+    emit("    在每个监测密度下都变大（5/25/100 次查看 x1.38 / x1.72 / x2.15）——")
+    emit("    主张的强度是「保证没了」，不是「一定超 alpha」。")
     emit(f"\n逐项检查: {checks}")
     emit(f"总体判定: {verdict}")
     emit(f"总耗时 {time.perf_counter() - t0:.1f}s")

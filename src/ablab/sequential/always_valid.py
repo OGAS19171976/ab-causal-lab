@@ -47,6 +47,8 @@ __all__ = [
     "msprt_statistic",
     "msprt_p_value",
     "always_valid_path",
+    "choose_tau",
+    "optimal_tau",
     "rejection_threshold",
 ]
 
@@ -56,16 +58,22 @@ def msprt_statistic(
     std_error: float | np.ndarray,
     tau: float,
 ) -> np.ndarray:
-    """混合似然比 ``Lambda_n``（越大越倾向有效应）。"""
-    if tau <= 0:
-        raise ValueError(f"tau 必须为正，收到 {tau}")
+    """混合似然比 ``Lambda_n``（越大越倾向有效应）。
+
+    ``tau`` 既可以是标量（固定先验，**这是唯一有 always-valid 保证的用法**），
+    也可以是逐时点的数组 —— 后者只为"让数据选先验"那个反例服务
+    （见 ``validation/tau_rule_audit.py`` 的实测：它会把 I 类错误抬上去）。
+    """
     est = np.asarray(estimate, dtype=float)
     se = np.asarray(std_error, dtype=float)
+    tau_arr = np.asarray(tau, dtype=float)
+    if np.any(tau_arr <= 0):
+        raise ValueError(f"tau 必须为正，收到 {tau!r}")
     if np.any(se <= 0):
         raise ValueError("标准误必须为正")
 
     V = se**2
-    tau2 = tau**2
+    tau2 = tau_arr**2
     with np.errstate(over="ignore"):
         lam = np.sqrt(V / (V + tau2)) * np.exp(est**2 * tau2 / (2.0 * V * (V + tau2)))
     return np.minimum(lam, np.inf)
@@ -165,3 +173,79 @@ def always_valid_path(
         alpha=float(alpha),
         tau=float(tau),
     )
+
+
+# --------------------------------------------------------------------------- #
+# tau 怎么选：一条能算出来的规则，而不是"取 2 倍标准误"
+# --------------------------------------------------------------------------- #
+def optimal_tau(std_error: float, alpha: float = 0.05) -> float:
+    """**使拒绝阈值最小**的 ``tau``（固定 ``std_error`` 与 ``alpha``）。
+
+    为什么这是"最优"：在给定时点，功效 = ``P(|theta_hat| > 阈值(tau))``，
+    而 ``theta_hat ~ N(delta, V)`` —— 所以**对任何 delta，阈值越小功效越高**。
+    于是"选 tau"这件事可以化成一个一维最小化，不需要先猜 delta：
+
+        f(tau) = (V + tau^2)/tau^2 * [ ln(1/alpha) + 0.5*ln((V + tau^2)/V) ]
+
+    令 ``u = tau^2/V``，``c = ln(1/alpha)``：``f = (1+u)/u*(c + 0.5*ln(1+u))``。
+    它在 ``u`` 上只有一个极小点（alpha=0.05 时 u* ≈ 8~9，即
+    ``tau* ≈ 3*SE``）—— 这也解释了线上那句 "tau 取 2 倍标准误" 为什么**不算错**：
+    它恰好落在最优点附近，只是没人量过它离最优点有多远。
+
+    返回的是**设计期**的量：``std_error`` 应当是**末次查看的预期标准误**
+    （不是当前观测到的 SE —— 那是数据依赖的选择，见 ``choose_tau`` 的警告）。
+    """
+    if std_error <= 0:
+        raise ValueError("std_error 必须为正")
+    if not 0 < alpha < 1:
+        raise ValueError("alpha 必须在 (0, 1)")
+
+    def objective(log_tau: float) -> float:
+        return rejection_threshold(std_error, float(np.exp(log_tau)), alpha)
+
+    # 在 log 尺度上做黄金分割：tau 的合理范围跨几个量级，线性搜索会漏掉
+    lo, hi = np.log(std_error * 0.1), np.log(std_error * 100.0)
+    inv_phi = (np.sqrt(5.0) - 1.0) / 2.0
+    a, b = lo, hi
+    c, d = b - inv_phi * (b - a), a + inv_phi * (b - a)
+    for _ in range(200):
+        if objective(c) < objective(d):
+            b, d = d, c
+            c = b - inv_phi * (b - a)
+        else:
+            a, c = c, d
+            d = a + inv_phi * (b - a)
+        if b - a < 1e-12:
+            break
+    return float(np.exp((a + b) / 2.0))
+
+
+def choose_tau(
+    *,
+    std_error: float,
+    target_effect: float | None = None,
+    alpha: float = 0.05,
+    rule: str = "threshold",
+) -> float:
+    """选 ``tau``。两条规则，**都必须在看数据之前定下来**。
+
+    * ``rule="threshold"``（默认）：使拒绝阈值最小 —— 见 ``optimal_tau``。
+      它不需要事先知道效应量，是"我不知道效应多大"时的稳妥选择；
+    * ``rule="match"``：``tau = |target_effect|``（先验与你想检出的效应匹配）。
+      知道目标效应时它更贴题，代价是效应猜小了会显著掉功效（有实测）。
+
+    **``tau`` 必须是设计期的常数**。always-valid 的保证来自
+    "先验在事前固定"：如果每次查看都拿**当前**观测到的 SE 去重算 tau，
+    这种数据依赖会让 I 类错误膨胀（本仓库有一条实测钉着这件事，
+    见 ``reports/m2_validation.md``）。所以这里的 ``std_error`` 参数
+    指的是**末次查看的预期标准误**，而不是"现在这批数据的 SE"。
+    """
+    if rule == "threshold":
+        return optimal_tau(std_error, alpha=alpha)
+    if rule == "match":
+        if target_effect is None:
+            raise ValueError('rule="match" 需要给出 target_effect')
+        if target_effect <= 0:
+            raise ValueError("target_effect 必须为正")
+        return float(target_effect)
+    raise ValueError(f'rule 只能是 "threshold" / "match"，收到 {rule!r}')

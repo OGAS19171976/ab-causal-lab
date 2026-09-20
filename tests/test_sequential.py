@@ -310,6 +310,75 @@ class TestMsprt:
 # --------------------------------------------------------------------------- #
 # 贝叶斯
 # --------------------------------------------------------------------------- #
+class TestTauChoice:
+    """``tau`` 怎么选：一条能算出来的规则 + 一个必须避开的陷阱。
+
+    与 ``TestMsprt`` 的分工：那一组测 mSPRT 本身（统计量、p 值、阈值反解），
+    这一组测"先验尺度该取多少"这条**设计决策**。
+    """
+
+    def test_optimal_tau_matches_a_brute_force_grid(self):
+        """黄金分割解出来的 tau 必须与暴力网格的最小点一致。"""
+        from ablab.sequential import optimal_tau, rejection_threshold
+
+        for alpha in (0.05, 0.01):
+            for se in (0.1, 0.42):
+                tau_star = optimal_tau(se, alpha=alpha)
+                grid = np.linspace(0.2 * se, 12.0 * se, 4001)
+                best = min(grid, key=lambda x: rejection_threshold(se, float(x), alpha))
+                assert tau_star == pytest.approx(best, rel=0.01)
+                # 阈值在 tau* 处确实是最小的
+                assert rejection_threshold(se, tau_star, alpha) <= rejection_threshold(
+                    se, best, alpha
+                ) + 1e-9
+
+    def test_optimal_tau_scales_with_alpha_and_se(self):
+        from ablab.sequential import optimal_tau
+
+        # 与 SE 成正比（尺度不变）
+        a = optimal_tau(0.2, alpha=0.05) / 0.2
+        b = optimal_tau(1.0, alpha=0.05) / 1.0
+        assert a == pytest.approx(b, rel=1e-6)
+        assert 2.5 < a < 3.2  # alpha=0.05 时约 2.87
+        # alpha 越小（越严）需要越宽的先验
+        assert optimal_tau(1.0, alpha=0.01) > optimal_tau(1.0, alpha=0.05)
+
+    def test_choose_tau_rules(self):
+        from ablab.sequential import choose_tau, optimal_tau
+
+        assert choose_tau(std_error=0.42) == pytest.approx(optimal_tau(0.42))
+        assert choose_tau(std_error=0.42, target_effect=1.5, rule="match") == 1.5
+        with pytest.raises(ValueError, match="target_effect"):
+            choose_tau(std_error=0.42, rule="match")
+        with pytest.raises(ValueError, match="rule"):
+            choose_tau(std_error=0.42, rule="magic")
+        with pytest.raises(ValueError, match="std_error"):
+            choose_tau(std_error=0.0)
+
+    def test_msprt_statistic_accepts_an_array_tau(self):
+        """数组 tau 只为"让数据选先验"那个反例服务 —— 但必须能算。"""
+        from ablab.sequential import msprt_p_value
+
+        est = np.array([0.1, 0.5, 1.0])
+        se = np.array([0.2, 0.2, 0.2])
+        p_arr = msprt_p_value(est, se, np.array([0.1, 0.2, 0.3]))
+        assert p_arr.shape == (3,)
+        assert np.all((p_arr > 0) & (p_arr <= 1))
+        with pytest.raises(ValueError, match="tau"):
+            msprt_p_value(est, se, np.array([0.1, -0.2, 0.3]))
+
+    def test_data_dependent_tau_voids_the_guarantee(self):
+        """审计的核心结论：让数据选先验，FWER 在每个监测密度下都变大。"""
+        from ablab.validation import run_tau_rule_audit
+
+        audit = run_tau_rule_audit(n_trials=4000)
+        assert audit.validity_holds_for_any_fixed_tau
+        assert audit.rule_is_near_the_empirical_optimum
+        assert audit.data_dependent_tau_voids_the_guarantee
+        # 规则点与经验最优在同一个量级（不是碰巧）
+        assert abs(audit.rule_tau_over_se - audit.empirical_best_tau_over_se) < 0.6
+
+
 class TestBayesian:
     def test_posterior_is_between_prior_and_data(self):
         prior = NormalPrior(sd=1.0)

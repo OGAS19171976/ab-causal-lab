@@ -11,8 +11,11 @@ M0 用仿真标定了一个常数边界来对抗窥视；M2 把它换成有解�
 from .always_valid import (
     AlwaysValidResult,
     always_valid_path,
+    choose_tau,
     msprt_p_value,
     msprt_statistic,
+    optimal_tau,
+    rejection_threshold,
 )
 from .bayesian import (
     BayesianDecision,
@@ -42,6 +45,10 @@ from .spending import (
 )
 
 __all__ = [
+    "choose_tau",
+    "optimal_tau",
+    "rejection_threshold",
+
     "SPENDING_FUNCTIONS",
     "SpendingFunction",
     "get_spending",

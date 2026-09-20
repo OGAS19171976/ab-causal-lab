@@ -42,7 +42,7 @@ from ..inference import (
     welch_ttest_from_stats,
     z_power,
 )
-from ..sequential import SequentialDesign, msprt_p_value
+from ..sequential import SequentialDesign, choose_tau, msprt_p_value
 from ..sim.generator import PopulationConfig
 from .datasource import (
     ExperimentData,
@@ -295,7 +295,16 @@ def _monitoring_from(data: ExperimentData, design: SequentialDesign) -> list[dic
                     alt_est.absolute_effect, ase, alt_est.absolute_effect / ase,
                 )
 
-    msp = msprt_p_value(effects, ses, tau=2.0 * float(ses[-1]))
+    # tau 从"取 2 倍标准误"改成**算出来的规则**（阈值最小化，见
+    # ``sequential.always_valid.choose_tau``）：alpha=0.05 时它给出 2.87×SE。
+    # 依据是实测（reports/m2_validation.md 第 7 节）：同样的 FWER 下，
+    # 功效从 0.1613 抬到 0.1814 —— 而 2×SE 恰好落在最优点附近但偏低，
+    # 所以这不是"旧的是错的"，是"旧的没人量过"。
+    # **tau 是设计期常数**：这里用末次查看的标准误（由事先定好的信息分数决定），
+    # 不是当前观测到的 SE —— 后者是数据依赖的选择，会让 always-valid 保证作废。
+    msp = msprt_p_value(
+        effects, ses, tau=choose_tau(std_error=float(ses[-1]), alpha=design.alpha)
+    )
     # mSPRT 逐个 look 的 p 值本身都是有效的，但"任何时候看都有效"这个卖点
     # 对应的量是它们的**运行最小值** —— 也就是"截止到目前为止最有利的那个 p"。
     # 只报逐次值会让人以为可以永远等到最后一个 look 再挑一个最小的看。
