@@ -25,9 +25,9 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 import sqlite3
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -72,7 +72,17 @@ def main() -> int:
     emit(header)
 
     # 用**临时文件库**而不是内存库：要验证"落盘重开之后审计还在"。
-    tmpdir = Path(tempfile.mkdtemp(prefix="gov_"))
+    #
+    # 但不用 ``tempfile.mkdtemp()``：它给目录加 0o700 权限位，而在受限（沙箱）
+    # 环境里那种目录**建得出来、写不进去** —— 实测下一行的 ``ExperimentRegistry``
+    # 直接报 ``sqlite3.OperationalError: unable to open database file``，
+    # 整个 gov 检查因此变红（CI 上一切正常，所以一直没被发现）。
+    # 改成在项目内用默认权限建（与 ``tests/conftest.py::work_dir`` 同一个理由）；
+    # 每次跑前先清掉上一次的库 —— 这份报告会断言审计条数，
+    # 残留的老库会让那些数字漂移。
+    tmpdir = ROOT / "build" / "_gov_tmp"
+    shutil.rmtree(tmpdir, ignore_errors=True)
+    tmpdir.mkdir(parents=True, exist_ok=True)
     db = tmpdir / "registry.db"
 
     # ---- 1. 操作审计 ------------------------------------------------------ #

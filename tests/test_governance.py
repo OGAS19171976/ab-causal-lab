@@ -3,6 +3,13 @@
 为什么单独一个文件：这两件事都不是统计方法，而是**平台治理**——
 "谁改了什么有没有留痕"、"声明了但没人看的东西有没有被说出来"。
 它们验证的是"这个平台会不会静默地骗人"，值得有自己的名字。
+
+为什么用 ``work_dir`` 而不是 pytest 自带的 ``tmp_path``：这个文件原先（在
+``conftest.py`` 把其余测试都迁走之后）是仓库里**最后一个**还在用 ``tmp_path`` 的。
+它落在系统 TEMP 下、由 ``tempfile.mkdtemp`` 建目录，而那种目录带一个受限的权限位，
+在受限（沙箱）环境里**建得出来但写不进去** —— 实测本文件 24 个测试全部 ERROR
+（``PermissionError: [WinError 5]``）。``work_dir`` 建在项目内的
+``build/_test_tmp``、用默认权限，与仓库其余测试一致。
 """
 
 from __future__ import annotations
@@ -122,9 +129,9 @@ class TestAuditTrail:
             registry.set_estimator(rec.id, "not_an_estimator", actor=ACTOR)
         assert [e.action for e in registry.events(rec.id)] == ["create"]
 
-    def test_events_survive_reopening_the_database(self, tmp_path):
+    def test_events_survive_reopening_the_database(self, work_dir):
         """落盘之后再打开，审计还在（真实用法是文件库，不是内存库）。"""
-        path = tmp_path / "registry.db"
+        path = work_dir / "registry.db"
         reg = ExperimentRegistry(path)
         rec = make(reg)
         reg.set_status(rec.id, "running", actor=ACTOR)
@@ -139,7 +146,7 @@ class TestAuditTrail:
 
 class TestAuditAPI:
     @staticmethod
-    def _client(tmp_path: Path):
+    def _client(work_dir: Path):
         """走真实的建应用路径（``create_app(库路径)``），而不是自己拼一个 registry。
 
         这样接口测的是**产品里那套装配**，不是测试自己接的一根线。
@@ -147,12 +154,12 @@ class TestAuditAPI:
         """
         from fastapi.testclient import TestClient
 
-        client = TestClient(create_app(tmp_path / "audit_api.db"))
+        client = TestClient(create_app(work_dir / "audit_api.db"))
         token = client.app.state.registry.add_user("api_admin", role="admin")
         return client, {"Authorization": f"Bearer {token}"}
 
-    def test_events_endpoint_lists_history(self, tmp_path):
-        client, auth = self._client(tmp_path)
+    def test_events_endpoint_lists_history(self, work_dir):
+        client, auth = self._client(work_dir)
         rec = client.post(
             "/api/experiments",
             json={"name": "api_audit", "variants": VARIANTS, "salt": "api_audit_v1"},
@@ -174,9 +181,9 @@ class TestAuditAPI:
         assert recent["count"] == 1
         assert recent["events"][0]["action"] == "set_status"
 
-    def test_events_endpoint_still_works_after_delete(self, tmp_path):
+    def test_events_endpoint_still_works_after_delete(self, work_dir):
         """删掉之后审计接口要还能用 —— 不能因为"实验不存在"就 404。"""
-        client, auth = self._client(tmp_path)
+        client, auth = self._client(work_dir)
         rec = client.post(
             "/api/experiments",
             json={"name": "api_audit_del", "variants": VARIANTS, "salt": "api_audit_del_v1"},
@@ -203,10 +210,10 @@ class TestAuthAndActor:
     """
 
     @staticmethod
-    def _app(tmp_path: Path):
+    def _app(work_dir: Path):
         from fastapi.testclient import TestClient
 
-        client = TestClient(create_app(tmp_path / "auth.db"))
+        client = TestClient(create_app(work_dir / "auth.db"))
         reg = client.app.state.registry
         tokens = {
             "admin": reg.add_user("boss", role="admin"),
@@ -219,8 +226,8 @@ class TestAuthAndActor:
     def _auth(token: str) -> dict[str, str]:
         return {"Authorization": f"Bearer {token}"}
 
-    def test_missing_or_wrong_credentials_get_401(self, tmp_path):
-        client, tokens = self._app(tmp_path)
+    def test_missing_or_wrong_credentials_get_401(self, work_dir):
+        client, tokens = self._app(work_dir)
         body = {"name": "e_auth", "variants": VARIANTS, "salt": "e_auth_v1"}
         assert client.post("/api/experiments", json=body).status_code == 401
         for header in (
@@ -233,8 +240,8 @@ class TestAuthAndActor:
             )
             assert resp.status_code == 401, header
 
-    def test_viewer_cannot_write_and_editor_cannot_delete(self, tmp_path):
-        client, tokens = self._app(tmp_path)
+    def test_viewer_cannot_write_and_editor_cannot_delete(self, work_dir):
+        client, tokens = self._app(work_dir)
         rec = client.post(
             "/api/experiments",
             json={"name": "e_roles", "variants": VARIANTS, "salt": "e_roles_v1"},
@@ -271,8 +278,8 @@ class TestAuthAndActor:
             == 204
         )
 
-    def test_disabled_user_is_locked_out_immediately(self, tmp_path):
-        client, tokens = self._app(tmp_path)
+    def test_disabled_user_is_locked_out_immediately(self, work_dir):
+        client, tokens = self._app(work_dir)
         client.app.state.registry.disable_user("alice")
         resp = client.post(
             "/api/experiments",
@@ -281,14 +288,14 @@ class TestAuthAndActor:
         )
         assert resp.status_code == 401
 
-    def test_actor_cannot_be_spoofed_by_the_request(self, tmp_path):
+    def test_actor_cannot_be_spoofed_by_the_request(self, work_dir):
         """**伪造尝试必须无效**：请求里写谁都不算数，只认凭据。
 
         这一条是这一整轮存在的理由。如果 actor 能从请求体里读，
         审计表就会变成"看起来权威的假证据"—— 比没有更糟。
         所以这里同时试三种伪造：请求体里的字段、附加 header、query 参数。
         """
-        client, tokens = self._app(tmp_path)
+        client, tokens = self._app(work_dir)
         # 1) 请求体里塞一个 actor 字段：_Strict 直接 422，根本进不了审计
         assert (
             client.post(
@@ -318,9 +325,9 @@ class TestAuthAndActor:
         events = client.get(f"/api/experiments/{rec['id']}/events").json()["events"]
         assert [e["actor"] for e in events] == ["alice"], events
 
-    def test_rejected_writes_leave_no_audit_row(self, tmp_path):
+    def test_rejected_writes_leave_no_audit_row(self, work_dir):
         """被拒的操作不写审计 —— 否则"谁改了什么"要翻十页失败的尝试才看得见。"""
-        client, tokens = self._app(tmp_path)
+        client, tokens = self._app(work_dir)
         body = {"name": "e_rej", "variants": VARIANTS, "salt": "e_rej_v1"}
         assert client.post("/api/experiments", json=body).status_code == 401
         assert (
@@ -333,14 +340,14 @@ class TestAuthAndActor:
         )
         assert client.get("/api/events").json()["count"] == 0
 
-    def test_every_mutating_route_needs_a_token(self, tmp_path):
+    def test_every_mutating_route_needs_a_token(self, work_dir):
         """**自动枚举所有写路由**，逐个断言无凭据时是 401。
 
         这是防"新加了一个端点但忘了鉴权"的唯一可靠办法：
         人会在新增端点时忘记加校验，但这条测试会在 CI 上直接红。
         免检名单为空 —— 本仓库没有"本来就该公开"的写接口。
         """
-        client, _tokens = self._app(tmp_path)
+        client, _tokens = self._app(work_dir)
         exempt: set[str] = set()
         checked = 0
         for route in client.app.routes:
@@ -357,9 +364,9 @@ class TestAuthAndActor:
                 checked += 1
         assert checked >= 5, f"只检查到 {checked} 个写路由，枚举逻辑可能失效了"
 
-    def test_stored_credentials_are_hashes_not_tokens(self, tmp_path):
+    def test_stored_credentials_are_hashes_not_tokens(self, work_dir):
         """库里存的是 sha256，不是 token —— 库文件泄露不等于凭据泄露。"""
-        client, tokens = self._app(tmp_path)
+        client, tokens = self._app(work_dir)
         reg = client.app.state.registry
         rows = reg._conn.execute("SELECT id, token_hash FROM users").fetchall()
         assert rows
@@ -373,14 +380,14 @@ class TestAuthAndActor:
         # list_users 也不能把哈希漏出去
         assert all("token" not in u for u in reg.list_users())
 
-    def test_pre_migration_events_show_unknown_actor(self, tmp_path):
+    def test_pre_migration_events_show_unknown_actor(self, work_dir):
         """老库（事件表没有 actor 列）迁移之后：**旧行写"未知"，绝不猜名字**。
 
         `experiment_events` 是 append-only，触发器禁止 UPDATE ——
         所以迁移只能是 `ADD COLUMN` + 默认值。想"回填"就得先关掉触发器，
         那等于毁掉审计的卖点。这里手工造一个老结构的库来验证。
         """
-        path = tmp_path / "old.db"
+        path = work_dir / "old.db"
         conn = sqlite3.connect(path)
         conn.executescript(
             """
@@ -422,10 +429,10 @@ class TestGuardrailStopDecision:
     """
 
     @staticmethod
-    def _client(tmp_path: Path):
+    def _client(work_dir: Path):
         from fastapi.testclient import TestClient
 
-        client = TestClient(create_app(tmp_path / "stop_api.db"))
+        client = TestClient(create_app(work_dir / "stop_api.db"))
         reg = client.app.state.registry
         tokens = {
             "admin": reg.add_user("boss", role="admin"),
@@ -457,10 +464,10 @@ class TestGuardrailStopDecision:
         return resp.json()
 
     def test_tripped_guardrail_stops_the_experiment_and_records_the_basis(
-        self, tmp_path
+        self, work_dir
     ):
         """护栏真的越界 -> 停实验，审计里写明**依据**（哪条护栏、伤害多少）。"""
-        client, tokens = self._client(tmp_path)
+        client, tokens = self._client(work_dir)
         rec = self._make(client, tokens, "stop_tripped", max_harm=0.05, demo_harm=0.12)
         resp = client.post(
             f"/api/experiments/{rec['id']}/stop",
@@ -479,13 +486,13 @@ class TestGuardrailStopDecision:
         assert "latency_p99" in stop_events[0]["note"]
         assert "服务端重新分析确认" in stop_events[0]["note"]
 
-    def test_untripped_guardrail_is_refused_with_409(self, tmp_path):
+    def test_untripped_guardrail_is_refused_with_409(self, work_dir):
         """护栏没越界 -> **拒绝**，实验状态不变，而且**不写审计**。
 
         这一条是这个端点存在的理由：只看调用方递过来的结论，
         就等于谁都能用一句"护栏炸了"停掉任何实验。
         """
-        client, tokens = self._client(tmp_path)
+        client, tokens = self._client(work_dir)
         rec = self._make(client, tokens, "stop_untripped", max_harm=0.50, demo_harm=0.0)
         resp = client.post(
             f"/api/experiments/{rec['id']}/stop",
@@ -501,9 +508,9 @@ class TestGuardrailStopDecision:
         ]
         assert actions == ["create"]
 
-    def test_force_requires_admin_and_says_so_in_the_audit(self, tmp_path):
+    def test_force_requires_admin_and_says_so_in_the_audit(self, work_dir):
         """人工叫停是合法的，但要走 **admin**，而且审计里写明"护栏未触发"。"""
-        client, tokens = self._client(tmp_path)
+        client, tokens = self._client(work_dir)
         rec = self._make(client, tokens, "stop_force", max_harm=0.50, demo_harm=0.0)
         refused = client.post(
             f"/api/experiments/{rec['id']}/stop",
@@ -525,9 +532,9 @@ class TestGuardrailStopDecision:
         )
         assert "护栏未触发" in note and "业务方要求" in note
 
-    def test_experiment_without_guardrails_cannot_be_stopped_by_guardrail(self, tmp_path):
+    def test_experiment_without_guardrails_cannot_be_stopped_by_guardrail(self, work_dir):
         """没有声明护栏 -> 409：没有判据就没有"依据护栏停止"这回事。"""
-        client, tokens = self._client(tmp_path)
+        client, tokens = self._client(work_dir)
         rec = client.post(
             "/api/experiments",
             json={
@@ -542,9 +549,9 @@ class TestGuardrailStopDecision:
         assert resp.status_code == 409
         assert "没有声明护栏" in resp.json()["detail"]
 
-    def test_stop_needs_credentials_and_respects_the_optimistic_lock(self, tmp_path):
+    def test_stop_needs_credentials_and_respects_the_optimistic_lock(self, work_dir):
         """与其它写接口一致：无凭据 401；带了过期 If-Match 就是 412。"""
-        client, tokens = self._client(tmp_path)
+        client, tokens = self._client(work_dir)
         rec = self._make(client, tokens, "stop_lock", max_harm=0.05, demo_harm=0.12)
         assert client.post(f"/api/experiments/{rec['id']}/stop", json={}).status_code == 401
 
@@ -573,11 +580,11 @@ class TestGuardrailStopDecision:
         assert StopIn().analyze == AnalyzeIn()
         assert StopIn().force is False and StopIn().reason == ""
 
-    def test_stop_reason_must_be_present_in_the_registry_layer(self, tmp_path):
+    def test_stop_reason_must_be_present_in_the_registry_layer(self, work_dir):
         """理由不是可选的装饰：注册表层直接拒绝空理由（审计要能回答为什么）。"""
         import pytest
 
-        reg = ExperimentRegistry(tmp_path / "reason.db")
+        reg = ExperimentRegistry(work_dir / "reason.db")
         try:
             rec = reg.create(
                 actor="tester", name="reason_demo", variants=list(VARIANTS), status="running"
@@ -857,10 +864,10 @@ class TestOptimisticLocking:
     """
 
     @staticmethod
-    def _app(tmp_path: Path):
+    def _app(work_dir: Path):
         from fastapi.testclient import TestClient
 
-        client = TestClient(create_app(tmp_path / "optlock.db"))
+        client = TestClient(create_app(work_dir / "optlock.db"))
         token = client.app.state.registry.add_user("lock_admin", role="admin")
         return client, {"Authorization": f"Bearer {token}"}
 
@@ -871,9 +878,9 @@ class TestOptimisticLocking:
             headers=auth,
         ).json()
 
-    def test_lost_update_is_prevented_by_if_match(self, tmp_path):
+    def test_lost_update_is_prevented_by_if_match(self, work_dir):
         """核心断言：A 写成功之后，B 拿着**读过的旧版本**再写必须被拒。"""
-        client, auth = self._app(tmp_path)
+        client, auth = self._app(work_dir)
         rec = self._new(client, auth)
         stale = rec["version"]  # 两个客户端都读到 v1
 
@@ -902,13 +909,13 @@ class TestOptimisticLocking:
         ]
         assert actions == ["create", "set_status"]
 
-    def test_without_if_match_it_is_last_write_wins(self, tmp_path):
+    def test_without_if_match_it_is_last_write_wins(self, work_dir):
         """不带 `If-Match` 时按后写覆盖放行 —— 这是**默认行为**，不是漏洞。
 
         把它钉住，是为了让"乐观锁是可选的"这件事有据可查：
         要防覆盖就带版本号；不带就表示调用方接受覆盖。
         """
-        client, auth = self._app(tmp_path)
+        client, auth = self._app(work_dir)
         rec = self._new(client, auth, "lock_lww")
         stale = rec["version"]
         assert (
@@ -927,9 +934,9 @@ class TestOptimisticLocking:
         assert overwrite.status_code == 200
         assert overwrite.json()["status"] == "stopped"
 
-    def test_stale_delete_does_not_remove_the_experiment(self, tmp_path):
+    def test_stale_delete_does_not_remove_the_experiment(self, work_dir):
         """删除也要检查版本：否则"我正打算改，别人把它删了"会变成静默失败。"""
-        client, auth = self._app(tmp_path)
+        client, auth = self._app(work_dir)
         rec = self._new(client, auth, "lock_del")
         client.patch(
             f"/api/experiments/{rec['id']}/status",
@@ -942,8 +949,8 @@ class TestOptimisticLocking:
         assert stale.status_code == 412
         assert client.get(f"/api/experiments/{rec['id']}").status_code == 200
 
-    def test_malformed_if_match_is_400_and_quoted_form_is_accepted(self, tmp_path):
-        client, auth = self._app(tmp_path)
+    def test_malformed_if_match_is_400_and_quoted_form_is_accepted(self, work_dir):
+        client, auth = self._app(work_dir)
         rec = self._new(client, auth, "lock_fmt")
         bad = client.patch(
             f"/api/experiments/{rec['id']}/status",
@@ -960,9 +967,9 @@ class TestOptimisticLocking:
         assert quoted.status_code == 200
         assert quoted.json()["version"] == rec["version"] + 1
 
-    def test_every_write_bumps_the_version_and_the_audit_says_so(self, tmp_path):
+    def test_every_write_bumps_the_version_and_the_audit_says_so(self, work_dir):
         """每次成功的写 +1，且审计里留下版本变迁 —— 复现时能对齐到具体某一版。"""
-        client, auth = self._app(tmp_path)
+        client, auth = self._app(work_dir)
         rec = self._new(client, auth, "lock_bump")
         eid = rec["id"]
         client.patch(
@@ -986,9 +993,9 @@ class TestOptimisticLocking:
         assert any("v1 -> v2" in n for n in notes), notes
         assert sum("-> v" in n for n in notes) >= 3
 
-    def test_conflict_type_is_distinct_from_bad_input(self, tmp_path):
+    def test_conflict_type_is_distinct_from_bad_input(self, work_dir):
         """冲突与"参数写错"必须是两种类型：前者重读后重试通常会成功。"""
-        reg = ExperimentRegistry(tmp_path / "types.db")
+        reg = ExperimentRegistry(work_dir / "types.db")
         try:
             rec = make(reg, "lock_types")
             reg.set_status(rec.id, "running", actor=ACTOR, expected_version=rec.version)
@@ -1006,13 +1013,13 @@ class TestOptimisticLocking:
         finally:
             reg.close()
 
-    def test_old_database_gets_version_column_at_one(self, tmp_path):
+    def test_old_database_gets_version_column_at_one(self, work_dir):
         """老库迁移：既有行的版本从 **1** 开始 —— 不编造历史。
 
         我们并不知道那些行被改过几次；写 1 的意思是"从这里开始计数"。
         编一个更大的数会假装我们知道历史，那正是审计要避免的事。
         """
-        path = tmp_path / "old_version.db"
+        path = work_dir / "old_version.db"
         reg = ExperimentRegistry(path)
         rec = make(reg, "old_version_row")
         reg._conn.execute("UPDATE experiments SET version = 99 WHERE id = ?", (rec.id,))
@@ -1021,7 +1028,7 @@ class TestOptimisticLocking:
 
         # 模拟"加列之前"的库：删掉 version 列在 sqlite 里做不到，
         # 所以直接建一个不含该列的表结构，再走一次迁移。
-        raw = sqlite3.connect(tmp_path / "old_shape.db")
+        raw = sqlite3.connect(work_dir / "old_shape.db")
         raw.executescript(
             """
             CREATE TABLE experiments (
@@ -1041,7 +1048,7 @@ class TestOptimisticLocking:
         raw.commit()
         raw.close()
 
-        migrated = ExperimentRegistry(tmp_path / "old_shape.db")
+        migrated = ExperimentRegistry(work_dir / "old_shape.db")
         try:
             row = migrated.get("old1")
             assert row.version == 1
