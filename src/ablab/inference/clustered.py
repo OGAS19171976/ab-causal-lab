@@ -25,6 +25,25 @@ G=200 个簇、每簇 100 人、ICC=0.1 时 deff = 1 + 99×0.1 ≈ 10.9，
     （每座城市等权）。当簇大小差异很大时，它与用户加权口径不同。
 
 两个口径都对，但要**事先**想清楚哪个是业务要问的。
+
+簇数很少时，上面两条都还不够
+------------------------------
+CR1 是**渐近**的：它要 G 大。G = 4~10 个城市时（真实业务里很常见），
+CR1 的 t 统计量分布与 t(G-2) 差得很远，**过度拒绝**是常态。
+标准解法是 **wild cluster bootstrap**（Cameron-Gelbach-Miller 2008；
+MacKinnon-Webb 2018）：在**施加零假设**的模型上重抽残差，
+每个簇整体乘一个随机权重 ``v_g``（簇内共享，所以保留组内相关），
+再看重抽出来的 t 统计量有多少超过观测到的。
+
+两个实现细节决定它灵不灵：
+
+* **权重取 Rademacher 还是 Webb**。Rademacher 只有 ``±1``，G 个簇最多
+  ``2^G`` 种抽法 —— G=6 时只有 64 种，p 值的最小分辨率就是 1/64，
+  而且尾部很粗。Webb 的 6 点权重把可用抽法变成 ``6^G``，
+  这是 G < 12 时的推荐做法（MacKinnon & Webb 2018）；
+* **零假设要不要施加**。施加（WCR）用受限残差，size 更好；
+  不施加（WCU）用无约束残差并把分布平移到估计值上，功效略高但 size 更松。
+  两条都实现，因为"哪个更好"取决于你更怕哪一类错误。
 """
 
 from __future__ import annotations
@@ -45,9 +64,11 @@ from .welch import t_inference, welch_inference
 
 __all__ = [
     "ClusterDiagnostics",
+    "WildBootstrapResult",
     "cluster_robust_ttest",
     "cluster_level_ttest",
     "estimate_icc",
+    "wild_cluster_bootstrap",
 ]
 
 
@@ -344,4 +365,233 @@ def cluster_level_ttest(
                 statistic=diag.icc,
             ),
         ),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 簇数很少时的推断：wild cluster bootstrap
+# --------------------------------------------------------------------------- #
+#: Webb 的 6 点权重：均值 0、方差 1，取值比 Rademacher 的 ±1 更丰富。
+#: 出处：MacKinnon & Webb (2018) 的六点集合 {±sqrt(3/2), ±1, ±sqrt(1/2)}。
+WEBB_WEIGHTS: tuple[float, ...] = (
+    -np.sqrt(1.5), -1.0, -np.sqrt(0.5), np.sqrt(0.5), 1.0, np.sqrt(1.5),
+)
+
+
+@dataclass(frozen=True)
+class WildBootstrapResult:
+    """wild cluster bootstrap-t 的结果，以及必须并排读的 CR1 对照。
+
+    为什么一定要把 CR1 的 p 值一起报：这个方法的全部价值就是"CR1 在少簇时
+    过度拒绝"，只报 bootstrap 的 p 值，读者无法判断它到底修掉了什么。
+    """
+
+    effect: float
+    se_cr1: float
+    t_stat: float
+    #: bootstrap p 值（分辨率 = 1/(B+1)）
+    p_value: float
+    #: 同一份数据上 CR1 t 检验的 p 值（自由度 G-2）
+    p_value_cr1: float
+    ci_low: float
+    ci_high: float
+    n_bootstrap: int
+    weights: str
+    null: str
+    n_clusters: int
+    n_clusters_treated: int
+    n_clusters_control: int
+    n_obs: int
+
+    @property
+    def p_resolution(self) -> float:
+        """p 值能取到的最小非零值 —— Webb 与 Rademacher 的差别就在这里。"""
+        if self.weights == "rademacher":
+            return float(2 ** (-self.n_clusters))
+        return 1.0 / (self.n_bootstrap + 1)
+
+    def summary(self) -> str:
+        return "\n".join(
+            [
+                f"wild cluster bootstrap-t（{self.weights} 权重，{self.null}，"
+                f"B={self.n_bootstrap}）",
+                f"  效应 {self.effect:+.4f}，CR1 SE {self.se_cr1:.4f}，t = {self.t_stat:+.3f}",
+                f"  bootstrap p = {self.p_value:.4f}（分辨率 {self.p_resolution:.4f}）"
+                f"；同一份数据的 CR1 p = {self.p_value_cr1:.4f}",
+                f"  簇数：合计 {self.n_clusters}"
+                f"（处置 {self.n_clusters_treated} / 对照 {self.n_clusters_control}），"
+                f"观测 {self.n_obs}",
+                f"  bootstrap-t 区间 [{self.ci_low:+.4f}, {self.ci_high:+.4f}]",
+            ]
+        )
+
+
+def _wild_weights(
+    rng: np.random.Generator, n_clusters: int, n_bootstrap: int, kind: str
+) -> np.ndarray:
+    """``(B, G)`` 的簇级权重矩阵。"""
+    if kind == "rademacher":
+        return rng.choice(np.array([-1.0, 1.0]), size=(n_bootstrap, n_clusters))
+    if kind == "webb":
+        return rng.choice(np.asarray(WEBB_WEIGHTS), size=(n_bootstrap, n_clusters))
+    raise ValueError(f"weights 只能是 rademacher / webb，收到 {kind!r}")
+
+
+def wild_cluster_bootstrap(
+    cluster_ids: ArrayLike,
+    treated: ArrayLike,
+    outcome: ArrayLike,
+    *,
+    n_bootstrap: int = 999,
+    weights: str = "webb",
+    null: str = "imposed",
+    alpha: float = 0.05,
+    seed: int = 0,
+    metric: str = "metric",
+    variant: str = "treatment",
+    control_name: str = "control",
+) -> WildBootstrapResult:
+    """簇数很少时的均值差检验（wild cluster bootstrap-t）。
+
+    做法（施加零假设那一支，WCR）：
+
+    1. 受限模型 ``y = a + e``（即 τ = 0）→ 残差 ``ẽ``；
+    2. 每次重抽：``y*_i = a + v_{g(i)}·ẽ_i``，``v_g`` 是簇级随机权重
+       （簇内**共享同一个** v，所以组内相关被完整保留）；
+    3. 重算 ``τ̂*`` 与它的 CR1 标准误 → ``t* = τ̂* / se*``；
+    4. ``p = (1 + #{|t*| ≥ |t_obs|}) / (B + 1)``（加 1 是为了让 p 永远不为 0，
+       这是标准的有限 B 修正）；区间用 bootstrap 的 ``|t*|`` 分位数。
+
+    **实现上只用到簇级充分统计量**：因为 ``y*_i = a + v_g ẽ_i`` 里的随机性
+    完全在簇这一层，所有需要的量（各簇的 ``Σy*``、``ΣT·y*``、``Σu_g``）
+    都能写成 ``(B, G)`` 矩阵上的运算，与用户数无关。
+    第一版按"每个 bootstrap 样本重算一遍全样本"写，200 次重抽 × 999 次
+    重抽要跑十几分钟 —— 与 Anderson-Rubin 那次是同一个教训：
+    **能算和能跑完是两件事**，而这里的杠杆是"找到随机性所在的层级"。
+    """
+    codes = _encode_clusters(cluster_ids)
+    t = np.asarray(treated, dtype=bool).ravel()
+    y = np.asarray(outcome, dtype=float).ravel()
+    if not (y.size == t.size == codes.size):
+        raise ValueError("cluster_ids / treated / outcome 长度必须一致")
+    if n_bootstrap < 99:
+        raise ValueError("n_bootstrap 至少 99（否则 p 值的分辨率没有意义）")
+    if null not in ("imposed", "unrestricted"):
+        raise ValueError(f"null 只能是 imposed / unrestricted，收到 {null!r}")
+    _check_cluster_assignment(codes, t)
+
+    n = y.size
+    n1 = int(t.sum())
+    n0 = n - n1
+    if n1 < 2 or n0 < 2:
+        raise ValueError(f"两臂样本量不足：{n1} / {n0}")
+
+    G = int(codes.max()) + 1
+    if G < 4:
+        raise ValueError(
+            f"只有 {G} 个簇：wild bootstrap 也救不了（每臂不足 2 个簇），"
+            "这不是实现问题，是识别问题"
+        )
+    sizes = np.bincount(codes, minlength=G).astype(float)
+    treated_share = np.bincount(codes, weights=t.astype(float), minlength=G)
+    is_treated = treated_share > (sizes / 2.0)
+    n_treated_per_cluster = np.where(is_treated, sizes, 0.0)
+
+    # ---- 观测到的统计量（用户加权口径，与 CR1 那支一致） ------------------ #
+    mean_t = float(y[t].mean())
+    mean_c = float(y[~t].mean())
+    effect = mean_t - mean_c
+
+    cr1 = cluster_robust_ttest(
+        cluster_ids, t, y, metric=metric, variant=variant, control_name=control_name,
+        alpha=alpha,
+    )
+    se_cr1 = float(cr1.std_error)
+    t_obs = effect / se_cr1 if se_cr1 > 0 else float("nan")
+
+    # ---- 两条重抽路径 ------------------------------------------------------ #
+    #
+    # * imposed（WCR）：在 τ=0 的受限模型上重抽 ⇒ bootstrap 分布以 0 为中心，
+    #   p = P(|t*| ≥ |t_obs|)；
+    # * unrestricted（WCU）：在无约束拟合上重抽，统计量取 (τ̂* − τ̂)/se*，
+    #   即模拟「τ̂ − τ」的零分布。
+    rng = np.random.default_rng(seed)
+    V = _wild_weights(rng, G, n_bootstrap, weights)
+
+    if null == "imposed":
+        a_base = float(y.mean())
+        tau_base = 0.0
+        base = y - a_base - tau_base * t
+    else:
+        a_base = float(y[~t].mean())
+        tau_base = effect
+        base = y - a_base - tau_base * t
+
+    base_g = np.bincount(codes, weights=base, minlength=G)
+    # 每个簇的「拟合值之和」：处置簇是 (a+τ)·n_g，对照簇是 a·n_g
+    fitted_g = a_base * sizes + tau_base * n_treated_per_cluster
+    # y*_i = 拟合值_i + v_g·残差_i ⇒ 簇级 Σy* = fitted_g + v_g·base_g
+    S_g = fitted_g[None, :] + V * base_g[None, :]
+    # 处置簇里 T≡1 ⇒ Σ_{i∈g} T_i y*_i = S_g；对照簇里 ≡0
+    TY_g = np.where(is_treated[None, :], S_g, 0.0)
+
+    sum_y = S_g.sum(axis=1)
+    sum_ty = TY_g.sum(axis=1)
+    n_arr = float(n)
+    n1_arr = float(n1)
+
+    # OLS（含截距）的 τ̂*：τ = Σ(T − n1/n)·y* ÷ [n0·n1/n]
+    denom = n0 * n1 / n
+    tau_raw = (sum_ty - (n1_arr / n_arr) * sum_y) / denom
+    tau_star = tau_raw - tau_base  # imposed 时 tau_base=0；unrestricted 时平移到 τ̂ 上
+
+    # 残差 u_i = y*_i − a* − τ*T_i：簇级求和只需 S_g、n_g、处置簇的 n_g
+    a_ols = sum_y / n_arr - tau_star * (n1_arr / n_arr)
+    u_g = (
+        S_g
+        - a_ols[:, None] * sizes[None, :]
+        - tau_star[:, None] * n_treated_per_cluster[None, :]
+    )
+    # 对照簇里 T≡0 ⇒ ΣT·u = 0；处置簇里 T≡1 ⇒ 就等于 u_g
+    tu_g = np.where(is_treated[None, :], u_g, 0.0)
+
+    meat11 = (u_g * u_g).sum(axis=1)
+    meat12 = (u_g * tu_g).sum(axis=1)
+    meat22 = (tu_g * tu_g).sum(axis=1)
+
+    b12 = -1.0 / n0
+    b22 = n / (n1 * n0)
+    var_star = b12 * b12 * meat11 + 2 * b12 * b22 * meat12 + b22 * b22 * meat22
+    if G > 1 and n > 2:
+        var_star = var_star * (G / (G - 1)) * ((n - 1) / (n - 2))
+    var_star = np.maximum(var_star, 0.0)
+    se_star = np.sqrt(var_star)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        t_star = np.where(se_star > 0, tau_star / se_star, 0.0)
+
+    # 统计量的中心：imposed 时分布已经以 0 为中心；unrestricted 时上面平移过，
+    # 两种情况下比较的都是 |t*| 与 |t_obs|。
+    hits = int((np.abs(t_star) >= abs(t_obs)).sum())
+    p_value = (1.0 + hits) / (n_bootstrap + 1.0)
+
+    # bootstrap-t 区间：用 |t*| 的分位数对称展开（少簇下的标准做法）
+    crit = float(np.quantile(np.abs(t_star), 1.0 - alpha))
+    ci_low, ci_high = effect - crit * se_cr1, effect + crit * se_cr1
+
+    return WildBootstrapResult(
+        effect=effect,
+        se_cr1=se_cr1,
+        t_stat=float(t_obs),
+        p_value=float(p_value),
+        p_value_cr1=float(cr1.p_value),
+        ci_low=float(ci_low),
+        ci_high=float(ci_high),
+        n_bootstrap=n_bootstrap,
+        weights=weights,
+        null=null,
+        n_clusters=G,
+        n_clusters_treated=int(is_treated.sum()),
+        n_clusters_control=int((~is_treated).sum()),
+        n_obs=n,
     )

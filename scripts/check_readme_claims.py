@@ -169,7 +169,16 @@ CLAIMS: list[tuple[str, str, str]] = [
     ("治理·决策层：护栏能停实验", "governance_report.md", "决策层：护栏触发"),
     ("治理·决策层：服务端复核", "governance_report.md", "服务端自己复核"),
     ("治理·没做清单：检查器会抓过时声明", "governance_report.md", "没做」的清单"),
-    ("治理·没做清单：9 条机检", "governance_report.md", "机检 9 条"),
+    ("治理·没做清单：8 条机检", "governance_report.md", "机检 8 条"),
+    # 少簇推断（m6 7b 节）：该节n与重复数随 --quick 变，所以只加文本类声明。
+    ("M6·少簇：wild cluster bootstrap 已实现",
+     "m6_validation.md", "CR1 到底有多过度拒绝"),
+    ("M6·少簇：判据被实测改写（簇数不是主因）",
+     "m6_validation.md", "判据被实测改写了一次"),
+    ("M6·少簇：真正的主因是簇大小不平衡",
+     "m6_validation.md", "簇大小不平衡"),
+    ("M6·少簇：Rademacher 分辨率不够",
+     "m6_validation.md", "G<12 推荐 Webb 的原因"),
     # 数仓护栏链路：两臂均值与"事件名过滤"是稳定的
     ("数仓·护栏：长表链路", "warehouse_report.md", "护栏链路"),
     ("数仓·护栏：注入的伤害可见", "warehouse_report.md", "latency_p99"),

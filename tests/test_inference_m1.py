@@ -19,6 +19,7 @@ from ablab.inference import (
     welch_inference_from_components,
     welch_ttest,
     welch_ttest_from_stats,
+    wild_cluster_bootstrap,
 )
 
 
@@ -458,3 +459,84 @@ class TestClustered:
     def test_length_mismatch_raises(self):
         with pytest.raises(ValueError, match="长度必须一致"):
             cluster_robust_ttest([1, 2, 3], [True, False], [1.0, 2.0])
+
+    # ---- wild cluster bootstrap（簇数很少时的推断） ------------------------ #
+
+    @staticmethod
+    def _wild_data(*, G=12, m=60, seed=0, size_cv=0.0):
+        from ablab.validation.wild_bootstrap_audit import _draw_cluster_experiment
+
+        return _draw_cluster_experiment(
+            n_clusters=G, users_per_cluster=m, cluster_sd=8.0, user_sd=10.0,
+            lift=0.0, seed=seed, size_cv=size_cv,
+        )
+
+    def test_returns_a_valid_p_value_and_records_the_design(self):
+        cid, treated, y = self._wild_data()
+        res = wild_cluster_bootstrap(cid, treated, y, n_bootstrap=299, seed=1)
+        assert 0.0 < res.p_value <= 1.0
+        assert res.p_value_cr1 >= 0.0
+        assert res.n_clusters == 12
+        assert res.n_clusters_treated + res.n_clusters_control == 12
+        assert res.ci_low < res.effect < res.ci_high
+        assert res.weights == "webb" and res.null == "imposed"
+
+    def test_is_deterministic_for_a_fixed_seed(self):
+        """同一个 seed 必须给同一个 p 值 —— 报告要可复算。"""
+        cid, treated, y = self._wild_data()
+        a = wild_cluster_bootstrap(cid, treated, y, n_bootstrap=299, seed=3)
+        b = wild_cluster_bootstrap(cid, treated, y, n_bootstrap=299, seed=3)
+        assert (a.p_value, a.ci_low, a.ci_high) == (b.p_value, b.ci_low, b.ci_high)
+
+    def test_rademacher_resolution_is_two_to_the_minus_g(self):
+        """Rademacher 的分辨率是 2^-G —— 这条就是 G<12 推荐 Webb 的理由。"""
+        cid, treated, y = self._wild_data(G=6)
+        rad = wild_cluster_bootstrap(
+            cid, treated, y, n_bootstrap=999, weights="rademacher", seed=0
+        )
+        webb = wild_cluster_bootstrap(cid, treated, y, n_bootstrap=999, seed=0)
+        assert rad.p_resolution == pytest.approx(2.0 ** -6)
+        assert webb.p_resolution == pytest.approx(1.0 / 1000)
+        assert rad.p_resolution > webb.p_resolution
+
+    def test_agrees_with_cr1_when_clusters_are_many_and_balanced(self):
+        """簇多且均衡时，两条路应当给出接近的 p 值（否则说明实现有问题）。"""
+        cid, treated, y = self._wild_data(G=40, m=50, seed=5)
+        cr1 = cluster_robust_ttest(cid, treated, y)
+        wild = wild_cluster_bootstrap(cid, treated, y, n_bootstrap=999, seed=5)
+        assert abs(wild.p_value - cr1.p_value) < 0.2, (wild.p_value, cr1.p_value)
+
+    def test_unrestricted_null_also_runs(self):
+        cid, treated, y = self._wild_data()
+        res = wild_cluster_bootstrap(
+            cid, treated, y, n_bootstrap=299, null="unrestricted", seed=2
+        )
+        assert 0.0 < res.p_value <= 1.0
+        assert res.null == "unrestricted"
+
+    def test_input_validation(self):
+        cid, treated, y = self._wild_data(G=3)  # 每臂不足 2 个簇
+        with pytest.raises(ValueError, match="识别问题"):
+            wild_cluster_bootstrap(cid, treated, y, n_bootstrap=199)
+        cid, treated, y = self._wild_data()
+        with pytest.raises(ValueError, match="n_bootstrap"):
+            wild_cluster_bootstrap(cid, treated, y, n_bootstrap=10)
+        with pytest.raises(ValueError, match="weights"):
+            wild_cluster_bootstrap(cid, treated, y, n_bootstrap=199, weights="normal")
+        with pytest.raises(ValueError, match="null"):
+            wild_cluster_bootstrap(cid, treated, y, n_bootstrap=199, null="both")
+
+    def test_audit_is_fast_and_structurally_sound(self):
+        """审计本体：小规模跑一遍，钉结构与"实测属性"的一致性。"""
+        from ablab.validation.wild_bootstrap_audit import run_wild_bootstrap_audit
+
+        audit = run_wild_bootstrap_audit(
+            n_trials=20, n_clusters_grid=(6,), size_cv_grid=(0.0, 1.0)
+        )
+        assert len(audit.rows) == 2
+        assert {r.size_cv for r in audit.rows} == {0.0, 1.0}
+        for row in audit.rows:
+            for rate in (row.size_cr1, row.size_wild_webb, row.size_wild_rademacher):
+                assert 0.0 <= rate <= 1.0
+            assert row.rademacher_min_p == pytest.approx(2.0 ** -6)
+        assert np.isfinite(audit.worst_power_cost)

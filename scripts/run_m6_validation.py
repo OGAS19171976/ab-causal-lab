@@ -216,6 +216,20 @@ def fig_mde_power(out: Path, post_sd: float, rho: float, baseline: float, n_arm:
 # --------------------------------------------------------------------------- #
 # 主流程
 # --------------------------------------------------------------------------- #
+def _demo_cluster_experiment(seed: int = 7):
+    """一个小的簇级实验示例：6 个簇、簇大小不平衡（给 7b 节用）。
+
+    直接复用审计里的 DGP，保证"示例"与"扫参"出自同一套生成逻辑 ——
+    示例里出现的数如果与表里的规律打架，那就是 bug。
+    """
+    from ablab.validation.wild_bootstrap_audit import _draw_cluster_experiment
+
+    return _draw_cluster_experiment(
+        n_clusters=6, users_per_cluster=100, cluster_sd=8.0, user_sd=10.0,
+        lift=0.0, seed=seed, size_cv=1.0,
+    )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="M6 平台生产口径验证")
     ap.add_argument("--quick", action="store_true", help="快速版（数字更粗）")
@@ -233,6 +247,9 @@ def main() -> int:
     # 簇级 CUPED 的校准次数：每次要跑两遍分析（cuped + post_only），
     # 200 次约 1 分钟；快速版给 40 次。
     n_cluster_cuped = 40 if args.quick else 200
+    # wild bootstrap 那一节：10 档 × (size + 功效) 各 250 次，每次 3 个统计量
+    # （CR1 + webb + rademacher）。向量化在簇级，所以整节只要 ~10 秒。
+    n_wild = 60 if args.quick else 250
 
     log: list[str] = []
     t_start = time.time()
@@ -416,6 +433,41 @@ def main() -> int:
     say("  结论：**簇级 CUPED 守住名义水平**（Wilson 区间覆盖 5%），")
     say("  而用户级检验的误停率是它的十几倍 —— 也就是说 CUPED 没有、也不该")
     say("  改变「观测单位」这件事。")
+
+    # ---- 7b. 簇数很少时的推断：wild cluster bootstrap ----------------------- #
+    say("\n### 7b. 簇数很少时：CR1 到底有多过度拒绝，wild bootstrap 修回多少")
+    say("CR1 是**渐近**的。真实业务里簇数常常只有 4~20（几个城市、几十家门店）。")
+    say("标准解法是 wild cluster bootstrap：在施加零假设的模型上重抽残差，")
+    say("**每个簇整体乘一个随机权重**（簇内共享，所以组内相关被保留）。")
+    say("两个细节决定它灵不灵：权重取 Rademacher 还是 Webb；")
+    say("以及零假设施加（WCR）还是不施加（WCU）。")
+    say("")
+    from ablab.validation.wild_bootstrap_audit import run_wild_bootstrap_audit
+
+    wild = run_wild_bootstrap_audit(n_trials=n_wild)
+    for line in wild.summary().splitlines():
+        say("  " + line)
+    say("")
+    say("  **这一节的判据被实测改写了一次**（值得单独记）：动手前写的是")
+    say("  「簇数少 → CR1 过度拒绝」。实测只对了一半 ——")
+    say("  **簇数少本身不太出事**（均衡簇下各档都接近名义值），")
+    say("  真正的主因是**簇大小不平衡**：同一批簇数下 CV=1 会把 CR1 的 size")
+    say("  翻到名义值的 2~3 倍，而且不随 G 增大而消失。")
+    say("  可操作的结论有两条：")
+    say("    · 拿到簇级实验先看**簇大小的离散度**，而不是只数簇个数；")
+    say("    · 簇数少/不平衡时用 wild bootstrap（Webb 权重，G<12 尤其），")
+    say("      但要一起报**功效代价** —— 每臂只有 2 个簇时它会矫枉过正。")
+    from ablab.inference import cluster_robust_ttest, wild_cluster_bootstrap
+
+    say("")
+    say("  单个示例（6 个簇、簇大小 CV=1）：")
+    demo_codes, demo_tr, demo_y = _demo_cluster_experiment(seed=7)
+    demo_cr1 = cluster_robust_ttest(demo_codes, demo_tr, demo_y)
+    demo_wild = wild_cluster_bootstrap(demo_codes, demo_tr, demo_y, n_bootstrap=999)
+    say(f"    CR1：效应 {demo_cr1.absolute_effect:+.3f}，SE {demo_cr1.std_error:.3f}，"
+        f"p = {demo_cr1.p_value:.4f}")
+    for line in demo_wild.summary().splitlines():
+        say("    " + line)
 
     say(f"总耗时 {time.time() - t_start:.0f}s；图：fig28_monitoring_estimator.png、"
         "fig29_unit_awareness.png、fig30_mde_power.png")

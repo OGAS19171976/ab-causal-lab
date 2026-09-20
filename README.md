@@ -1998,7 +1998,7 @@ python -m mypy                                # 类型检查（范围与档位�
 ## 六、已知边界
 
 > **这一节里每一句"没做"都有人管。** `scripts/check_unimplemented.py` 把能机检的
-> 那些（9 条：断点回归、策略优化、wild cluster bootstrap、多协变量 CUPED、
+> 那些（8 条：断点回归、策略优化、多协变量 CUPED、
 > mSPRT 的 tau、时间安慰剂、非线性敏感性、**数仓路径上的簇级 A/A 校准**、
 > 真实流量入口）逐条配上**证据**：
 > 某个符号必须**不存在**、某个串必须**搜不到**、某个文件必须**不存在**。
@@ -2123,7 +2123,17 @@ python -m mypy                                # 类型检查（范围与档位�
   或者用模型预测值当协变量（CUPAC）。目前是单变量版本 + 明确边界。
 * **没有真实流量**。全部数据都是合成数据 —— 这既是限制也是优点：
   只有合成数据才知道 ground truth。
-* **聚类稳健只实现了 CR1**。簇数很少时应改用 wild cluster bootstrap。
+* ~~**聚类稳健只实现了 CR1**。簇数很少时应改用 wild cluster bootstrap。~~
+  **已经补上了**：`inference/clustered.py` 现在给出 `wild_cluster_bootstrap`
+  （Webb 六点权重 / Rademacher 可选、零假设施加或不施加、bootstrap-t 区间），
+  实测在 `reports/m6_validation.md` 第 7b 节。
+  而那一节**推翻了我动手前的判据**：原来写的是"簇数少 → CR1 过度拒绝"，
+  实测只对了一半 —— 均衡簇下 G=4~8 时 CR1 的 size 只有 0.05~0.08，
+  真正的主因是**簇大小不平衡**（CV=1 时 CR1 的 size 到 0.09~0.16，
+  而且不随 G 增大而消失）。所以现在的操作建议是两条：
+  先看簇大小离散度，再看簇数；少簇/不平衡时用 wild bootstrap（G<12 用 Webb 权重），
+  并**一起报功效代价**（每臂只有 2 个簇时它会矫枉过正）。
+  **仍未做**：簇级配对/协变量调整那一类设计层面的补救。
 
 M5 平台层自身的边界：
 
@@ -2314,7 +2324,7 @@ M6 生产口径自身的边界：
 | 里程碑 | 内容 | 状态 |
 |---|---|---|
 | M0 | 分流引擎 + 数仓链路 + 仿真验证台 | 已完成 |
-| M1 | CUPED、比值指标 delta method、聚类稳健标准误 | 已完成 |
+| M1 | CUPED、比值指标 delta method、聚类稳健标准误、**wild cluster bootstrap** | 已完成 |
 | M2 | 群序贯（OBF alpha spending）、mSPRT always-valid、贝叶斯决策 | 已完成 |
 | M3 | 观察数据因果：DiD（含交错处置）、合成控制、平行趋势敏感性、**工具变量（2SLS + AR）** | 已完成 |
 | M4 | 异质效应：DML、honest 因果森林、S/T/X/**R/DR** 元学习器、Qini/AUUC、BLP/GATES、保形区间 | 已完成 |

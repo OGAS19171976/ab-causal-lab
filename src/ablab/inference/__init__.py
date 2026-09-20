@@ -3,9 +3,11 @@
 from .aggregates import AggregateStats
 from .clustered import (
     ClusterDiagnostics,
+    WildBootstrapResult,
     cluster_level_ttest,
     cluster_robust_ttest,
     estimate_icc,
+    wild_cluster_bootstrap,
 )
 from .cuped import CupedFit, cuped_estimate, cuped_ttest, fit_cuped
 from .power import mde, required_n_per_arm, se_of_mean_diff, z_power
@@ -21,6 +23,8 @@ from .welch import (
 )
 
 __all__ = [
+    "WildBootstrapResult",
+    "wild_cluster_bootstrap",
     "AggregateStats",
     "ClusterDiagnostics",
     "cluster_level_ttest",

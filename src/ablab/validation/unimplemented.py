@@ -86,14 +86,6 @@ ITEMS: tuple[UnimplementedItem, ...] = (
         ),
     ),
     UnimplementedItem(
-        id="wild_cluster_bootstrap",
-        readme_phrase="聚类稳健只实现了 CR1",
-        kind="symbol_absent",
-        target="ablab.inference.clustered.wild_cluster_bootstrap",
-        anchor_present="ablab.inference.clustered",
-        when_done="README 要改成「簇数很少时用 wild cluster bootstrap」，并给出 size 实测",
-    ),
-    UnimplementedItem(
         id="multivariate_cuped",
         readme_phrase="CUPED 只支持单协变量",
         kind="symbol_absent",
