@@ -123,6 +123,129 @@ def replicate_warehouse_path(project_root):
     return path
 
 
+@pytest.fixture(scope="session")
+def lifted_warehouse_path(project_root):
+    """再建一条**只含带真实效应复制实验**的小数仓（6 个，每条互动 +2）。
+
+    为什么单独一条库：它们会真的往 ``post_effect`` 里加东西，
+    与默认演示实验混在一起会把已有数字改掉（README 里引用过的那些）。
+    """
+    from ablab.warehouse import (
+        WarehouseConfig,
+        build_warehouse,
+        ratio_replicate_experiments_with_lift,
+    )
+
+    base = project_root / "build" / "_test_tmp" / "warehouse_lifted"
+    base.mkdir(parents=True, exist_ok=True)
+    path = base / "wh_pow.duckdb"
+    config = WarehouseConfig(
+        n_users=4000, experiments=ratio_replicate_experiments_with_lift(6, lift=2.0)
+    )
+    con = build_warehouse(
+        path, base / "source", project_root / "sql", config=config,
+        force_data=True, verbose=False,
+    )
+    con.close()
+    return path
+
+
+class TestRatioLinkPowerCalibration:
+    """真实效应下的校准：覆盖、功效、以及"SE 到底诚不诚实"。
+
+    零效应那一半（``TestRatioReplicateCalibration``）回答 FWER 与 z 的方差；
+    这一半回答功效与真实效应下的覆盖 —— 而它需要**真的往结果里加效应**。
+    """
+
+    def test_lift_replicates_are_mutually_exclusive(self, lifted_warehouse_path):
+        """互斥是"真实效应恰好等于 lift"的前提：一个用户最多落进一个复制实验。
+
+        若允许一个用户同时进两个，别的复制的效应会加进来 —— 它仍然是被平衡掉的
+        噪声，但目标就不再**逐字**相等了，而"真值 = 注入的 lift"正是这一节的立身之本。
+        """
+        import duckdb
+
+        con = duckdb.connect(str(lifted_warehouse_path), read_only=True)
+        try:
+            dup = con.execute(
+                """
+                SELECT COUNT(*) FROM (
+                    SELECT user_id FROM ods_exposure_log
+                    WHERE experiment LIKE 'exp_ratio_pow%'
+                    GROUP BY user_id HAVING COUNT(DISTINCT experiment) > 1
+                )
+                """
+            ).fetchone()[0]
+            n_lift = con.execute(
+                "SELECT COUNT(DISTINCT true_lift) FROM dim_experiment_config"
+                " WHERE experiment LIKE 'exp_ratio_pow%'"
+            ).fetchone()[0]
+        finally:
+            con.close()
+        assert dup == 0, f"{dup} 个用户同时落进多个复制实验 —— 互斥性不成立"
+        assert n_lift == 1, "这批复制实验的真实效应应当是同一个值"
+
+    def test_power_calibration_runs_on_the_real_chain(self, lifted_warehouse_path):
+        import duckdb
+
+        from ablab.warehouse.ratio_calibration import run_ratio_link_power_calibration
+
+        con = duckdb.connect(str(lifted_warehouse_path), read_only=True)
+        try:
+            res = run_ratio_link_power_calibration(
+                con, n_replicates=6, true_lift=2.0, n_looks=5, alpha=0.05
+            )
+        finally:
+            con.close()
+
+        assert res.n_replicates == 6
+        assert res.true_lift == 2.0
+        for rate, interval in (
+            (res.coverage, res.coverage_interval),
+            (res.power, res.power_interval),
+        ):
+            assert 0.0 <= rate <= 1.0
+            assert interval[0] <= rate <= interval[1]
+        # SE 诚实性：点估计必须落在自己的区间里，且非中心度与真值/平均 SE 一致
+        assert res.se_over_sd_interval[0] <= res.se_over_sd <= res.se_over_sd_interval[1]
+        assert res.noncentrality == pytest.approx(res.true_lift / res.se_mean, rel=1e-9)
+        assert res.se_mean > 0 and res.effect_sd > 0
+        assert res.sequential_power >= 0.0
+
+    def test_rerandomization_is_deterministic_and_unbiased(self, lifted_warehouse_path):
+        """两个断言，各自钉一件事。
+
+        1. **可复算**：同一份数据跑两次必须逐位相同。第一版没写 ``ORDER BY``，
+           DuckDB 并行扫描的行序一变、同一个 seed 抽到的用户组合就变了 ——
+           实测 SE/sd 在 1.01 ~ 1.06 之间跳，而汇总量一位不差。这类"数字会漂"
+           正是 README 第 42 条要防的东西。
+        2. **无偏 + 真值逐字相等**：``Y_i(1) = Y_i(0) + lift·X_i`` ⇒ 全处置 vs
+           全对照的真实效应**恰好**是 lift；重抽分布的均值应当在蒙特卡洛误差内。
+        """
+        import duckdb
+
+        from ablab.warehouse.ratio_calibration import rerandomization_reference
+
+        con = duckdb.connect(str(lifted_warehouse_path), read_only=True)
+        try:
+            a = rerandomization_reference(
+                con, experiment="exp_ratio_pow000", true_lift=2.0, n_splits=200
+            )
+            b = rerandomization_reference(
+                con, experiment="exp_ratio_pow000", true_lift=2.0, n_splits=200
+            )
+        finally:
+            con.close()
+
+        assert (a.estimate_mean, a.sd, a.se_mean) == (b.estimate_mean, b.sd, b.se_mean), (
+            "重随机化不可复算 —— 先检查取数有没有 ORDER BY"
+        )
+        assert a.truth == pytest.approx(2.0, abs=1e-9), a.truth
+        # 偏差应当在重抽的蒙特卡洛误差内（4 倍标准误的宽带，避免假红灯）
+        mc_se = a.sd / np.sqrt(a.n_splits)
+        assert abs(a.bias) <= 4 * mc_se, (a.bias, mc_se)
+
+
 class TestRatioReplicateCalibration:
     """比值链路的**序贯校准**：重复实现才是校准，一致性不是。
 

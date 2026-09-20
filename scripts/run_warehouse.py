@@ -8,7 +8,7 @@
 
 输出到 ``reports/warehouse_report.md``，同时打印到终端。
 
-这份脚本演示"数仓链路 + 统计引擎"的接口面：
+这份脚本演示「数仓链路 + 统计引擎」的接口面：
 SQL 负责口径（首次曝光去重、前后窗口、可加汇总），
 Python 负责推断（t 检验、置信区间、SRM 体检），
 两边各有一个交叉验证点，任何一个不过就说明有一侧写错了。
@@ -32,10 +32,17 @@ from ablab.warehouse import (  # noqa: E402
     build_warehouse,
     covariate_adjustment_report,
     ratio_replicate_experiments,
+    ratio_replicate_experiments_with_lift,
     render_report,
     verify_against_detail,
 )
-from ablab.warehouse.ratio_calibration import run_ratio_link_calibration  # noqa: E402
+from ablab.warehouse.ratio_calibration import (  # noqa: E402
+    RerandomizationReference,
+    lift_replicate_name,
+    rerandomization_reference,
+    run_ratio_link_calibration,
+    run_ratio_link_power_calibration,
+)
 
 LAYERS = (
     ("ods_exposure_log", "ODS 曝光日志（分流服务直接落盘）"),
@@ -48,11 +55,11 @@ LAYERS = (
 
 
 def scalar(con, sql: str) -> int:
-    """跑一句"只返回一个数"的 SQL。
+    """跑一句「只返回一个数」的 SQL。
 
     ``fetchone()`` 的静态类型是 ``tuple | None``（查询可能一行都不返回），
     旧代码直接 ``.fetchone()[0]`` —— 类型检查器说得对。这里把它变成
-    **一句能读懂的报错**：``COUNT(*)`` 永远有一行，所以"没有行"只可能是
+    **一句能读懂的报错**：``COUNT(*)`` 永远有一行，所以「没有行」只可能是
     查询本身写错了，而 ``None[0]`` 的 TypeError 不会告诉你这一点。
     """
     row = con.execute(sql).fetchone()
@@ -99,10 +106,16 @@ def main() -> int:
     #: 足以判断名义 5% 有没有被盖住。
     #:
     #: **故意不提供 --quick**：6b 的数值进了 `check_readme_claims.py` 的声明清单，
-    #: 个数一变那些声明就不成立 —— 那正是 README 第 31 条说的"假红灯"。
+    #: 个数一变那些声明就不成立 —— 那正是 README 第 31 条说的「假红灯」。
     #: 检查集那一侧也有契约测试（`test_ci_contract.py`）盯着"脚本接受 --quick
     #: 就必须在计划里声明"，两边是同一件事的两面。
     n_rep = 100
+    #: 6c 节：带真实效应的复制实验。80 个 × 每臂 ~730 个单元 ⇒
+    #: 覆盖率的 Wilson 区间宽约 ±5.6%、功效约 0.8，足以判断「盖不盖得住」。
+    #: n_users 决定每个复制的样本量（桶位由 10000 均分给 n_pow 个复制）。
+    n_pow = 80
+    pow_lift = 2.0
+    pow_users = 120_000
     cfg = WarehouseConfig(n_users=args.users)
     con = build_warehouse(
         db_path=ROOT / "build" / "warehouse.duckdb",
@@ -183,9 +196,9 @@ def main() -> int:
     # ---- 6. 比值链路（06/07）的交叉验证 -------------------------------- #
     #
     # 这一节存在的理由：比值指标走的是**另一条 ADS 链路**（分子/分母两列可加量），
-    # 而"换了数据源，校准主张就不再自动成立"是这个项目反复强调的规矩。
-    # 所以这里不是"再看一眼数字"，而是拿 **M1 的独立实现**（直接吃 DWD 明细的
-    # ratio_delta_method）当裁判，并顺带给出负对照与"末次查看 == 主结论"的不变量。
+    # 而「换了数据源，校准主张就不再自动成立」是这个项目反复强调的规矩。
+    # 所以这里不是「再看一眼数字」，而是拿 **M1 的独立实现**（直接吃 DWD 明细的
+    # ratio_delta_method）当裁判，并顺带给出负对照与「末次查看 == 主结论」的不变量。
     emit("\n### 6. 比值指标链路（06/07）：平台 vs M1 独立实现")
     ratio_rows = con.execute(
         "SELECT experiment, variant, user_cnt, sum_y, sum_x FROM ads_experiment_ratio_result"
@@ -269,12 +282,12 @@ def main() -> int:
 
     # ---- 6b. 比值链路的**序贯校准**：100 个 A/A 复制实验 -------------------- #
     #
-    # 6 节证明的是"两份实现算得一样"（一致性），回答不了校准：
+    # 6 节证明的是「两份实现算得一样」（一致性），回答不了校准：
     # 序贯 FWER、区间覆盖、z 的方差都是关于**一个分布**的陈述，一个 salt 给不出分布。
     # 这一节造 100 个真实效应为 0 的复制实验（各自一层、各自 salt），
     # 走**完整条真实链路**（ODS→DWD→DWS→ADS→平台编排→序贯判定）跑 100 遍。
     #
-    # 为什么这是精确的校准而不是"仿真"：见 audit 模块的 docstring ——
+    # 为什么这是精确的校准而不是「仿真」：见 audit 模块的 docstring ——
     # 固定结果序列、只重抽分流 → 尖锐零假设逐字成立，随机化分布 i.i.d.。
     #
     # **单独建一条库**：复制实验会往曝光表里加 100 个实验，
@@ -317,11 +330,83 @@ def main() -> int:
          "所以极端值那一个只是尾部，不是分流坏了：")
     emit(f"    chi2 = {calib.arm_share_chi2:.2f}（df={calib.n_replicates}），"
          f"p = {calib.arm_share_chi2_p:.4f}；最小 SRM p = {calib.srm_min_p:.3g}")
-    emit("  **仍未做**：真实效应下的功效/覆盖。复制实验共享同一份结果序列、")
-    emit("  真实效应为 0，所以它只能校准零效应；要给真实效应，必须让复制实验")
-    emit("  走自己的事件名与自己的 DWD 链路（否则它的效应会加进共享序列、")
-    emit("  把别的实验的数字改掉）。这条写进 README 的已知边界。")
+    emit("  **这一节只能校准零效应**（复制实验共享同一份结果序列、真实效应为 0）。")
+    emit("  真实效应下的覆盖与功效由 6c 节补上。")
     rep_con.close()
+
+    # ---- 6c. 真实效应下的校准：覆盖、功效、SE 是否诚实 ---------------------- #
+    #
+    # 6b 校准的是零效应（FWER、z 的方差、覆盖 0）；功率与"真实效应下盖不盖得住"
+    # 是另一半，而它需要**真的往结果里加效应**。做法：建一条**只含这批实验**的
+    # 源数据（不是新事件名、也不是新 SQL —— 换一条数据就够了），每个复制实验
+    # 自带一段互斥的桶位、真实效应 = 每条互动 +lift。
+    #
+    # 真值为什么可以取 lift 本身：生成器把效应加进**每一条**后置互动记录的取值，
+    # 而分母 post_cnt 数的就是互动条数 ⇒ Y_i(1) = Y_i(0) + lift·X_i，
+    # 两边同除 ΣX 得 R_t = R_t(0) + lift。**逐字相等**，不用估「大概的真值」。
+    emit("\n### 6c. 真实效应下的校准：覆盖、功效、以及 SE 到底诚不诚实")
+    emit("  6b 只能校准零效应。这一节让复制实验**真的带效应**：")
+    emit(f"  {n_pow} 个复制实验，每个占一段互斥桶位（一个用户最多落进一个），")
+    emit(f"  真实效应 = 每条互动 +{pow_lift:g}。真值为什么能取这个数本身：")
+    emit("  效应是加在**每一条**后置互动记录的取值上的，而分母 post_cnt 数的就是")
+    emit("  互动条数 ⇒ Y_i(1) = Y_i(0) + lift·X_i ⇒ R_t = R_t(0) + lift，")
+    emit("  **逐字相等** —— 所以覆盖率是直接对着真值数的，不需要先估一个真值。")
+    emit("")
+
+    pow_root = ROOT / "build" / "ratio_pow"
+    pow_root.mkdir(parents=True, exist_ok=True)
+    pow_cfg = WarehouseConfig(
+        n_users=pow_users,
+        experiments=ratio_replicate_experiments_with_lift(n_pow, lift=pow_lift),
+    )
+    pow_con = build_warehouse(
+        db_path=pow_root / "ratio_pow.duckdb",
+        data_dir=pow_root / "source",
+        sql_dir=ROOT / "sql",
+        config=pow_cfg,
+        force_data=args.rebuild,
+        verbose=False,
+    )
+    power_calib = run_ratio_link_power_calibration(
+        pow_con, n_replicates=n_pow, true_lift=pow_lift, n_looks=5, alpha=0.05
+    )
+    for line in power_calib.summary().splitlines():
+        emit("  " + line)
+    emit("")
+    emit("  40 个点量不出「SE 是不是 1」（sd 本身就有 ±30% 的区间），所以再做一次")
+    emit("  **重随机化对照**：DGP 已知 ⇒ 潜在结果可逐字重建，于是在同一批用户上")
+    emit("  重抽 400 次分流，直接量估计量的设计分布（蒙特卡洛误差只由重抽次数决定）：")
+    # 变量名不要复用上面 6 节那个 `ref`（那是 Estimate，mypy 会按第一个绑定推断）
+    refs: list[RerandomizationReference] = []
+    for i in (0, n_pow // 2):
+        rr = rerandomization_reference(
+            pow_con, experiment=lift_replicate_name(i), true_lift=pow_lift, n_splits=400
+        )
+        refs.append(rr)
+        for line in rr.summary().splitlines():
+            emit(line)
+    emit("")
+    emit("  三条结论（每个数都从这里算出来，不写死）：")
+    cov_ok = "盖住" if power_calib.coverage_covers_nominal else "**没盖住**"
+    emit(f"    · **覆盖**：末次 95% 区间覆盖真值 {power_calib.coverage:.4f}"
+         f"（Wilson [{power_calib.coverage_interval[0]:.4f}, "
+         f"{power_calib.coverage_interval[1]:.4f}]）—— {cov_ok}名义 0.95；")
+    emit(f"    · **功效**：末次显著率 {power_calib.power:.4f}，序贯口径 "
+         f"{power_calib.sequential_power:.4f}；非中心度 {power_calib.noncentrality:.3f} ——")
+    emit("      所以「检出率」这个数不能单独读，它由这批设置的信息量决定；")
+    se_ok = "盖住" if power_calib.se_is_honest else "**没盖住**"
+    emit(f"    · **SE 诚实**：平均 SE ÷ 跨复制 sd = {power_calib.se_over_sd:.4f}"
+         f"（区间 [{power_calib.se_over_sd_interval[0]:.4f}, "
+         f"{power_calib.se_over_sd_interval[1]:.4f}]，{se_ok} 1）；")
+    emit("      重随机化那两组更锋利（蒙特卡洛误差只由重抽次数决定）："
+         + "；".join(
+             f"{r.experiment} 的 SE/sd {r.se_over_sd:.4f}、偏差 {r.bias:+.4f}"
+             for r in refs
+         )
+         + "。")
+    emit("  **仍未做**：数仓路径上的**簇级** A/A 校准（簇级 CUPED 的校准目前只有")
+    emit("  合成路径那份；数仓侧要每个复制吃掉 ~30 个城市，是另一套规模的重复）。")
+    pow_con.close()
 
         # ---- 护栏链路（08/09）：长表 + 判定所需的可加量 ------------------------ #
     emit("\n### 护栏链路：08 DWS -> 09 ADS（长表，不新增落地文件）")

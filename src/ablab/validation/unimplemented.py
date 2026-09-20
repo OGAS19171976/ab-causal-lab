@@ -117,18 +117,18 @@ ITEMS: tuple[UnimplementedItem, ...] = (
         when_done="README 要补相对幅度/平滑约束版本的实测",
     ),
     UnimplementedItem(
-        id="ratio_replicates_with_lift",
-        readme_phrase="数仓的比值复制实验只能校准零效应",
+        id="warehouse_cluster_aa",
+        readme_phrase="数仓路径上还没有簇级的 A/A 校准",
         kind="symbol_absent",
-        target="ablab.warehouse.generate.ratio_replicate_experiments_with_lift",
-        anchor_present="ablab.warehouse.generate.ratio_replicate_experiments",
+        target="ablab.warehouse.ratio_calibration.run_cluster_replicate_calibration",
+        anchor_present="ablab.warehouse.ratio_calibration.run_ratio_link_power_calibration",
         when_done=(
-            "README 要改成「复制实验也能校准真实效应」，"
-            "并给出功效/覆盖的实测（那时复制实验走的是自己的事件名与自己的 DWD 链路）"
+            "README 要改成「数仓路径上的簇级 A/A 也量过了」，"
+            "并给出误停率/覆盖的实测（那时每个复制实验要吃下 ~30 个城市）"
         ),
         notes=[
-            "只钉「没有带真实效应的复制实验生成器」，"
-            "不声称「比值链路没有被校准」—— 零效应那一半是量过的（6b 节）",
+            "只钉「数仓路径上没有簇级重复实现」，不声称「簇级 CUPED 没校准」——"
+            "合成路径上量过（reports/m6_validation.md 第 7 节，误停率 0.0400）",
         ],
     ),
     UnimplementedItem(

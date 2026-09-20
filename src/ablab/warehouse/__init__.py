@@ -20,11 +20,15 @@ from .build import (
 )
 from .generate import (
     DEFAULT_EXPERIMENTS,
+    LIFT_REPLICATE_LAYER,
+    LIFT_REPLICATE_PREFIX,
     RATIO_REPLICATE_PREFIX,
     ExperimentDef,
     WarehouseConfig,
+    config_fingerprint,
     generate_source_data,
     ratio_replicate_experiments,
+    ratio_replicate_experiments_with_lift,
 )
 
 __all__ = [
@@ -41,8 +45,12 @@ __all__ = [
     "split_statements",
     "verify_against_detail",
     "DEFAULT_EXPERIMENTS",
+    "LIFT_REPLICATE_LAYER",
+    "LIFT_REPLICATE_PREFIX",
     "RATIO_REPLICATE_PREFIX",
+    "config_fingerprint",
     "ratio_replicate_experiments",
+    "ratio_replicate_experiments_with_lift",
     "ExperimentDef",
     "WarehouseConfig",
     "generate_source_data",

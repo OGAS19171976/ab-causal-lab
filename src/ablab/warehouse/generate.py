@@ -192,6 +192,70 @@ def ratio_replicate_experiments(
     return tuple(out)
 
 
+#: 带真实效应的复制实验：名字前缀与共享层。
+LIFT_REPLICATE_PREFIX = "exp_ratio_pow"
+LIFT_REPLICATE_LAYER = "ratio_rep_pow"
+
+
+def ratio_replicate_experiments_with_lift(
+    n: int,
+    *,
+    lift: float = 2.0,
+    prefix: str = LIFT_REPLICATE_PREFIX,
+) -> tuple[ExperimentDef, ...]:
+    """``n`` 个**带真实效应**的复制实验：用来校准功效与真实效应下的覆盖。
+
+    与 ``ratio_replicate_experiments``（A/A、真实效应 0）的分工是明确的：
+    那一批只能校准零效应（FWER、z 的方差、覆盖 0），**校准不了功效** ——
+    因为它共享同一份结果序列、真实效应处处为 0。这一批补上另一半。
+
+    **为什么真实效应恰好等于 ``lift``**（这让目标精确、不是一个"大概"）：
+
+    生成器把效应用 ``post_effect * is_post`` 加进**每一条**后置互动记录的
+    取值里（``values = level + noise + post_effect*is_post``），而 DWD 里的
+    分母 ``post_cnt`` 数的就是后置互动**记录条数**。于是处置用户的
+    ``Y_i(1) = Y_i(0) + lift * X_i``，两边同除 ``ΣX``：
+
+        R_t = Σ_t Y(0)/Σ_t X + lift        ⇒   真实效应 ≡ lift，**逐字相等**
+
+    与分流无关、与用户异质性无关、也不需要渐近论 —— 所以覆盖率可以直接
+    对着 ``lift`` 数，而不必先估一个"大概的真值"。
+
+    **互斥性**：这批实验放在**同一个层**里、各自占一段互不重叠的桶位。
+    一个用户最多落进一个复制实验，于是"真实效应 ≡ lift"对每个复制都**逐字**
+    成立（若允许一个用户同时进多个复制，别的复制的效应会加进来，
+    它仍然是被平衡掉的噪声，但目标就不再逐字相等了 —— 那正是要避开的）。
+
+    **必须建在一条独立的数据集里**：它们会真的往 ``post_effect`` 里加东西，
+    与默认演示实验混在一起会把 README 里引用过的数字全改掉。
+    （这也是上一轮那句"要给真实效应就必须走自己的事件名与自己的 DWD 链路"
+    的**更省的做法**：不用新事件名、不用新 SQL —— 换一条只有它们的源数据即可。
+    那句话当时是推测，实测下来有更便宜的路。）
+    """
+    if n < 1:
+        raise ValueError("复制实验个数必须为正")
+    if n > 10_000:
+        raise ValueError("桶位空间只有 10000，复制实验个数不能超过它")
+    span = 10_000 // n
+    if span < 1:
+        raise ValueError(f"n={n} 太多，每个复制分不到桶位")
+    out: list[ExperimentDef] = []
+    for i in range(n):
+        out.append(
+            ExperimentDef(
+                name=f"{prefix}{i:03d}",
+                # 同一个层名 + 同一段 salt，但桶位互不重叠 → 用户互斥
+                layer=LIFT_REPLICATE_LAYER,
+                layer_salt=f"layer_{LIFT_REPLICATE_LAYER}",
+                bucket_start=i * span,
+                bucket_end=(i + 1) * span,
+                true_lift=lift,
+                hypothesis=f"带真实效应（每条互动 +{lift:g}）的复制实验：校准数与功效",
+            )
+        )
+    return tuple(out)
+
+
 @dataclass(frozen=True)
 class WarehouseConfig:
     """仿真源数据的超参数。"""

@@ -44,9 +44,20 @@ from scipy import stats
 from ..platform.analysis import analyse_experiment_from_warehouse
 from ..platform.registry import ExperimentRecord
 from ..validation.aa import wilson_interval
-from .generate import RATIO_REPLICATE_PREFIX
+from .generate import LIFT_REPLICATE_PREFIX, RATIO_REPLICATE_PREFIX
 
-__all__ = ["RatioLinkCalibration", "replicate_name", "replicate_record", "run_ratio_link_calibration"]
+__all__ = [
+    "RatioLinkCalibration",
+    "RatioLinkPowerCalibration",
+    "RerandomizationReference",
+    "lift_replicate_name",
+    "lift_replicate_record",
+    "replicate_name",
+    "replicate_record",
+    "rerandomization_reference",
+    "run_ratio_link_calibration",
+    "run_ratio_link_power_calibration",
+]
 
 
 def replicate_name(i: int, prefix: str = RATIO_REPLICATE_PREFIX) -> str:
@@ -391,4 +402,333 @@ def run_ratio_link_calibration(
         last_look_matches_primary=matched / n_replicates,
         final_z=z_final,
         srm_p_values=[float(v) for v in srm.to_numpy()],
+    )
+
+
+def lift_replicate_name(i: int, prefix: str = LIFT_REPLICATE_PREFIX) -> str:
+    """第 ``i`` 个**带真实效应**的复制实验的名字。"""
+    return f"{prefix}{i:03d}"
+
+
+def lift_replicate_record(i: int, prefix: str = LIFT_REPLICATE_PREFIX) -> ExperimentRecord:
+    """把带真实效应的复制实验包成平台记录（数仓路径 + 比值口径 + post-only）。"""
+    name = lift_replicate_name(i, prefix)
+    return ExperimentRecord(
+        id=f"pow_{i:03d}",
+        name=name,
+        salt=f"{name}_v1",
+        variants=[
+            {"name": "control", "weight": 0.5},
+            {"name": "treatment", "weight": 0.5},
+        ],
+        primary_metric="post_metric_14d",
+        warehouse_experiment=name,
+        estimator="post_only",
+        metric_type="ratio",
+    )
+
+
+@dataclass
+class RatioLinkPowerCalibration:
+    """比值链路在**真实效应**下的校准：覆盖、功效、以及 SE 是否诚实。
+
+    为什么真值可以取 ``true_lift`` 本身：生成器把效应用
+    ``post_effect * is_post`` 加进**每一条**后置互动记录的取值里，而分母
+    ``post_cnt`` 数的就是后置互动**条数** —— 于是
+    ``Y_i(1) = Y_i(0) + lift * X_i``，两边同除 ``ΣX`` 得 ``R_t = R_t(0) + lift``。
+    所以真实效应 ≡ ``lift``，**逐字相等**，不需要估一个"大概的真值"。
+
+    三个数字回答三件事：
+
+    * ``coverage``：末次 95% 区间盖住真值的比例 —— 真实效应下的水平承诺；
+    * ``power`` / ``sequential_power``：末次与序贯口径的检出率 —— 功效；
+    * ``se_over_sd`` 与 ``z_sd``：平均 SE ÷ 估计的跨复制 sd（=1 才叫诚实）。
+      小样本下 sd 本身有噪声，所以**必须**同时给它的卡方区间。
+    """
+
+    n_replicates: int
+    n_looks: int
+    alpha: float
+    true_lift: float
+    #: 末次固定样本区间（z=1.96）覆盖真值的比例与 Wilson 区间
+    coverage: float
+    coverage_interval: tuple[float, float]
+    #: 末次 p < alpha 的比例（功效）与 Wilson 区间
+    power: float
+    power_interval: tuple[float, float]
+    #: 序贯口径：至少越界一次的比例（= 序贯功效）、末次重复区间覆盖真值的比例
+    sequential_power: float
+    sequential_coverage: float
+    #: 真值 ÷ 平均 SE：这批设置的**非中心度**（解释功效的量）
+    noncentrality: float
+    #: z = (τ̂ − 真值)/SE 的分布
+    z_mean: float
+    z_sd: float
+    #: sd 的卡方区间（n−1 自由度）—— 小样本下不给它就没法判断"sd 是不是 1"
+    z_sd_interval: tuple[float, float]
+    #: 点估计的分布
+    effect_mean: float
+    effect_sd: float
+    se_mean: float
+    #: 平均 SE ÷ 跨复制 sd：1 才是诚实（<1 反保守，>1 保守）
+    se_over_sd: float
+    se_over_sd_interval: tuple[float, float]
+    n_per_arm_mean: float
+
+    @property
+    def coverage_covers_nominal(self) -> bool:
+        return self.coverage_interval[0] <= 1.0 - self.alpha <= self.coverage_interval[1]
+
+    @property
+    def se_is_honest(self) -> bool:
+        """``se_over_sd`` 的区间是否盖住 1。"""
+        return self.se_over_sd_interval[0] <= 1.0 <= self.se_over_sd_interval[1]
+
+    def summary(self) -> str:
+        return "\n".join(
+            [
+                f"比值链路在**真实效应**下的校准（{self.n_replicates} 个复制实验 × "
+                f"{self.n_looks} 次查看，真值 = 注入的每条互动 +{self.true_lift:g}）",
+                f"  末次 95% 区间覆盖真值的比例 {self.coverage:.4f}"
+                f"（Wilson [{self.coverage_interval[0]:.4f}, {self.coverage_interval[1]:.4f}]，"
+                f"名义 {1 - self.alpha:.2f}）",
+                f"  功效：末次显著率 {self.power:.4f}"
+                f"（Wilson [{self.power_interval[0]:.4f}, {self.power_interval[1]:.4f}]）；"
+                f"序贯至少越界一次 {self.sequential_power:.4f}",
+                f"  序贯末次重复区间覆盖真值 {self.sequential_coverage:.4f}",
+                f"  非中心度（真值 ÷ 平均 SE）= {self.noncentrality:.3f}，"
+                f"每臂平均 {self.n_per_arm_mean:.0f} 个单元",
+                f"  z =（τ̂ − 真值）/SE：均值 {self.z_mean:+.4f}，sd {self.z_sd:.4f}"
+                f"（sd 的卡方区间 [{self.z_sd_interval[0]:.4f}, {self.z_sd_interval[1]:.4f}]）",
+                f"  点估计：均值 {self.effect_mean:+.6f}（真值 {self.true_lift:g}，"
+                f"差 {self.effect_mean - self.true_lift:+.6f}），sd {self.effect_sd:.6f}，"
+                f"平均 SE {self.se_mean:.6f}",
+                f"  **平均 SE ÷ 跨复制 sd = {self.se_over_sd:.4f}**"
+                f"（区间 [{self.se_over_sd_interval[0]:.4f}, {self.se_over_sd_interval[1]:.4f}]）"
+                " —— 1 才是诚实",
+                "  → 读法：覆盖率对着**真值本身**数（真值是逐字相等的，不是估出来的）；",
+                "    非中心度决定功效，所以功效低不一定是链路的问题，可能只是这批设置太小；",
+                "    SE 诚实与否看最后一行：区间盖住 1 才叫校准，否则要么反保守要么保守。",
+            ]
+        )
+
+
+def _sd_interval(sd: float, n: int, alpha: float = 0.05) -> tuple[float, float]:
+    """标准差估计的卡方区间 —— 小样本下**必须**给，否则"sd 偏离 1"这句话站不住。
+
+    12 个样本时 sd 的 95% 区间宽到 [0.59, 1.41]×，也就是"0.65 的 sd"与 1
+    在这点样本量下**根本区分不开**。不报区间的 sd 对比就是过度解读。
+    """
+    if n < 2 or not np.isfinite(sd):
+        return float("nan"), float("nan")
+    lo = np.sqrt((n - 1) * sd**2 / stats.chi2.ppf(1 - alpha / 2, n - 1))
+    hi = np.sqrt((n - 1) * sd**2 / stats.chi2.ppf(alpha / 2, n - 1))
+    return float(lo), float(hi)
+
+
+def run_ratio_link_power_calibration(
+    con,
+    *,
+    n_replicates: int = 40,
+    true_lift: float = 2.0,
+    n_looks: int = 5,
+    alpha: float = 0.05,
+    prefix: str = LIFT_REPLICATE_PREFIX,
+) -> RatioLinkPowerCalibration:
+    """在真实数仓上跑 ``n_replicates`` 个**带真实效应**的复制实验。
+
+    ``con`` 必须是只含这批实验的那条数仓连接（见 ``scripts/run_warehouse.py``
+    的 6c 节）—— 它们会真的往结果里加效应，混进默认演示库会把已有数字改掉。
+    """
+    if n_replicates < 2:
+        raise ValueError("复制实验至少要 2 个，否则量不出分布")
+    z_crit = float(stats.norm.ppf(1 - alpha / 2))
+    n_cover = 0
+    n_power = 0
+    n_seq_power = 0
+    n_seq_cover = 0
+    z_values: list[float] = []
+    effects: list[float] = []
+    ses: list[float] = []
+    n_arms: list[int] = []
+
+    for i in range(n_replicates):
+        rep = analyse_experiment_from_warehouse(
+            lift_replicate_record(i, prefix), con, n_looks=n_looks, alpha=alpha
+        )
+        primary = rep.primary
+        rows = rep.monitoring
+        if primary is None or not rows:  # pragma: no cover - 数仓路径必然给出
+            raise RuntimeError(f"{lift_replicate_name(i, prefix)} 没有主结论或监控序列")
+        est = float(primary.absolute_effect)
+        se_i = float(primary.std_error)
+        effects.append(est)
+        ses.append(se_i)
+        n_arms.append(int(rows[-1]["n_per_arm"]))
+        z_values.append((est - true_lift) / se_i)
+        n_cover += int(abs(est - true_lift) <= z_crit * se_i)
+        n_power += int(float(primary.p_value) < alpha)
+        crossed = [bool(m["crossed"]) for m in rows]
+        n_seq_power += int(any(crossed))
+        # 序贯末次重复区间：用设计给的末次边界而不是 1.96
+        bound = float(rows[-1]["boundary"])
+        n_seq_cover += int(abs(est - true_lift) <= bound * se_i)
+
+    z_arr = np.asarray(z_values, dtype=float)
+    eff = np.asarray(effects, dtype=float)
+    se_arr = np.asarray(ses, dtype=float)
+    sd_eff = float(eff.std(ddof=1))
+    sd_z = float(z_arr.std(ddof=1))
+    se_mean = float(se_arr.mean())
+    ratio = se_mean / sd_eff if sd_eff > 0 else float("nan")
+    sd_lo, sd_hi = _sd_interval(sd_eff, n_replicates)
+
+    return RatioLinkPowerCalibration(
+        n_replicates=n_replicates,
+        n_looks=n_looks,
+        alpha=alpha,
+        true_lift=true_lift,
+        coverage=n_cover / n_replicates,
+        coverage_interval=wilson_interval(n_cover, n_replicates),
+        power=n_power / n_replicates,
+        power_interval=wilson_interval(n_power, n_replicates),
+        sequential_power=n_seq_power / n_replicates,
+        sequential_coverage=n_seq_cover / n_replicates,
+        noncentrality=true_lift / se_mean,
+        z_mean=float(z_arr.mean()),
+        z_sd=sd_z,
+        z_sd_interval=_sd_interval(sd_z, n_replicates),
+        effect_mean=float(eff.mean()),
+        effect_sd=sd_eff,
+        se_mean=se_mean,
+        se_over_sd=ratio,
+        # se/sd 的区间就是把 sd 的区间倒过来（分子的噪声随 n 增长而消失）
+        se_over_sd_interval=(
+            se_mean / sd_hi if sd_hi > 0 else float("nan"),
+            se_mean / sd_lo if sd_lo > 0 else float("nan"),
+        ),
+        n_per_arm_mean=float(np.mean(n_arms)),
+    )
+
+
+@dataclass
+class RerandomizationReference:
+    """对**固定结果**做重随机化，直接量估计量与 SE 的分布。
+
+    为什么需要它：40 个复制实验给出的跨复制 sd 只有 40 个点，它的卡方区间宽到
+    ±30% —— **量不出** SE 到底准不准。而 DGP 是已知的
+    （``Y_i(1) = Y_i(0) + lift·X_i``），所以潜在结果可以**逐字重建**：
+
+        处置用户  ``Y_i(0) = y_i − lift·x_i``，``Y_i(1) = y_i``
+        对照用户  ``Y_i(0) = y_i``，            ``Y_i(1) = y_i + lift·x_i``
+
+    然后在同一批用户上重抽 50/50 分流，直接得到估计量的设计分布。
+    这是"SE 诚不诚实"最锋利的证据：``SE/sd`` 的蒙特卡洛误差只由重抽次数决定
+    （400 次 ≈ ±3.5%），与复制实验个数无关。
+
+    **注意它检验的是同一件事的另一面**：跨复制校准把"数据生成"的随机性也算进去，
+    重随机化只留"分流"的随机性。两个都报，因为它们回答的问题不同。
+    """
+
+    experiment: str
+    n_units: int
+    n_splits: int
+    true_lift: float
+    #: 全处置 vs 全对照的真实效应（由重建的潜在结果算出，应逐字等于 ``true_lift``）
+    truth: float
+    estimate_mean: float
+    bias: float
+    sd: float
+    se_mean: float
+    se_over_sd: float
+    #: 观测到的这一次分流的估计与 SE（对照用）
+    observed_estimate: float
+    observed_se: float
+
+    def summary(self) -> str:
+        return "\n".join(
+            [
+                f"  重随机化对照（{self.experiment}，n={self.n_units}，"
+                f"{self.n_splits} 次重抽分流）",
+                f"    真值 {self.truth:.6f}（DGP 注入的每条互动 +{self.true_lift:g}）",
+                f"    估计均值 {self.estimate_mean:+.6f}（偏差 {self.bias:+.6f}），"
+                f"sd {self.sd:.6f}",
+                f"    delta method 的 SE 均值 {self.se_mean:.6f} → "
+                f"**SE/sd = {self.se_over_sd:.4f}**",
+                f"    观测到的那一次分流：估计 {self.observed_estimate:+.6f}，"
+                f"SE {self.observed_se:.6f}",
+            ]
+        )
+
+
+def rerandomization_reference(
+    con,
+    *,
+    experiment: str,
+    true_lift: float,
+    n_splits: int = 400,
+    seed: int = 0,
+) -> RerandomizationReference:
+    """见 ``RerandomizationReference``：重建潜在结果，重抽分流。"""
+    from ..inference import ratio_delta_method
+    from ..inference.aggregates import AggregateStats
+
+    # **必须 ORDER BY**：DuckDB 并行扫描的行序不保证稳定，而重抽是对**行位置**
+    # 做置换的 —— 行序一变，同一个 seed 抽到的用户组合就变了（实测同一份库、
+    # 同一次重抽，SE/sd 会在 1.01 ~ 1.06 之间跳，而汇总量一位不差）。
+    # 这是"报告必须可复算"的直接要求，不是洁癖。
+    frame = con.execute(
+        "SELECT variant, post_metric, post_cnt FROM dwd_experiment_user"
+        " WHERE experiment = ? ORDER BY user_id",
+        [experiment],
+    ).df()
+    if frame.empty:
+        raise ValueError(f"DWD 里找不到实验 {experiment!r}")
+    y = frame["post_metric"].to_numpy(dtype=float)
+    x = frame["post_cnt"].to_numpy(dtype=float)
+    treated = (frame["variant"] == "treatment").to_numpy()
+    y0 = np.where(treated, y - true_lift * x, y)
+    y1 = np.where(treated, y, y + true_lift * x)
+    truth = float(y1.sum() / x.sum() - y0.sum() / x.sum())
+
+    def _stats(sel: np.ndarray, values: np.ndarray) -> AggregateStats:
+        xs, ys = x[sel], values[sel]
+        return AggregateStats.from_sums(
+            n=int(sel.sum()),
+            sum_x=float(xs.sum()),
+            sum_y=float(ys.sum()),
+            sum_xx=float((xs * xs).sum()),
+            sum_yy=float((ys * ys).sum()),
+            sum_xy=float((xs * ys).sum()),
+        )
+
+    rng = np.random.default_rng(seed)
+    n = x.size
+    half = n // 2
+    estimates = np.empty(n_splits)
+    ses = np.empty(n_splits)
+    for k in range(n_splits):
+        order = rng.permutation(n)
+        sel = np.zeros(n, dtype=bool)
+        sel[order[:half]] = True
+        res = ratio_delta_method(_stats(sel, y1), _stats(~sel, y0))
+        estimates[k] = res.absolute_effect
+        ses[k] = res.std_error
+
+    observed = ratio_delta_method(_stats(treated, y), _stats(~treated, y))
+    sd = float(estimates.std(ddof=1))
+    se_mean = float(ses.mean())
+    return RerandomizationReference(
+        experiment=experiment,
+        n_units=n,
+        n_splits=n_splits,
+        true_lift=true_lift,
+        truth=truth,
+        estimate_mean=float(estimates.mean()),
+        bias=float(estimates.mean() - truth),
+        sd=sd,
+        se_mean=se_mean,
+        se_over_sd=se_mean / sd if sd > 0 else float("nan"),
+        observed_estimate=float(observed.absolute_effect),
+        observed_se=float(observed.std_error),
     )
