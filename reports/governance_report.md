@@ -151,10 +151,9 @@ ab-causal-lab · 治理验证：操作审计（append-only）+ 护栏指标显�
 
   [OK  ] rdd: 符号 ablab.causal.rdd 仍不存在 ✓
   [OK  ] policy_optimization: 符号 ablab.causal.policy.aipw_policy_learner 仍不存在 ✓
-  [OK  ] scm_time_placebo: 符号 ablab.causal.synthetic.time_placebo 仍不存在 ✓
   [OK  ] sensitivity_smoothness: 符号 ablab.causal.sensitivity.rambachan_roth_smoothness 仍不存在 ✓
 
-  机检 4 条『没做』：4 条仍成立，0 条已经过时。
+  机检 3 条『没做』：3 条仍成立，0 条已经过时。
   另有 3 条**无法机检**、只能人读 ——清单不假装覆盖它们。
   退出码：0（0 = 清单与事实一致）
 

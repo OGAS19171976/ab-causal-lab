@@ -25,7 +25,13 @@ from ..causal.did import (
 )
 from ..causal.panel import StaggeredPanelConfig, generate_staggered_panel
 from ..causal.sensitivity import trend_sensitivity
-from ..causal.synthetic import SCMConfig, generate_scm_scenario, placebo_inference
+from ..causal.synthetic import (
+    SCMConfig,
+    generate_scm_scenario,
+    leave_one_out,
+    placebo_inference,
+    time_placebo,
+)
 from .aa import wilson_interval
 
 __all__ = [
@@ -407,6 +413,125 @@ class SCMAudit:
             f"  处置后/处置前 RMSE 比值分位数 = "
             + " / ".join(f"{q:.2f}" for q in self.rmse_ratio_quantiles)
         )
+
+
+@dataclass
+class SCMPlaceboAudit:
+    """空间安慰剂 / 时间安慰剂 / 留一法：三条检查各自的角色。
+
+    **三条检查回答三个不同的问题**，混在一起读就会得出错误结论：
+
+    * **空间安慰剂**（``placebo_inference``）：别的**单元**会不会也这样 ——
+      它给排名 p 值，是这三条里唯一能"当检验用"的；
+    * **时间安慰剂**（``time_placebo``）：别的**时段**会不会也这样。
+      它**只看处置前窗口**，所以与有没有真实效应**无关** ——
+      这一节特意把"同一个种子下 H0 与 H1 的读数逐位相同"当成不变量量出来。
+      它的用途是诊断"这条合成对照在留出的处置前窗口上站不站得住"，
+      不是检验效应；
+    * **留一法**（``leave_one_out``）：结论会不会被某一个捐赠单元撑着。
+    """
+
+    n_trials: int
+    alpha: float
+    effect: float
+    #: 空间安慰剂：H0 下的误报率与 H1 下的功效
+    space_fpr: float
+    space_power: float
+    #: 时间安慰剂"不干净"的比例（H0 / H1）—— 两者**应当接近**（它与效应无关）
+    time_not_clean_h0: float
+    time_not_clean_h1: float
+    #: 同种子下 H0 与 H1 的时间安慰剂读数**逐位相同**的比例（不变量的实测）
+    time_effect_blind_share: float
+    #: 留一法：H1 下符号稳定的比例与中位移动幅度
+    loo_sign_stable_h1: float
+    loo_median_shift_h1: float
+
+    @property
+    def space_is_calibrated(self) -> bool:
+        """空间安慰剂的 H0 误报率不超过名义值 +0.05（小样本，容差放宽）。"""
+        return self.space_fpr <= self.alpha + 0.05
+
+    @property
+    def space_has_power(self) -> bool:
+        return self.space_power >= 0.8
+
+    @property
+    def time_placebo_is_effect_blind(self) -> bool:
+        """时间安慰剂在 H0/H1 下逐位相同 —— 它是处置前窗口的诊断，不是效应检验。"""
+        return self.time_effect_blind_share >= 0.999
+
+    @property
+    def loo_is_stable(self) -> bool:
+        return self.loo_sign_stable_h1 >= 0.95 and self.loo_median_shift_h1 <= 0.15
+
+    def summary(self) -> str:
+        return "\n".join(
+            [
+                f"SCM 的三条安慰剂检查（各 {self.n_trials} 次，alpha={self.alpha}，"
+                f"真实效应 {self.effect:g}）",
+                f"  空间安慰剂：H0 误报率 {self.space_fpr:.4f}，H1 功效 {self.space_power:.4f}",
+                f"  时间安慰剂：不干净的比例 H0 {self.time_not_clean_h0:.4f} / "
+                f"H1 {self.time_not_clean_h1:.4f}",
+                f"    **同种子下 H0/H1 读数逐位相同**的比例 "
+                f"{self.time_effect_blind_share:.4f} —— 它只看处置前窗口，与效应无关",
+                f"  留一法：H1 下符号稳定 {self.loo_sign_stable_h1:.4f}，"
+                f"中位移动 {self.loo_median_shift_h1:.1%}",
+                "  读法：三条回答三个不同的问题（别的单元 / 别的时段 / 是否靠某一个捐赠单元）；",
+                "        只有空间安慰剂能当检验用，另外两条是**诊断**。",
+            ]
+        )
+
+
+def run_scm_placebo_audit(
+    config: SCMConfig | None = None,
+    *,
+    n_trials: int = 150,
+    alpha: float = 0.05,
+    effect: float = 3.0,
+    seed: int = 0,
+) -> SCMPlaceboAudit:
+    """跑三条检查：空间安慰剂（检验）、时间安慰剂（诊断）、留一法（稳健性）。"""
+    cfg = config or SCMConfig(n_units=25, n_pre=16, n_post=8, noise_sd=0.4)
+
+    space_hits_null = space_hits_alt = 0
+    time_not_clean_h0 = time_not_clean_h1 = 0
+    identical = 0
+    loo_stable = 0
+    loo_shifts: list[float] = []
+
+    for i in range(n_trials):
+        data_null = generate_scm_scenario(cfg, effect=0.0, seed=seed + i)
+        data_alt = generate_scm_scenario(cfg, effect=effect, seed=seed + i)
+
+        space_hits_null += int(placebo_inference(data_null).p_value < alpha)
+        space_hits_alt += int(placebo_inference(data_alt).p_value < alpha)
+
+        tp_null = time_placebo(data_null)
+        tp_alt = time_placebo(data_alt)
+        time_not_clean_h0 += int(not tp_null.clean)
+        time_not_clean_h1 += int(not tp_alt.clean)
+        # 不变量：时间安慰剂只用处置前窗口 ⇒ 同一个种子下两个效应档必须逐位相同
+        identical += int(
+            tp_null.placebo_att == tp_alt.placebo_att
+            and tp_null.n_pre_used == tp_alt.n_pre_used
+        )
+
+        loo = leave_one_out(data_alt)
+        loo_stable += int(loo.sign_is_stable)
+        loo_shifts.append(loo.max_shift_share)
+
+    return SCMPlaceboAudit(
+        n_trials=n_trials,
+        alpha=alpha,
+        effect=effect,
+        space_fpr=space_hits_null / n_trials,
+        space_power=space_hits_alt / n_trials,
+        time_not_clean_h0=time_not_clean_h0 / n_trials,
+        time_not_clean_h1=time_not_clean_h1 / n_trials,
+        time_effect_blind_share=identical / n_trials,
+        loo_sign_stable_h1=loo_stable / n_trials,
+        loo_median_shift_h1=float(np.median(loo_shifts)),
+    )
 
 
 def run_scm_audit(

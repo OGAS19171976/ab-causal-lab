@@ -170,7 +170,12 @@ CLAIMS: list[tuple[str, str, str]] = [
     ("治理·决策层：护栏能停实验", "governance_report.md", "决策层：护栏触发"),
     ("治理·决策层：服务端复核", "governance_report.md", "服务端自己复核"),
     ("治理·没做清单：检查器会抓过时声明", "governance_report.md", "没做」的清单"),
-    ("治理·没做清单：4 条机检", "governance_report.md", "机检 4 条"),
+    ("治理·没做清单：3 条机检", "governance_report.md", "机检 3 条"),
+    # SCM 三条检查（m3 第 4 节随 --quick 变 → 只加文本类声明）
+    ("M3·SCM：三条检查各自回答不同的问题",
+     "m3_validation.md", "三条各自回答**不同**的问题"),
+    ("M3·SCM：时间安慰剂与效应无关（不变量）",
+     "m3_validation.md", "同种子下 H0/H1 读数逐位相同"),
     # 数仓簇级 A/A 校准（warehouse 报告 6d 节，数值稳定，不随 --quick 变）
     ("数仓·簇级 A/A：post-only 误停率 0",
      "warehouse_report.md", "误停率 0.0000（Wilson [0.0000, 0.0602]）"),

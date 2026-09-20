@@ -35,6 +35,10 @@ __all__ = [
     "generate_scm_scenario",
     "synthetic_control",
     "placebo_inference",
+    "TimePlaceboResult",
+    "LeaveOneOutResult",
+    "time_placebo",
+    "leave_one_out",
 ]
 
 
@@ -277,4 +281,164 @@ def placebo_inference(data: SCMData, *, treated_index: int | None = None) -> Pla
         p_value=p,
         treated_att=main.att,
         placebo_atts=np.asarray(atts),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 时间安慰剂与留一法：空间安慰剂之外的两种"自打脸"检查
+# --------------------------------------------------------------------------- #
+@dataclass
+class TimePlaceboResult:
+    """时间安慰剂：把"处置"往前挪到处置前窗口里，看它会不会也造出一个效应。
+
+    做法（Abadie 的 in-time placebo）：只用 ``[0, k)`` 这段拟合权重，
+    然后在 ``[k, n_pre)`` 这段**什么都没发生**的窗口上算差距。
+    如果这里也能"检出"一个可观的效果，说明这条差距路径本来就不可信 ——
+    它可能是过拟合（捐赠池被拟合得太紧）或者结构性漂移，而不是处置造成的。
+
+    与空间安慰剂的分工：空间安慰剂问"**别的单元**会不会也这样"，
+    时间安慰剂问"**别的时段**会不会也这样"。两种都过，结论才站得住。
+    """
+
+    n_pre_used: int
+    placebo_att: float
+    placebo_rmse_ratio: float
+    #: 同一个"处置前窗口"里，真实拟合的 RMSE（用来给 placebo_att 定标尺）
+    pre_rmse_scale: float
+
+    @property
+    def scaled_placebo(self) -> float:
+        """把安慰剂效应按处置前拟合误差标准化 —— 它才是"大不大"的读数。"""
+        return abs(self.placebo_att) / self.pre_rmse_scale if self.pre_rmse_scale > 0 else float("nan")
+
+    @property
+    def clean(self) -> bool:
+        """安慰剂效应不超过处置前拟合误差的 2 倍。"""
+        return bool(self.scaled_placebo <= 2.0)
+
+    def summary(self) -> str:
+        return (
+            f"时间安慰剂（前 {self.n_pre_used} 期拟合，后 {self.n_pre_used} 期当安慰剂窗口）\n"
+            f"  安慰剂窗口的 ATT = {self.placebo_att:+.4f}\n"
+            f"  处置前拟合 RMSE = {self.pre_rmse_scale:.4f} → 标准化后"
+            f" {self.scaled_placebo:.3f}（≤2 视为干净：{self.clean}）\n"
+            f"  安慰剂窗口内的处置后/处置前 RMSE 比值 = {self.placebo_rmse_ratio:.3f}"
+        )
+
+
+def time_placebo(
+    data: SCMData, *, treated_index: int | None = None, split: float = 0.5
+) -> TimePlaceboResult:
+    """见 ``TimePlaceboResult``。``split`` 是"假想处置时点"在处置前窗口里的位置。"""
+    t_index = data.treated_index if treated_index is None else treated_index
+    if not 0.2 <= split <= 0.8:
+        raise ValueError("split 必须落在 [0.2, 0.8]，否则两侧样本太少")
+    k = int(round(data.n_pre * split))
+    if k < 3 or data.n_pre - k < 2:
+        raise ValueError(
+            f"处置前只有 {data.n_pre} 期，拆成 {k}/{data.n_pre - k} 之后不够拟合与检验"
+        )
+
+    mask = np.ones(data.n_units, dtype=bool)
+    mask[t_index] = False
+    donors = data.outcome[mask]
+
+    # 只用前半段拟合权重
+    w = _fit_weights(data.outcome[t_index, :k], donors[:, :k])
+    synthetic = w @ donors
+
+    # 安慰剂窗口 = [k, n_pre)：这一段真实效应为 0
+    placebo_gap = data.outcome[t_index, k : data.n_pre] - synthetic[k : data.n_pre]
+    placebo_att = float(np.mean(placebo_gap))
+    fit_resid = data.outcome[t_index, :k] - synthetic[:k]
+    pre_rmse = float(np.sqrt(np.mean(fit_resid**2)))
+    placebo_rmse = (
+        float(np.sqrt(np.mean(placebo_gap**2))) if placebo_gap.size else float("nan")
+    )
+    ratio = placebo_rmse / pre_rmse if pre_rmse > 0 else float("nan")
+
+    return TimePlaceboResult(
+        n_pre_used=k,
+        placebo_att=placebo_att,
+        placebo_rmse_ratio=float(ratio),
+        pre_rmse_scale=pre_rmse,
+    )
+
+
+@dataclass
+class LeaveOneOutResult:
+    """留一法：逐个丢掉一个捐赠单元，看估计的处置效应稳不稳。
+
+    这条检查针对的是"整个结论靠某一个捐赠单元撑着"的情形 ——
+    在合成控制里很常见（权重集中在一两个单元上时尤其如此）。
+    """
+
+    att_full: float
+    att_dropped: np.ndarray
+    weights_full: np.ndarray
+
+    @property
+    def att_min(self) -> float:
+        return float(np.min(self.att_dropped))
+
+    @property
+    def att_max(self) -> float:
+        return float(np.max(self.att_dropped))
+
+    @property
+    def att_sd(self) -> float:
+        return float(np.std(self.att_dropped, ddof=1)) if self.att_dropped.size > 1 else 0.0
+
+    @property
+    def most_influential(self) -> int:
+        """丢掉之后 ATT 变得最多的那个捐赠单元的下标（捐赠池内）。"""
+        return int(np.argmax(np.abs(self.att_dropped - self.att_full)))
+
+    @property
+    def sign_is_stable(self) -> bool:
+        """所有留一估计的符号都与全样本一致。"""
+        return bool(
+            np.all(self.att_dropped > 0) if self.att_full > 0 else np.all(self.att_dropped < 0)
+        )
+
+    @property
+    def max_shift_share(self) -> float:
+        """最坏的那次删掉，ATT 相对全样本移动了多少比例。"""
+        if self.att_full == 0:
+            return float("nan")
+        return float(
+            np.max(np.abs(self.att_dropped - self.att_full)) / abs(self.att_full)
+        )
+
+    def summary(self) -> str:
+        return (
+            f"留一法（逐个丢掉 {self.att_dropped.size} 个捐赠单元）\n"
+            f"  全样本 ATT = {self.att_full:+.4f}\n"
+            f"  留一 ATT 范围 [{self.att_min:+.4f}, {self.att_max:+.4f}]，"
+            f"sd {self.att_sd:.4f}\n"
+            f"  最坏一次移动 {self.max_shift_share:.1%}；符号是否稳定：{self.sign_is_stable}"
+        )
+
+
+def leave_one_out(data: SCMData, *, treated_index: int | None = None) -> LeaveOneOutResult:
+    """见 ``LeaveOneOutResult``：逐个丢掉捐赠单元重估。"""
+    t_index = data.treated_index if treated_index is None else treated_index
+    main = synthetic_control(data, treated_index=t_index)
+    donor_indices = [j for j in range(data.n_units) if j != t_index]
+
+    atts: list[float] = []
+    for drop in donor_indices:
+        keep = [j for j in donor_indices if j != drop]
+        sub = SCMData(
+            outcome=data.outcome[[t_index, *keep]],
+            n_pre=data.n_pre,
+            true_effect=data.true_effect,
+            treated_index=0,
+        )
+        atts.append(float(synthetic_control(sub, treated_index=0).att))
+
+    return LeaveOneOutResult(
+        att_full=float(main.att),
+        att_dropped=np.asarray(atts),
+        weights_full=main.weights,
     )

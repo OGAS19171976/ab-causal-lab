@@ -46,13 +46,17 @@ from .panel import (
 )
 from .sensitivity import TrendSensitivity, trend_sensitivity
 from .synthetic import (
+    LeaveOneOutResult,
     PlaceboResult,
     SCMConfig,
     SCMData,
     SCMResult,
+    TimePlaceboResult,
     generate_scm_scenario,
+    leave_one_out,
     placebo_inference,
     synthetic_control,
+    time_placebo,
 )
 from .uplift import (
     UpliftCurve,
@@ -65,6 +69,11 @@ from .uplift import (
 )
 
 __all__ = [
+    "LeaveOneOutResult",
+    "TimePlaceboResult",
+    "leave_one_out",
+    "time_placebo",
+
     "dr_learner",
     "r_learner",
     "IVResult",

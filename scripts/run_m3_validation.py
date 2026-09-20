@@ -37,11 +37,13 @@ from ablab.causal import (  # noqa: E402
     callaway_santanna,
     generate_scm_scenario,
     generate_staggered_panel,
+    leave_one_out,
     placebo_inference,
     pretrend_test,
     sun_abraham,
     sun_abraham_regression,
     synthetic_control,
+    time_placebo,
     trend_sensitivity,
     twfe,
     twfe_decomposition,
@@ -55,6 +57,7 @@ from ablab.validation import (  # noqa: E402
     run_iv_audit,
     run_pretrend_audit,
     run_scm_audit,
+    run_scm_placebo_audit,
     run_sensitivity_audit,
     run_staggered_estimator_comparison,
 )
@@ -586,6 +589,22 @@ def main() -> int:
     emit("单个示例：")
     emit(demo_main.summary())
     emit(demo_placebo.summary())
+    emit("")
+    emit("  这一轮补上另外两条检查 —— 三条各自回答**不同**的问题，混着读会读错：")
+    emit("    · 空间安慰剂（上面那条）：别的**单元**会不会也这样 —— 唯一能当检验用的；")
+    emit("    · 时间安慰剂：别的**时段**会不会也这样。它**只看处置前窗口**，")
+    emit("      所以与有没有真实效应**无关**（这一节把「同种子下 H0/H1 逐位相同」")
+    emit("      当成不变量量出来）；它的用途是诊断「这条合成对照在留出的处置前窗口」")
+    emit("      上站不站得住」，不是检验效应；")
+    emit("    · 留一法：结论会不会被某一个捐赠单元撑着。")
+    emit("")
+    scm_placebo = run_scm_placebo_audit(n_trials=n_scm)
+    for line in scm_placebo.summary().splitlines():
+        emit("  " + line)
+    emit("")
+    emit("  示例上的两条读数：")
+    emit("    " + time_placebo(demo).summary().replace("\n", "\n    "))
+    emit("    " + leave_one_out(demo).summary().replace("\n", "\n    "))
 
     # ---- 5. 敏感性分析 ----------------------------------------------------- #
     emit(f"\n### 5. 平行趋势敏感性：翻转点分析（{n_sens} 次）")
@@ -618,6 +637,10 @@ def main() -> int:
         "检验对不可见违背无功效": pretrend.blind_spot,
         "合成控制安慰剂假阳性率接近名义": abs(scm_audit.false_positive_rate - 0.05) < 0.06,
         "敏感性分析给出有限翻转点": np.isfinite(sens_audit.median_breakdown),
+        "SCM 空间安慰剂校准": scm_placebo.space_is_calibrated,
+        "SCM 空间安慰剂有功效": scm_placebo.space_has_power,
+        "SCM 时间安慰剂与效应无关（不变量）": scm_placebo.time_placebo_is_effect_blind,
+        "SCM 留一法稳健": scm_placebo.loo_is_stable,
         "内生性把 OLS 推偏了": iv_audit.ols_is_biased,
         "没有内生性时 OLS 无偏（正对照）": abs(iv_audit.ols_bias_no_endogeneity) < 0.15,
         "弱工具把 2SLS 拉向 OLS": iv_audit.weak_pulls_to_ols,

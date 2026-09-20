@@ -86,14 +86,6 @@ ITEMS: tuple[UnimplementedItem, ...] = (
         ),
     ),
     UnimplementedItem(
-        id="scm_time_placebo",
-        readme_phrase="合成控制只做了空间安慰剂",
-        kind="symbol_absent",
-        target="ablab.causal.synthetic.time_placebo",
-        anchor_present="ablab.causal.synthetic",
-        when_done="README 要补时间安慰剂/留一法的实测",
-    ),
-    UnimplementedItem(
         id="sensitivity_smoothness",
         readme_phrase="敏感性分析只做了线性违背",
         kind="symbol_absent",

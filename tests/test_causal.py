@@ -1590,6 +1590,82 @@ class TestSyntheticControl:
 # --------------------------------------------------------------------------- #
 # 敏感性分析
 # --------------------------------------------------------------------------- #
+class TestSyntheticControlPlacebos:
+    """合成控制的三条检查：空间安慰剂（检验）、时间安慰剂与留一法（诊断）。
+
+    这一组最重要的东西是**分工**：时间安慰剂只看处置前窗口，
+    所以它与有没有真实效应无关 —— 那不是缺陷，是它的定义。
+    """
+
+    @staticmethod
+    def _data(effect=3.0, seed=0, n_pre=16):
+        from ablab.causal import SCMConfig, generate_scm_scenario
+
+        return generate_scm_scenario(
+            SCMConfig(n_units=20, n_pre=n_pre, n_post=8, noise_sd=0.4),
+            effect=effect, seed=seed,
+        )
+
+    def test_time_placebo_is_effect_blind(self):
+        """**不变量**：同一个种子下，H0 与 H1 的时间安慰剂读数逐位相同。
+
+        它只用处置前窗口，所以真实效应（加在处置后）不可能影响它。
+        这条不变量同时说明：**不要拿它当效应检验**。
+        """
+        from ablab.causal import time_placebo
+
+        null = time_placebo(self._data(effect=0.0, seed=3))
+        alt = time_placebo(self._data(effect=50.0, seed=3))
+        assert null.placebo_att == alt.placebo_att
+        assert null.n_pre_used == alt.n_pre_used
+        assert null.pre_rmse_scale == alt.pre_rmse_scale
+
+    def test_time_placebo_detects_a_broken_pre_fit(self):
+        """处置前窗口拟合得好的时候，安慰剂窗口里的"效应"应当很小。"""
+        from ablab.causal import time_placebo
+
+        res = time_placebo(self._data(seed=1))
+        assert res.n_pre_used == 8  # n_pre=16, split=0.5
+        assert abs(res.placebo_att) < 5 * res.pre_rmse_scale
+        assert res.scaled_placebo >= 0
+        assert isinstance(res.clean, bool)
+
+    def test_time_placebo_validates_split(self):
+        import pytest
+
+        from ablab.causal import time_placebo
+
+        with pytest.raises(ValueError, match="split"):
+            time_placebo(self._data(), split=0.05)
+        # split=0.4 且只有 6 期 ⇒ 假想处置时点落在第 2 期，拟合段太短
+        with pytest.raises(ValueError, match="不够"):
+            time_placebo(self._data(n_pre=6), split=0.4)
+
+    def test_leave_one_out_brackets_the_full_estimate(self):
+        """有真实效应时：留一法的估计应当都靠拢全样本估计，且符号一致。"""
+        from ablab.causal import leave_one_out
+
+        res = leave_one_out(self._data(effect=3.0, seed=2))
+        assert res.att_dropped.size == 19  # 20 个单元，留一个是捐赠池里的 19 个
+        assert res.sign_is_stable
+        assert abs(res.att_full - 3.0) < 1.0
+        assert res.att_min > 0 and res.att_max < 5.0
+        assert res.max_shift_share < 0.25
+        assert 0 <= res.most_influential < res.att_dropped.size
+
+    def test_placebo_audit_separates_the_three_roles(self):
+        """审计本体：空间安慰剂当检验、时间安慰剂与效应无关、留一法稳。"""
+        from ablab.validation import run_scm_placebo_audit
+
+        audit = run_scm_placebo_audit(n_trials=25)
+        assert audit.space_is_calibrated
+        assert audit.space_has_power
+        assert audit.time_placebo_is_effect_blind
+        assert audit.loo_is_stable
+        # 时间安慰剂"不干净"的比例在两个效应档下应当接近（它不看处置后）
+        assert abs(audit.time_not_clean_h0 - audit.time_not_clean_h1) < 0.15
+
+
 class TestSensitivity:
     def test_breakdown_is_finite_and_positive(self):
         panel, _ = generate_staggered_panel(HEADLINE)

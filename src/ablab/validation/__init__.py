@@ -28,10 +28,12 @@ from .causal_audit import (
     EstimatorComparison,
     PretrendAudit,
     SCMAudit,
+    SCMPlaceboAudit,
     SensitivityAudit,
     run_aggregation_variance_audit,
     run_pretrend_audit,
     run_scm_audit,
+    run_scm_placebo_audit,
     run_sensitivity_audit,
     run_staggered_estimator_comparison,
 )
@@ -96,6 +98,8 @@ from .sequential_audit import (
 )
 
 __all__ = [
+    "SCMPlaceboAudit",
+    "run_scm_placebo_audit",
     "TauRuleAudit",
     "TauRuleRow",
     "run_tau_rule_audit",
