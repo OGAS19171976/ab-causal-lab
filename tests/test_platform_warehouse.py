@@ -246,6 +246,100 @@ class TestRatioLinkPowerCalibration:
         assert abs(a.bias) <= 4 * mc_se, (a.bias, mc_se)
 
 
+@pytest.fixture(scope="session")
+def cluster_replicate_warehouse_path(project_root):
+    """再建一条**整簇随机化复制实验**的小数仓（6 个 A/A，60 个城市）。"""
+    from ablab.warehouse import (
+        DEFAULT_EXPERIMENTS,
+        WarehouseConfig,
+        build_warehouse,
+        cluster_replicate_experiments,
+    )
+
+    base = project_root / "build" / "_test_tmp" / "warehouse_cluster_reps"
+    base.mkdir(parents=True, exist_ok=True)
+    path = base / "wh_clu.duckdb"
+    config = WarehouseConfig(
+        n_users=3000,
+        experiments=DEFAULT_EXPERIMENTS + cluster_replicate_experiments(6),
+    )
+    con = build_warehouse(
+        path, base / "source", project_root / "sql", config=config,
+        force_data=True, verbose=False,
+    )
+    con.close()
+    return path
+
+
+class TestClusterReplicateCalibration:
+    """数仓路径上的**簇级** A/A 校准：整簇随机化 × 多个 salt。
+
+    这一组钉的是"M6 只报了方差缩减、不声称覆盖率"那条边界被补上的证据：
+    簇级推断走的是另一条数据链路（ADS 臂级 + DWS 簇级），
+    合成路径上对，推不出数仓路径上也对。
+    """
+
+    def test_replicate_definitions_are_cluster_randomized(self):
+        from ablab.warehouse import cluster_replicate_experiments
+
+        reps = cluster_replicate_experiments(6)
+        assert len({e.name for e in reps}) == 6
+        assert len({e.layer for e in reps}) == 6, "每个复制实验必须独占一层"
+        assert all(e.cluster_key == "city" for e in reps), "必须是整簇随机化"
+        assert all(e.true_lift == 0.0 for e in reps), "A/A：真实效应必须是 0"
+        assert all(e.bucket_end == 10_000 for e in reps), "取满桶位才有 60 个簇"
+
+    def test_every_replicate_keeps_all_clusters(self, cluster_replicate_warehouse_path):
+        """每个复制实验都要拿到全部 60 个簇 —— 少了就不叫"够多簇"的重复。"""
+        import duckdb
+
+        con = duckdb.connect(str(cluster_replicate_warehouse_path), read_only=True)
+        try:
+            frame = con.execute(
+                "SELECT experiment, COUNT(DISTINCT city) AS n_clusters"
+                " FROM dwd_experiment_user WHERE experiment LIKE 'exp_cluster_rep%'"
+                " GROUP BY experiment"
+            ).df()
+        finally:
+            con.close()
+        assert len(frame) == 6
+        assert (frame["n_clusters"] == 60).all(), frame.to_dict("records")
+
+    def test_calibration_on_the_real_chain(self, cluster_replicate_warehouse_path):
+        import duckdb
+
+        from ablab.warehouse.cluster_calibration import run_cluster_replicate_calibration
+
+        con = duckdb.connect(str(cluster_replicate_warehouse_path), read_only=True)
+        try:
+            res = run_cluster_replicate_calibration(con, n_replicates=6, estimator="cuped")
+        finally:
+            con.close()
+
+        assert res.n_replicates == 6
+        assert 0.0 <= res.fpr <= 1.0
+        assert res.fpr_interval[0] <= res.fpr <= res.fpr_interval[1]
+        assert res.n_clusters_min == 60
+        assert len(res.final_z) == 6
+        assert res.z_sd > 0
+        # 簇级 A/A 的误停率必须**不高于**名义值太多（Wilson 上界是宽区间，
+        # 6 个复制实验量不出精确的 size —— 所以这里只钉"没有明显崩"）
+        assert res.fpr_interval[1] < 0.6, res.fpr_interval
+
+    def test_degenerate_input_is_refused(self, cluster_replicate_warehouse_path):
+        import duckdb
+        import pytest as _pytest
+
+        from ablab.warehouse.cluster_calibration import run_cluster_replicate_calibration
+
+        con = duckdb.connect(str(cluster_replicate_warehouse_path), read_only=True)
+        try:
+            with _pytest.raises(ValueError, match="至少"):
+                run_cluster_replicate_calibration(con, n_replicates=3)
+        finally:
+            con.close()
+
+
 class TestRatioReplicateCalibration:
     """比值链路的**序贯校准**：重复实现才是校准，一致性不是。
 

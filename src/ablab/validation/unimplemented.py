@@ -101,21 +101,6 @@ ITEMS: tuple[UnimplementedItem, ...] = (
         anchor_present="ablab.causal.sensitivity",
         when_done="README 要补相对幅度/平滑约束版本的实测",
     ),
-    UnimplementedItem(
-        id="warehouse_cluster_aa",
-        readme_phrase="数仓路径上还没有簇级的 A/A 校准",
-        kind="symbol_absent",
-        target="ablab.warehouse.ratio_calibration.run_cluster_replicate_calibration",
-        anchor_present="ablab.warehouse.ratio_calibration.run_ratio_link_power_calibration",
-        when_done=(
-            "README 要改成「数仓路径上的簇级 A/A 也量过了」，"
-            "并给出误停率/覆盖的实测（那时每个复制实验要吃下 ~30 个城市）"
-        ),
-        notes=[
-            "只钉「数仓路径上没有簇级重复实现」，不声称「簇级 CUPED 没校准」——"
-            "合成路径上量过（reports/m6_validation.md 第 7 节，误停率 0.0400）",
-        ],
-    ),
 )
 
 

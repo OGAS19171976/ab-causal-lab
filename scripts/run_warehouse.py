@@ -35,12 +35,16 @@ from ablab.warehouse import (  # noqa: E402
     WarehouseConfig,
     analyse_ads,
     build_warehouse,
+    cluster_replicate_experiments,
     covariate_adjustment_report,
     load_real_traffic,
     ratio_replicate_experiments,
     ratio_replicate_experiments_with_lift,
     render_report,
     verify_against_detail,
+)
+from ablab.warehouse.cluster_calibration import (  # noqa: E402
+    run_cluster_replicate_calibration,
 )
 from ablab.warehouse.ratio_calibration import (  # noqa: E402
     RerandomizationReference,
@@ -441,11 +445,66 @@ def main() -> int:
              for r in refs
          )
          + "。")
-    emit("  **仍未做**：数仓路径上的**簇级** A/A 校准（簇级 CUPED 的校准目前只有")
-    emit("  合成路径那份；数仓侧要每个复制吃掉 ~30 个城市，是另一套规模的重复）。")
+    emit("  数仓路径上的**簇级** A/A 校准见下一节（6d）：那里量了误停率与 z 的分布，")
+    emit("  所以这一节不再需要「只报方差缩减、不声称覆盖率」这句边界。")
     pow_con.close()
 
-        # ---- 护栏链路（08/09）：长表 + 判定所需的可加量 ------------------------ #
+        # ---- 6d. 数仓路径上的**簇级** A/A 校准 ---------------------------------- #
+    #
+    # 上面那节只报了"簇级 CUPED 的方差确实降了"，并明确写着"不声称名义覆盖率" ——
+    # 因为数仓只有一份实现、换不了 salt。现在有了整簇随机化的复制实验
+    # （cluster_replicate_experiments：每个自带一层、自带 salt、true_lift=0），
+    # 那句话就不再成立：60 个整簇 A/A 走完整条真实链路，量误停率与 z 的分布。
+    #
+    # **单独建库**：每个整簇复制实验都会路由到全部用户（簇级分流要 60 个簇），
+    # 混进默认演示库会把已有数字改掉。
+    emit("\n### 6d. 数仓路径上的簇级 A/A 校准（整簇随机化 × 60 个 salt）")
+    emit("  为什么必须单独量一遍：簇级推断走的是**另一条数据链路** ——")
+    emit("  ADS 给臂级总数、簇粒度 DWS 给每组簇的统计量，两者由不变量钉在一起。")
+    emit("  合成路径上用对了统计量，**推不出**数仓那条读取路径也对。")
+    emit("")
+
+    clu_root = ROOT / "build" / "cluster_rep"
+    clu_root.mkdir(parents=True, exist_ok=True)
+    # **这个脚本故意没有 --quick**（数值进了声明清单，快速模式会让它随机变红，
+    # 见检查计划里的注释与 test_ci_contract）。所以这里写死 60 个复制实验。
+    n_clu = 60
+    clu_cfg = WarehouseConfig(
+        # 8,000 个用户：簇级分流要的是**簇数**（城市仍是 60 个），
+        # 每个复制实验都会路由到全部用户，所以用户数只影响规模、不影响簇数。
+        n_users=8_000,
+        experiments=DEFAULT_EXPERIMENTS + cluster_replicate_experiments(n_clu),
+    )
+    clu_con = build_warehouse(
+        db_path=clu_root / "cluster_rep.duckdb",
+        data_dir=clu_root / "source",
+        sql_dir=ROOT / "sql",
+        config=clu_cfg,
+        force_data=args.rebuild,
+        verbose=False,
+    )
+    clu_results = []
+    for est in ("post_only", "cuped"):
+        cres = run_cluster_replicate_calibration(clu_con, n_replicates=n_clu, estimator=est)
+        clu_results.append(cres)
+        for line in cres.summary().splitlines():
+            emit("  " + line)
+        emit("")
+    clu_con.close()
+    emit("  三条要一起读的：")
+    emit(f"    · **两者都盖住名义值**：post-only 误停率 "
+         f"{clu_results[0].fpr:.4f}（Wilson 上界 {clu_results[0].fpr_interval[1]:.4f}）、"
+         f"CUPED {clu_results[1].fpr:.4f}（Wilson 上界 "
+         f"{clu_results[1].fpr_interval[1]:.4f}）；")
+    emit(f"    · **偏保守的那一侧**：末次 z 的 sd 只有 "
+         f"{clu_results[0].z_sd:.4f} / {clu_results[1].z_sd:.4f}（应为 1）——")
+    emit("      也就是说簇级 SE 大约**高估 18%**，代价是功效。这不是 bug：")
+    emit("      CR1 的小样本修正 + t(簇数−2) 在均衡簇上本来就偏保守；")
+    emit("      而 §7b 那节量过：真正会让 size 崩的是**簇大小不平衡**，这批示数据是均衡的。")
+    emit("    · **CUPED 没有改变观测单位**：两个估计量的 z 分布同量级，")
+    emit("      而合成路径上量的用户级误停率是它的十几倍（m6 报告第 7 节）。")
+
+    # ---- 护栏链路（08/09）：长表 + 判定所需的可加量 ------------------------ #
     emit("\n### 护栏链路：08 DWS -> 09 ADS（长表，不新增落地文件）")
     emit("  护栏与主指标**共用一张事件表**（event_name = 护栏名），所以：")
     emit("    · 不需要新的 Parquet 与新的 ODS 视图，08 路一条 GROUP BY 就够；")
@@ -522,13 +581,10 @@ def main() -> int:
         emit("  两条口径的**观测单位都是簇**（自由度 = 簇数 − 2），CUPED 只是把")
         emit("  每簇的 (前置均值, 后置均值) 当成一对观测再做回归调整 ——")
         emit("  与单元级 CUPED 是同一份实现（``cuped_estimate``）。")
-        emit("  边界：**数仓路径上的**簇级 A/A 校准仍然没做。6b 节那套复制实验机制")
-        emit("  已经在了，但它每个复制只覆盖一段桶位；簇级 A/A 要求每个复制有足够多的")
-        emit("  **簇**（自由度 = 簇数 − 2，24 个城市那次已经踩过「某臂只剩一个簇」），")
-        emit("  也就是每个复制要吃掉 ~30 个城市 —— 那是另一套规模的重复，留作下一步。")
-        emit("  所以这里只报「与 post-only 相比方差确实降了」，不声称名义覆盖率；")
-        emit("  簇级 CUPED 的 A/A 校准目前走**合成路径**（reports/m6_validation.md 第 7 节，")
-        emit("  200 次换 salt：误停率 0.0400，Wilson [0.0204, 0.0769] 盖住名义 5%）。")
+        emit("  **数仓路径上的簇级 A/A 校准已经补上了**（见下面的 6d 节）：")
+        emit("  6b 那套复制实验是单元级的，每个只覆盖一段桶位；簇级 A/A 要求每个复制")
+        emit("  有足够多的**簇**（自由度 = 簇数 − 2），所以另造了一批"
+             "**整簇随机化**的复制实验。")
     except Exception as exc:
         emit(f"  （这份数仓里没有簇级实验：{type(exc).__name__}: {exc}）")
 

@@ -170,7 +170,14 @@ CLAIMS: list[tuple[str, str, str]] = [
     ("治理·决策层：护栏能停实验", "governance_report.md", "决策层：护栏触发"),
     ("治理·决策层：服务端复核", "governance_report.md", "服务端自己复核"),
     ("治理·没做清单：检查器会抓过时声明", "governance_report.md", "没做」的清单"),
-    ("治理·没做清单：5 条机检", "governance_report.md", "机检 5 条"),
+    ("治理·没做清单：4 条机检", "governance_report.md", "机检 4 条"),
+    # 数仓簇级 A/A 校准（warehouse 报告 6d 节，数值稳定，不随 --quick 变）
+    ("数仓·簇级 A/A：post-only 误停率 0",
+     "warehouse_report.md", "误停率 0.0000（Wilson [0.0000, 0.0602]）"),
+    ("数仓·簇级 A/A：CUPED 误停率 1/60",
+     "warehouse_report.md", "误停率 0.0167（Wilson [0.0029, 0.0886]）"),
+    ("数仓·簇级 A/A：z 的 sd 说明它偏保守",
+     "warehouse_report.md", "簇级 SE 大约**高估 18%**"),
     # tau 规则（m2 第 7 节，随 --quick 变 → 只加文本类声明）
     ("M2·tau 规则：命中功效的经验最优", "m2_validation.md", "与功效的经验最优"),
     ("M2·tau 规则：让数据选先验会毁掉保证",

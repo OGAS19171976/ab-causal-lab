@@ -256,6 +256,54 @@ def ratio_replicate_experiments_with_lift(
     return tuple(out)
 
 
+#: 整簇随机化的复制实验：名字前缀与共享层名。
+CLUSTER_REPLICATE_PREFIX = "exp_cluster_rep"
+
+
+def cluster_replicate_experiments(
+    n: int,
+    *,
+    prefix: str = CLUSTER_REPLICATE_PREFIX,
+    cluster_key: str = "city",
+) -> tuple[ExperimentDef, ...]:
+    """``n`` 个**整簇随机化**的 A/A 复制实验：每个自带一层、自带 salt、真实效应 0。
+
+    为什么要有它：簇级 CUPED 的 A/A 校准此前只有**合成路径**那一份
+    （reports/m6_validation.md 第 7 节，误停率 0.0400）。数仓路径上一直没量，
+    理由是"数仓只有一份实现、换不了 salt" —— 而这个函数就是那批 salt。
+
+    与 ``ratio_replicate_experiments``（单元级、各占一段桶位）的两点不同：
+
+    * **分流在簇级别做**（``cluster_key="city"``）：一个城市整体落到某一臂，
+      这正是簇级检验要面对的 DGP；
+    * **桶位取满**（一个城市一个哈希值，取满才有 60 个簇）：
+      所以每个复制实验都会路由到**全部**用户，源数据的曝光行是 ``n × 用户数``。
+      这也意味着复制实验之间的用户是重叠的 —— 但它们的分流互相独立
+      （各自一层、各自 salt），而 ``true_lift=0`` 保证结果序列不被污染，
+      所以"独立重复"这件事仍然成立。
+    """
+    if n < 1:
+        raise ValueError("复制实验个数必须为正")
+    if cluster_key != "city":
+        raise ValueError("数仓里只有 city 这一列簇键")
+    out: list[ExperimentDef] = []
+    for i in range(n):
+        name = f"{prefix}{i:03d}"
+        out.append(
+            ExperimentDef(
+                name=name,
+                layer=f"cluster_rep{i:03d}",
+                layer_salt=f"layer_cluster_rep{i:03d}",
+                bucket_start=0,
+                bucket_end=10_000,
+                true_lift=0.0,
+                hypothesis="整簇 A/A 复制实验：真实效应为 0，用于校准数仓路径的簇级推断",
+                cluster_key=cluster_key,
+            )
+        )
+    return tuple(out)
+
+
 @dataclass(frozen=True)
 class WarehouseConfig:
     """仿真源数据的超参数。"""
