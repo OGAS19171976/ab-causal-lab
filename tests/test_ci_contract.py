@@ -92,6 +92,7 @@ class TestCheckPlan:
             ("env", "check_env_origin.py"),
             ("typed", "check_typed_deps.py"),
             ("frontend", "check_frontend.py"),
+            ("realdata", "check_real_traffic.py"),
         ):
             assert key in by_key, key
             assert any(script in a for a in by_key[key].argv), by_key[key].argv
@@ -110,10 +111,10 @@ class TestCheckPlan:
         keys = [s.key for s in runner.steps()]
         # 前 9 个是**声明过的顺序**（run_all_checks._ORDER_HEAD）：
         # lock → env → typed → lint → types → unimplemented → warehouse → gov → cate
-        assert keys[:10] == [
-            "lock", "env", "typed", "frontend", "lint", "types",
+        assert keys[:11] == [
+            "lock", "env", "typed", "frontend", "realdata", "lint", "types",
             "unimplemented", "warehouse", "gov", "cate"
-        ], keys[:10]
+        ], keys[:11]
 
     def test_claims_runs_last(self, runner):
         """**声明核对必须排在最后**：它检查的"README 数字能否在报告里找到"

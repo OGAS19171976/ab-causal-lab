@@ -122,6 +122,7 @@ _ORDER_HEAD = (
     "env",
     "typed",
     "frontend",
+    "realdata",
     "lint",
     "types",
     "unimplemented",
@@ -146,6 +147,10 @@ def steps() -> list[Step]:
         # 与"改了 id 控件静默失效"这两类不报错的坏。node 只用来做语法检查。
         Step("frontend", "前端契约：UI 调用的端点/选择器必须存在（含 node 语法检查）",
              (py, "scripts/check_frontend.py")),
+        # 真实数据的门：目录空着不算失败（那正是机检项 real_traffic 成立的条件），
+        # 但一旦有人放了 provenance.json，契约、反冒充与真接入都要过。
+        Step("realdata", "真实数据：契约 + 反冒充（合成数据不许冒充外部数据）",
+             (py, "scripts/check_real_traffic.py")),
         # ruff 走 `python -m ruff` 而不是直接调可执行文件 —— 后者在 Windows 上叫
         # ruff.exe、在 Linux 上叫 ruff，路径拼接容易写错，而 python -m 是跨平台的。
         # 下面 mypy 同理。
@@ -230,6 +235,44 @@ def run_step(step: Step, *, log_dir: Path, quick: bool) -> tuple[int, float]:
     return proc.returncode, elapsed
 
 
+#: 上一次每步耗时的落点。它的用处只有一个：**把"这次为什么慢"从猜测变成读数** ——
+#: 2026-09-21 那一次整套跑了 94.5 分钟（历史 27 分钟，3.4×），当时只能靠人肉对比
+#: 日志去判断"是机器慢还是代码变慢"。现在汇总里直接给出比值与核数。
+TIMINGS = ROOT / "build" / "checks" / ".timings.json"
+
+
+def previous_timings() -> dict[str, float]:
+    import json
+
+    if not TIMINGS.exists():
+        return {}
+    try:
+        data = json.loads(TIMINGS.read_text(encoding="utf-8"))
+    except (OSError, ValueError):  # pragma: no cover - 文件坏了就当没有
+        return {}
+    return {str(k): float(v) for k, v in data.items()}
+
+
+def remember_timings(results: list[tuple[str, int, float]]) -> None:
+    """把这次每步耗时并进基线。
+
+    **必须合并而不是覆盖**：`--only m5` 这种单步运行如果直接覆盖，
+    下次整套跑的时候基线里就只剩一步，比值列全是"-" ——
+    我第一版就是这么写的，跑了一次 `--only realdata` 之后基线被清成一行。
+    合并规则：这次跑过的步骤更新，没跑的保留旧值。
+    """
+    import json
+
+    merged = previous_timings()
+    merged.update({k: round(v, 2) for k, _c, v in results})
+    TIMINGS.parent.mkdir(parents=True, exist_ok=True)
+    TIMINGS.write_text(
+        json.dumps(merged, ensure_ascii=False, indent=1, sort_keys=True),
+        encoding="utf-8",
+        newline="\n",
+    )
+
+
 def main() -> int:
     # 放在第一行：下面每一句 print 都可能带中文或 ▶，包括 --help 之后的计划列表。
     force_utf8_output()
@@ -298,12 +341,36 @@ def main() -> int:
     failed = [k for k, code, _ in results if code != 0]
     print()
     print("=" * 74)
-    print(f"{'项':<12}{'结果':<8}{'耗时':>10}")
+    prev = previous_timings()
+    print(f"{'项':<12}{'结果':<8}{'耗时':>10}{'上次':>10}{'倍数':>7}")
     for key, code, elapsed in results:
-        print(f"{key:<12}{'OK' if code == 0 else 'FAIL':<8}{elapsed:>9.1f}s")
+        before = prev.get(key)
+        ratio = f"{elapsed / before:>6.1f}x" if before and before > 0.5 else "      -"
+        shown = f"{before:>9.1f}s" if before else "        -"
+        print(f"{key:<12}{'OK' if code == 0 else 'FAIL':<8}{elapsed:>9.1f}s{shown}{ratio}")
+    if prev:
+        # 只对**秒级以上**的步骤提示：0.1s → 0.6s 也是 6 倍，
+        # 但那说明不了机器负载（第一版就报过一次"typed 慢 5.7 倍"，
+        # 而它总共只花了 1.1 秒 —— 这种提示会教人忽略提示）。
+        slowest = max(
+            (
+                (k, v / prev[k])
+                for k, _c, v in results
+                if prev.get(k, 0) > 0.5 and v >= 5.0
+            ),
+            key=lambda kv: kv[1],
+            default=None,
+        )
+        if slowest and slowest[1] >= 1.5:
+            print()
+            print(f"  本次整体比上一次慢：最慢的一步是 {slowest[0]}（{slowest[1]:.1f}×）。")
+            print(f"  机器：CPU {os.cpu_count()} 核；如果每步都同比例变慢，"
+                  "先怀疑机器负载（内存/其它进程），不是代码回归 ——")
+            print("  代码回归通常只让**少数几步**变慢，而负载会让所有步骤一起变慢。")
     print("-" * 74)
     print(f"合计 {len(results)} 项，用时 {total:.0f}s（{total / 60:.1f} 分钟）")
     print("全部通过" if not failed else f"**失败：{', '.join(failed)}**")
+    remember_timings(results)
     print("=" * 74)
     return 1 if failed else 0
 

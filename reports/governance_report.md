@@ -149,9 +149,10 @@ ab-causal-lab · 治理验证：操作审计（append-only）+ 护栏指标显�
   （某个符号确实不存在 / 某个串搜不到 / 某个文件不存在），
   一旦不成立就在检查集里报错并指出该改哪一句。
 
+  [OK  ] real_traffic: data/real/provenance.json 仍不存在 ✓
 
-  机检 0 条『没做』：0 条仍成立，0 条已经过时。
-  另有 3 条**无法机检**、只能人读 ——清单不假装覆盖它们。
+  机检 1 条『没做』：1 条仍成立，0 条已经过时。
+  另有 2 条**无法机检**、只能人读 ——清单不假装覆盖它们。
   退出码：0（0 = 清单与事实一致）
 
   第一次跑就报了**一个假阳性**：清单里写着 `target=load_real_traffic`，
@@ -175,9 +176,9 @@ ab-causal-lab · 治理验证：操作审计（append-only）+ 护栏指标显�
       包                     版本          py.typed  stub 包          用到它的源码文件
       numpy                 2.5.3       有         -                     70
       scipy                 1.18.1      **没有**    -                     31
-      pytest                9.1.1       有         -                     18
+      pytest                9.1.1       有         -                     19
+      pandas                3.0.3       **没有**    -                      9
       fastapi               0.141.1     有         -                      7
-      pandas                3.0.3       **没有**    -                      7
       duckdb                1.5.5       有         -                      4
       scikit-learn          1.9.1       **没有**    -                      4
       packaging             26.3        有         -                      2
@@ -201,7 +202,7 @@ ab-causal-lab · 治理验证：操作审计（append-only）+ 护栏指标显�
       没带类型、但被本项目用到的（逐包处置）：
         scipy              31 个文件   处置：stub
           用到的是 stats.norm / optimize.minimize / spatial 的几个函数；本地最小 stub 只声明这些签名，上游改名会在 mypy 里报
-        pandas              7 个文件   处置：accept-any
+        pandas              9 个文件   处置：accept-any
           DataFrame 的类型在无 stub 时基本退化成 Any；本仓库对它的用法集中在数仓 IO 与列选择，靠测试与 schema 检查兜底
         scikit-learn        4 个文件   处置：accept-any
           只作为 nuisance 学习器（Ridge / RandomForest）出现，接口窄且被测试覆盖；上游一旦补上顶层 py.typed，本条会被判过时
@@ -304,6 +305,41 @@ ab-causal-lab · 治理验证：操作审计（append-only）+ 护栏指标显�
   **刻意不做** —— 这一条也写在脚本的模块文档里，免得后来人以为漏了。
   契约检查自己也有故障注入测试：拿一份**故意写坏**的页面（调用不存在的端点、
   方法写错、选择器指向不存在、语法错）跑一遍，断言它**确实报红**。
+
+### 7.14 真实数据：把「没有真实流量」变成一道有证据的门
+  已知边界里原先写着「数据里到底有没有真实流量，只能人看」——
+  这一轮把它变成 `unimplemented.py` 里一条**机检项**：
+  `kind=file_absent`、`target=data/real/provenance.json`。
+  也就是说：只要那份 provenance 不存在，README 那句话就成立；
+  一旦有人把外部数据接进来，检查集立刻红，并逼着 README 改口径。
+  这是把一个**无法核对**的问题换成可核对的证据（与 7.11 节同一个机制）。
+
+  门本身还查三层（`scripts/check_real_traffic.py`）：
+    1. **契约**：source / exported_at / external_generator / experiments /
+       tables 都在，实验的设计权重和为 1（口径必须来自声明，不能从数据反推）；
+    2. **字节与声明一致**：每张表的 sha256 与行数都要和磁盘上的文件对得上；
+    3. **反冒充**：`external_generator` 必须为 true，且源目录里不许出现
+       本仓库合成器的痕迹（`.generated` 标记、`config_fingerprint` 列）——
+       没有这一条，「合成数据 + 手写 provenance」就能把这句话骗过去。
+  三层都过了才**真接入**：load_real_traffic 归一化 → build_warehouse
+  (generate=False) 跑同一套 SQL。CI 里目录为空，所以它打印'没有接入'并返回 0。
+
+    真实数据的门（契约 + 反冒充 + 真接入）
+      目录：data/real
+
+      当前状态：**没有接入真实数据** —— 目录里没有 provenance.json。
+      这不是失败：unimplemented.py 里那条机检项（kind=file_absent，
+      target=data/real/provenance.json）正是靠『它不存在』成立的；
+      一旦有人接进来，那条检查会红，并逼着 README 改口径。
+
+      接进来的做法见 data/real/README.md（三张表的列 + provenance 契约）。
+
+  契约被实测修正过一次，值得记：第一版把 `user_profile.reg_ds` 写成「可选」，
+  依据是 `_normalize_profile` 里那个 `if reg_ds in out.columns` 的写法。
+  端到端测试（拿最小 fixture 真的跑一遍链路）当场给出
+  `KeyError: ['reg_ds'] not in index` —— **归一化器认为可选，链路认为必需**。
+  所以现在门会先查必需列，缺列时报清楚哪张表缺哪列。
+  教训（写进 README 决策 55）：**契约要从链路写，不是从某一段代码写**。
 
 ### 7.5 并发：丢失更新（后写覆盖），以及乐观锁怎么挡住它
   场景：两个客户端（**两个独立连接**，不是同一个对象）都读到同一版本，
