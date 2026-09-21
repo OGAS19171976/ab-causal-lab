@@ -65,15 +65,27 @@ DIST_TO_MODULE = {
 ALLOWED_EXTRA: dict[str, str] = {}
 
 
-def lock_pins() -> list[str]:
-    """锁文件里的发行版名（去掉 marker 与注释）。"""
-    names = []
-    for raw in LOCK.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "==" not in line:
-            continue
-        names.append(line.split("==")[0].strip())
-    return names
+def lock_pins() -> tuple[list[str], list[str]]:
+    """``(在当前平台上适用的发行版名, 因 marker 不适用的)``。
+
+    **marker 必须判**：锁文件里有 ``colorama ; sys_platform == "win32"``
+    这类平台条件依赖，在 Linux 上它们**本来就不该被安装**。第一版直接把
+    锁文件每一行都当成"必须装"，于是本地（Windows）全绿、**CI（Linux）红** ——
+    报的是"锁文件里有，但这个环境里没装"。判据本身没错，是漏了一步
+    "这条在当前平台适用吗"。
+
+    复用 ``lock_requirements.parse_lock`` / ``_marker_applies`` 而不是自己
+    再写一遍：同一个规则实现两次，迟早会分叉（这个仓库已经栽过）。
+    """
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import lock_requirements as lr
+
+    entries = lr.parse_lock(LOCK)
+    applicable: list[str] = []
+    skipped: list[str] = []
+    for name, (_version, marker) in entries.items():
+        (applicable if lr._marker_applies(marker) else skipped).append(name)
+    return sorted(applicable), sorted(skipped)
 
 
 def module_of(dist_name: str) -> str:
@@ -103,14 +115,16 @@ def check_flag() -> tuple[list[str], str]:
     return [], f"适用：{cfg} 里读到 false"
 
 
-def check_origins() -> tuple[list[str], list[tuple[str, str]]]:
+def check_origins() -> tuple[list[str], list[tuple[str, str]], list[str]]:
     """每个锁文件发行版的安装位置必须在**当前解释器的 purelib** 里。
 
     这一条同时抓两种情形：本地那种"venv 看得见系统 site-packages"的混合环境，
     以及任何"包从别的解释器漏进来"的情形 —— 判据是 purelib，与有没有 .venv 无关。
     """
-    problems, rows = [], []
-    for name in lock_pins():
+    problems: list[str] = []
+    rows: list[tuple[str, str]] = []
+    applicable, skipped = lock_pins()
+    for name in applicable:
         try:
             dist = md.distribution(name)
         except md.PackageNotFoundError:
@@ -122,13 +136,17 @@ def check_origins() -> tuple[list[str], list[tuple[str, str]]]:
         rows.append((name, where))
         if not inside:
             hint = ""
-            if USER_SITE is not None and (USER_SITE in loc.parents or loc == USER_SITE):
+            if USER_SITE is not None and parents_or_self(loc, USER_SITE):
                 hint = "（这是 **user site**：pip install --user 装的，不属于这套环境）"
             problems.append(
                 f"{name}: 来自当前解释器之外（{loc}）{hint} —— "
                 "跑测试的这套包与锁文件不是同一份"
             )
-    return problems, rows
+    return problems, rows, skipped
+
+
+def parents_or_self(path: pathlib.Path, root: pathlib.Path) -> bool:
+    return path == root or root in path.parents
 
 
 def _stdlib_names() -> set[str]:
@@ -159,7 +177,8 @@ def source_imports() -> dict[str, list[str]]:
 
 
 def check_imports() -> tuple[list[str], list[tuple[str, str]]]:
-    locked = {module_of(n) for n in lock_pins()}
+    applicable, _skipped = lock_pins()
+    locked = {module_of(n) for n in applicable}
     problems, rows = [], []
     stdlib = _stdlib_names()
     for module, files in sorted(source_imports().items()):
@@ -183,7 +202,7 @@ def check_imports() -> tuple[list[str], list[tuple[str, str]]]:
 
 def main() -> int:
     flag_problems, flag_note = check_flag()
-    origin_problems, origin_rows = check_origins()
+    origin_problems, origin_rows, skipped = check_origins()
     import_problems, import_rows = check_imports()
     problems = flag_problems + origin_problems + import_problems
 
@@ -200,6 +219,9 @@ def main() -> int:
         print(f"      ** {name} 不在 venv 里")
     print()
     untyped = [r for r in import_rows if r[1] == "**没人锁**"]
+    print(f"    另有 {len(skipped)} 个因平台 marker 不适用（本平台不该装）："
+          f"{', '.join(skipped) if skipped else '无'}")
+    print()
     print(f"  二、源码 import 的顶层模块：共 {len(import_rows)} 个，"
           f"没人锁的 {len(untyped)} 个")
     categories: dict[str, int] = {}

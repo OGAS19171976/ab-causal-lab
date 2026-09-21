@@ -35,6 +35,7 @@ from __future__ import annotations
 import ast
 import importlib.metadata as md
 import pathlib
+import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 LOCK = ROOT / "requirements.lock"
@@ -75,17 +76,25 @@ UNTYPED_DECISIONS: dict[str, tuple[str, str]] = {
 }
 
 
-def lock_pins() -> list[tuple[str, str]]:
-    """``(发行版名, 版本)``；marker 与注释都跳过。"""
-    pins = []
-    for raw in LOCK.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "==" not in line:
-            continue
-        name, rest = line.split("==", 1)
-        version = rest.split(";")[0].strip()
-        pins.append((name.strip(), version))
-    return pins
+def lock_pins() -> tuple[list[tuple[str, str]], list[str]]:
+    """``([(发行版名, 版本)], [因 marker 不适用的])``。
+
+    marker 必须判：``colorama ; sys_platform == "win32"`` 在 Linux 上
+    本来就不该装，把它算成"缺失"会让 CI 红（第一版就是这样）。
+    过滤逻辑复用 ``lock_requirements._marker_applies``，不重写。
+    """
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import lock_requirements as lr
+
+    entries = lr.parse_lock(LOCK)
+    pins: list[tuple[str, str]] = []
+    skipped: list[str] = []
+    for name, (version, marker) in entries.items():
+        if lr._marker_applies(marker):
+            pins.append((name, version))
+        else:
+            skipped.append(name)
+    return sorted(pins), sorted(skipped)
 
 
 def module_of(dist_name: str) -> str:
@@ -159,7 +168,7 @@ def usage_counts() -> dict[str, int]:
 
 
 def main() -> int:
-    pins = lock_pins()
+    pins, skipped = lock_pins()
     usage = usage_counts()
     problems: list[str] = []
     rows: list[tuple[str, str, str, str, int]] = []
@@ -201,7 +210,9 @@ def main() -> int:
 
     typed_rows = [r for r in rows if str(r[2]) == "有"]
     print("三方库类型清单（判据：覆盖 100% 的锁文件条目 + 每个无类型的包都有处置）")
-    print(f"  锁文件条目 {len(pins)} 个；带 py.typed 的 {len(typed_rows)} 个；"
+    skipped_note = ", ".join(skipped) if skipped else "无"
+    print(f"  锁文件条目 {len(pins)} 个（另有 {len(skipped)} 个因平台 marker 不适用："
+          f"{skipped_note}）；带 py.typed 的 {len(typed_rows)} 个；"
           f"本项目实际 import 的 {sum(1 for r in rows if r[4] > 0)} 个")
     print()
     print(f"  {'包':<22}{'版本':<12}{'py.typed':<10}{'stub 包':<16}{'用到它的源码文件':>8}")

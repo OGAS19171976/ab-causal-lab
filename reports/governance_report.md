@@ -170,7 +170,7 @@ ab-causal-lab · 治理验证：操作审计（append-only）+ 护栏指标显�
 
   第一句的实测（`scripts/check_typed_deps.py`）：
     三方库类型清单（判据：覆盖 100% 的锁文件条目 + 每个无类型的包都有处置）
-      锁文件条目 48 个；带 py.typed 的 32 个；本项目实际 import 的 11 个
+      锁文件条目 48 个（另有 0 个因平台 marker 不适用：无）；带 py.typed 的 32 个；本项目实际 import 的 11 个
 
       包                     版本          py.typed  stub 包          用到它的源码文件
       numpy                 2.5.3       有         -                     70
@@ -184,18 +184,18 @@ ab-causal-lab · 治理验证：操作审计（append-only）+ 护栏指标显�
       matplotlib            3.11.1      有         -                      1
       pydantic              2.13.5      有         -                      1
       uvicorn               0.53.0      有         -                      1
-      Pygments              2.21.0      **没有**    -                      0
       cloudpickle           3.1.2       **没有**    -                      0
       colorama              0.4.6       **没有**    -                      0
       fonttools             4.64.0      **没有**    -                      0
       joblib                1.6.0       **没有**    -                      0
-      mypy_extensions       1.1.0       **没有**    -                      0
+      mypy-extensions       1.1.0       **没有**    -                      0
       pyarrow               25.0.1      **没有**    -                      0
+      pygments              2.21.0      **没有**    -                      0
       python-dateutil       2.9.0.post0 **没有**    -                      0
       ruff                  0.16.8      **没有**    -                      0
       six                   1.17.0      **没有**    -                      0
       threadpoolctl         3.7.0       **没有**    -                      0
-      typing_extensions     4.16.0      **没有**    -                      0
+      typing-extensions     4.16.0      **没有**    -                      0
       tzdata                2026.2      **没有**    -                      0
 
       没带类型、但被本项目用到的（逐包处置）：
@@ -226,6 +226,8 @@ ab-causal-lab · 治理验证：操作审计（append-only）+ 护栏指标显�
 
       一、锁文件里的 48 个发行版装在哪
         当前解释器内 48 个 / 外面 0 个
+
+        另有 0 个因平台 marker 不适用（本平台不该装）：无
 
       二、源码 import 的顶层模块：共 22 个，没人锁的 0 个
         标准库         14
