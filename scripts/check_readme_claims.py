@@ -180,6 +180,11 @@ CLAIMS: list[tuple[str, str, str]] = [
      "governance_report.md", "环境来源与锁文件一致"),
     ("治理·类型清单：覆盖锁文件全部条目",
      "governance_report.md", "清单覆盖锁文件全部条目"),
+    # 前端契约（治理报告 7.13 节）
+    ("治理·前端契约：端点/选择器/语法四条一起过",
+     "governance_report.md", "页面与接口的契约一致"),
+    ("治理·前端契约：FastAPI 自带路由单独归类",
+     "governance_report.md", "FastAPI **自带** 4 条路由"),
     # SCM 三条检查（m3 第 4 节随 --quick 变 → 只加文本类声明）
     ("M3·SCM：三条检查各自回答不同的问题",
      "m3_validation.md", "三条各自回答**不同**的问题"),

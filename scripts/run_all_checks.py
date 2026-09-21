@@ -121,6 +121,7 @@ _ORDER_HEAD = (
     "lock",
     "env",
     "typed",
+    "frontend",
     "lint",
     "types",
     "unimplemented",
@@ -141,6 +142,10 @@ def steps() -> list[Step]:
              (py, "scripts/check_env_origin.py")),
         Step("typed", "三方库类型清单：覆盖 100% 的锁文件条目，逐包给处置",
              (py, "scripts/check_typed_deps.py")),
+        # 前端契约：页面 495 行、无构建步骤，靠静态契约挡住"后端改路径前端静默 404"
+        # 与"改了 id 控件静默失效"这两类不报错的坏。node 只用来做语法检查。
+        Step("frontend", "前端契约：UI 调用的端点/选择器必须存在（含 node 语法检查）",
+             (py, "scripts/check_frontend.py")),
         # ruff 走 `python -m ruff` 而不是直接调可执行文件 —— 后者在 Windows 上叫
         # ruff.exe、在 Linux 上叫 ruff，路径拼接容易写错，而 python -m 是跨平台的。
         # 下面 mypy 同理。

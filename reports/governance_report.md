@@ -175,7 +175,7 @@ ab-causal-lab · 治理验证：操作审计（append-only）+ 护栏指标显�
       包                     版本          py.typed  stub 包          用到它的源码文件
       numpy                 2.5.3       有         -                     70
       scipy                 1.18.1      **没有**    -                     31
-      pytest                9.1.1       有         -                     17
+      pytest                9.1.1       有         -                     18
       fastapi               0.141.1     有         -                      7
       pandas                3.0.3       **没有**    -                      7
       duckdb                1.5.5       有         -                      4
@@ -237,6 +237,73 @@ ab-causal-lab · 治理验证：操作审计（append-only）+ 护栏指标显�
 
   为什么值得单独记一条：这个漏检**不是**版本错，是**拓扑**错 ——
   版本对、来源错，所有基于版本的自检都会说「没问题」（设计决策 53）。
+
+### 7.13 前端契约：495 行单文件页面，靠静态契约挡住两类「不报错的坏」
+  `src/ablab/platform/static/index.html` 是**无构建步骤**的单文件页面
+  （一个 `api(path, opts)` helper 包住 fetch）。它最容易出的两类事故
+  都**不报错**：后端改了路径、前端静默 404；改了某个 id、控件静默失效。
+  这一轮给它配了四条机检（`scripts/check_frontend.py`，秒级、进快速组）：
+    1. **路由契约**：页面调用的每条端点都必须在服务端路由表里（含方法）；
+    2. **反向契约**：路由表里没出现在页面上的端点，必须有**写下来的决定**；
+    3. **选择器契约**：`$(「#x」)` / `querySelector(「.y」)` 指向的 id/class 必须存在；
+    4. **语法**：`node --check` 对页面里的 JS 做一次真正的解析。
+  路由表走**两条独立路径**取（静态解析装饰器 + 真的构造一次 app 读 routes），
+  两边算出来不一样就报错 —— 以后有人改用 include_router，静态那一条会漏。
+
+    前端契约检查（页面：src/ablab/platform/static/index.html，无构建步骤）
+      页面 495 行，内联 JS 301 行；应用路由 16 条（静态解析 16 条，两条路径一致）；另有 4 条 FastAPI 自带（文档/OpenAPI，不参与判据）
+
+      一、UI → API：页面调用的端点
+        方法     端点                                        行
+        GET    /api/experiments                          L75
+        POST   /api/experiments/{param}/analyze          L121
+        POST   /api/experiments                          L248
+        POST   /api/validate/aa                          L267
+
+      二、API → UI：路由表里没有出现在页面上的端点（每条都有决定）
+        DELETE /api/experiments/{param}                  有决定
+               └ 删除是破坏性操作，只留 admin 的 curl 路径
+        GET    /                                         有决定
+               └ 静态页面本身（服务端把 index.html 发出来），不是页面要调的 API
+        GET    /api/events                               有决定
+               └ 同上（全局审计流）
+        GET    /api/experiments/{param}                  有决定
+               └ 详情页用列表返回的字段直接渲染；这条是给脚本/curl 单取一条用的
+        GET    /api/experiments/{param}/events           有决定
+               └ 审计留痕：页面没有审计页，运维用 curl 查
+        GET    /api/warehouse/experiments                有决定
+               └ 数仓里有哪几条实验：属于运维探索，页面不做
+        GET    /healthz                                  有决定
+               └ 探活接口，给运维与 CI 用，页面不需要
+        PATCH  /api/experiments/{param}/status           有决定
+               └ 改实验状态（draft/running/...）：页面只做创建与查看，状态流转留给脚本
+        POST   /api/design/power                         有决定
+               └ 设计期算功效：设计期用 Python API，页面只管在跑的实验
+        POST   /api/experiments/{param}/bind             有决定
+               └ 绑定数仓需要选表与确认，交给脚本
+        POST   /api/experiments/{param}/estimator        有决定
+               └ 改判定口径会**改变结论的解释**，页面刻意不提供入口（只留带 token 的脚本调用）
+        POST   /api/experiments/{param}/stop             有决定
+               └ 停实验是不可逆动作：宁可不在页面上放一个容易被误点的按钮
+
+      三、选择器：页面里引用 38 处，其中指向不存在的 0 处
+      四、语法：node --check 通过
+
+    页面与接口的契约一致：端点都在、决定都齐、选择器都能落地、JS 语法通过
+
+  第一次跑就抓出三件事，都不是页面写错了，而是**没人写下来的事实**：
+    · FastAPI **自带** 4 条路由（/docs、/redoc、/openapi.json 与 oauth2-redirect）
+      —— 第一版把它们报成「界面没用到且没有决定」4 条假阳性，现在单独归类；
+    · 路由表里有 12 条**界面有意不做**的端点，这一轮逐条写下理由
+      （删除/停实验/改判定口径这类不可逆或改变解释的动作，页面刻意不给入口）；
+    · 我自己的决定表里有一条其实**已经被 UI 用着**（`POST /api/validate/aa`），
+      被反向判据当场抓出来 —— 决定表与「没做」清单一样会漂，所以也要有反向检查。
+  诚实的边界：这四条检查的是**契约**（路径/方法/选择器/语法），不是**行为**。
+  「点了按钮会不会真的做对」靠 HTTP 层测试（`tests/test_platform_*.py`：状态码、
+  乐观锁 412、审计留痕）与人工看一眼；Playwright 那类端到端与它们重叠度高，
+  **刻意不做** —— 这一条也写在脚本的模块文档里，免得后来人以为漏了。
+  契约检查自己也有故障注入测试：拿一份**故意写坏**的页面（调用不存在的端点、
+  方法写错、选择器指向不存在、语法错）跑一遍，断言它**确实报红**。
 
 ### 7.5 并发：丢失更新（后写覆盖），以及乐观锁怎么挡住它
   场景：两个客户端（**两个独立连接**，不是同一个对象）都读到同一版本，
