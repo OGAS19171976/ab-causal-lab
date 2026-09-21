@@ -216,19 +216,22 @@ ab-causal-lab · 治理验证：操作审计（append-only）+ 护栏指标显�
   也就是说「本地跑的东西」与「CI 装的东西」不是同一套文件。
   修法两步：按锁文件把缺的包装进 venv（必须 `--ignore-installed`，
   否则 pip 看到系统里的同名包就认为「已满足」——这一步实测踩过），
-  再把 `include-system-site-packages` 置为 false。修完的读数：
+  再把 `include-system-site-packages` 置为 false（CI 用裸解释器，
+  那一条会显式打印「不适用」而不是静默跳过；判据是"跑测试的这套包
+  必须都来自当前解释器的 purelib"）。修完的读数：
     环境来源检查（锁文件管版本，这一条管**来源**）
-      venv: .venv
-      site-packages: .venv/Lib/site-packages
+      解释器: .venv/Scripts/python.exe
+      当前解释器的 purelib: .venv/Lib/site-packages（venv）
+      开关 include-system-site-packages：适用：.venv/pyvenv.cfg 里读到 false
 
       一、锁文件里的 48 个发行版装在哪
-        venv 内 48 个 / 外面 0 个
+        当前解释器内 48 个 / 外面 0 个
 
       二、源码 import 的顶层模块：共 22 个，没人锁的 0 个
         标准库         14
         锁文件         8
 
-    环境来源与锁文件一致：所有包都来自 venv，源码没有未锁的 import
+    环境来源与锁文件一致：所有包都来自当前解释器，源码没有未锁的 import
 
   为什么值得单独记一条：这个漏检**不是**版本错，是**拓扑**错 ——
   版本对、来源错，所有基于版本的自检都会说「没问题」（设计决策 53）。

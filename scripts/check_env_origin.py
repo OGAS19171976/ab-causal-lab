@@ -15,8 +15,9 @@
 
 判据（三条，任一条不成立就红）
 ------------------------------
-  1. ``include-system-site-packages`` 必须是 ``false``；
-  2. 锁文件里每个**发行版**的安装位置必须在 venv 内；
+  1. 若仓库目录下有 ``.venv``，它的 ``include-system-site-packages`` 必须是 ``false``
+     （CI 用裸解释器时这一条不适用 —— 但会**显式打印**"不适用"，不静默跳过）；
+  2. 锁文件里每个**发行版**的安装位置必须在**当前解释器的 purelib** 内；
   3. 仓库源码里 import 的每个顶层模块，必须是标准库 / 本项目 / 锁文件里的包
      —— 第 3 条抓的是"能 import 但没人锁"的东西（它今天能跑，明天在 CI 上就没了）。
 
@@ -29,13 +30,24 @@ from __future__ import annotations
 import ast
 import importlib.metadata as md
 import pathlib
+import site
 import sys
+import sysconfig
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 LOCK = ROOT / "requirements.lock"
 VENV = ROOT / ".venv"
-SITE = VENV / "Lib" / "site-packages"
 SRC = ROOT / "src"
+
+#: "当前这套解释器把包装在哪" —— 用 sysconfig 而不是拼 .venv 路径。
+#: 第一版写死了 ``ROOT/.venv/Lib/site-packages``，本地是对的，**CI 上直接红**：
+#: GitHub Actions 的 setup-python 装的是一个**裸解释器**（没有 .venv，
+#: 包进 tool cache 的 site-packages）。检查的判据应该是"跑测试的这套包
+#: 必须都来自当前解释器的 purelib"，而不是"必须有一个 .venv 目录" ——
+#: 后者是把**本地布局**当成了不变量。
+PURELIB = pathlib.Path(sysconfig.get_paths()["purelib"]).resolve()
+IS_VENV = sys.prefix != sys.base_prefix
+USER_SITE = pathlib.Path(site.getusersitepackages()).resolve() if hasattr(site, "getusersitepackages") else None
 
 #: 发行版名 → 实际 import 的顶层模块名（两者不同的那几种）
 DIST_TO_MODULE = {
@@ -68,21 +80,35 @@ def module_of(dist_name: str) -> str:
     return DIST_TO_MODULE.get(dist_name.lower(), dist_name.replace("-", "_").lower())
 
 
-def check_flag() -> list[str]:
-    cfg = (VENV / "pyvenv.cfg").read_text(encoding="utf-8")
-    problems = []
-    for line in cfg.splitlines():
+def check_flag() -> tuple[list[str], str]:
+    """``(问题列表, 这一条是否适用)``。
+
+    ``include-system-site-packages`` 只在"解释器跑在一个 venv 里、而且那个
+    venv 就在仓库目录下"时才是一个可核对的开关。CI 用的是裸解释器，
+    这一条**不适用** —— 但要说出来，不能默默跳过（静默跳过就是这个仓库
+    反复栽过的那种错）。
+    """
+    cfg = VENV / "pyvenv.cfg"
+    if not cfg.exists():
+        return [], f"不适用：{VENV} 不存在（本次跑在非 venv 环境：{sys.prefix}）"
+    value = "（没有这一行）"
+    for line in cfg.read_text(encoding="utf-8").splitlines():
         if line.startswith("include-system-site-packages"):
             value = line.split("=", 1)[1].strip().lower()
-            if value != "false":
-                problems.append(
-                    f"include-system-site-packages = {value}（必须是 false —— "
-                    "否则系统 Python 的包会漏进这个环境，锁文件就管不住它）"
-                )
-    return problems
+    if value != "false":
+        return [
+            f"include-system-site-packages = {value}（必须是 false —— 否则系统 "
+            "Python 的包会漏进这个环境，锁文件就管不住它）"
+        ], f"适用：{cfg} 里读到 {value}"
+    return [], f"适用：{cfg} 里读到 false"
 
 
 def check_origins() -> tuple[list[str], list[tuple[str, str]]]:
+    """每个锁文件发行版的安装位置必须在**当前解释器的 purelib** 里。
+
+    这一条同时抓两种情形：本地那种"venv 看得见系统 site-packages"的混合环境，
+    以及任何"包从别的解释器漏进来"的情形 —— 判据是 purelib，与有没有 .venv 无关。
+    """
     problems, rows = [], []
     for name in lock_pins():
         try:
@@ -91,11 +117,16 @@ def check_origins() -> tuple[list[str], list[tuple[str, str]]]:
             problems.append(f"{name}: 锁文件里有，但这个环境里没装")
             continue
         loc = pathlib.Path(str(dist.locate_file(""))).resolve()
-        inside = SITE.resolve() in loc.parents or loc == SITE.resolve()
-        rows.append((name, "venv" if inside else f"**外面** {loc}"))
+        inside = PURELIB in loc.parents or loc == PURELIB
+        where = "当前解释器" if inside else f"**外面** {loc}"
+        rows.append((name, where))
         if not inside:
+            hint = ""
+            if USER_SITE is not None and (USER_SITE in loc.parents or loc == USER_SITE):
+                hint = "（这是 **user site**：pip install --user 装的，不属于这套环境）"
             problems.append(
-                f"{name}: 来自 venv 之外（{loc}）—— 本地与 CI 跑的不是同一套文件"
+                f"{name}: 来自当前解释器之外（{loc}）{hint} —— "
+                "跑测试的这套包与锁文件不是同一份"
             )
     return problems, rows
 
@@ -151,18 +182,20 @@ def check_imports() -> tuple[list[str], list[tuple[str, str]]]:
 
 
 def main() -> int:
-    problems = check_flag()
+    flag_problems, flag_note = check_flag()
     origin_problems, origin_rows = check_origins()
     import_problems, import_rows = check_imports()
-    problems += origin_problems + import_problems
+    problems = flag_problems + origin_problems + import_problems
 
     print("环境来源检查（锁文件管版本，这一条管**来源**）")
-    print(f"  venv: {VENV}")
-    print(f"  site-packages: {SITE}")
+    print(f"  解释器: {sys.executable}")
+    print(f"  当前解释器的 purelib: {PURELIB}"
+          f"{'（venv）' if IS_VENV else '（裸解释器，CI 就是这样）'}")
+    print(f"  开关 include-system-site-packages：{flag_note}")
     print()
     print(f"  一、锁文件里的 {len(origin_rows)} 个发行版装在哪")
-    outside = [name for name, where in origin_rows if where != "venv"]
-    print(f"    venv 内 {len(origin_rows) - len(outside)} 个 / 外面 {len(outside)} 个")
+    outside = [name for name, where in origin_rows if where != "当前解释器"]
+    print(f"    当前解释器内 {len(origin_rows) - len(outside)} 个 / 外面 {len(outside)} 个")
     for name in outside:
         print(f"      ** {name} 不在 venv 里")
     print()
@@ -180,7 +213,7 @@ def main() -> int:
         for p in problems:
             print(f"  - {p}")
         return 1
-    print("环境来源与锁文件一致：所有包都来自 venv，源码没有未锁的 import")
+    print("环境来源与锁文件一致：所有包都来自当前解释器，源码没有未锁的 import")
     return 0
 
 

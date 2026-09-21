@@ -503,7 +503,9 @@ def main() -> int:
     emit("  也就是说「本地跑的东西」与「CI 装的东西」不是同一套文件。")
     emit("  修法两步：按锁文件把缺的包装进 venv（必须 `--ignore-installed`，")
     emit("  否则 pip 看到系统里的同名包就认为「已满足」——这一步实测踩过），")
-    emit("  再把 `include-system-site-packages` 置为 false。修完的读数：")
+    emit("  再把 `include-system-site-packages` 置为 false（CI 用裸解释器，")
+    emit("  那一条会显式打印「不适用」而不是静默跳过；判据是\"跑测试的这套包")
+    emit("  必须都来自当前解释器的 purelib\"）。修完的读数：")
     for _line in _run_checker("check_env_origin.py"):
         emit("    " + _line)
     emit("")
