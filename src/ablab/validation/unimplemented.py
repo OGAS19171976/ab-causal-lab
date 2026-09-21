@@ -77,8 +77,10 @@ def human_reviewed_notes() -> tuple[str, ...]:
         "数据里到底有没有真实流量，得人看。",
         "前端没有构建步骤、没有测试：那是工程取舍，不是「没做」，"
         "但也没有东西能自动核对它。",
-        "scipy / pandas / sklearn 没有类型保证：取决于上游是否带 py.typed，"
-        "只能人看 mypy 的输出。",
+        "类型只覆盖**接口形状**，不覆盖**数值语义**：scipy 的 optimize 收不收敛、"
+        "sklearn 的随机性、pandas 的隐式类型转换都不在类型系统里 —— "
+        "「哪些包没带 py.typed」已经被 scripts/check_typed_deps.py 机检了，"
+        "剩下这一句只能人读。",
     )
 
 

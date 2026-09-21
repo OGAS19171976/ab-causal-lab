@@ -162,6 +162,77 @@ ab-causal-lab · 治理验证：操作审计（append-only）+ 护栏指标显�
     · 「整簇路径只支持 post-only」（簇级 CUPED 已做并校准）
     · 「数仓不支持比值指标」（06/07 两条 SQL 早已上线）
 
+### 7.12 环境来源与三方库类型：两句「只能人看」变成两张表
+  已知边界里原先有两句话是**无法核对**的：
+    · 「三方库没有类型保证：取决于上游是否带 py.typed，只能人看」；
+    · （隐含的）「锁文件 == 环境」—— 它比的是**版本**，看不见**来源**。
+  这一轮把它们各变成一条机器检查。
+
+  第一句的实测（`scripts/check_typed_deps.py`）：
+    三方库类型清单（判据：覆盖 100% 的锁文件条目 + 每个无类型的包都有处置）
+      锁文件条目 48 个；带 py.typed 的 32 个；本项目实际 import 的 11 个
+
+      包                     版本          py.typed  stub 包          用到它的源码文件
+      numpy                 2.5.3       有         -                     70
+      scipy                 1.18.1      **没有**    -                     31
+      pytest                9.1.1       有         -                     17
+      fastapi               0.141.1     有         -                      7
+      pandas                3.0.3       **没有**    -                      7
+      duckdb                1.5.5       有         -                      4
+      scikit-learn          1.9.1       **没有**    -                      4
+      packaging             26.3        有         -                      2
+      matplotlib            3.11.1      有         -                      1
+      pydantic              2.13.5      有         -                      1
+      uvicorn               0.53.0      有         -                      1
+      Pygments              2.21.0      **没有**    -                      0
+      cloudpickle           3.1.2       **没有**    -                      0
+      colorama              0.4.6       **没有**    -                      0
+      fonttools             4.64.0      **没有**    -                      0
+      joblib                1.6.0       **没有**    -                      0
+      mypy_extensions       1.1.0       **没有**    -                      0
+      pyarrow               25.0.1      **没有**    -                      0
+      python-dateutil       2.9.0.post0 **没有**    -                      0
+      ruff                  0.16.8      **没有**    -                      0
+      six                   1.17.0      **没有**    -                      0
+      threadpoolctl         3.7.0       **没有**    -                      0
+      typing_extensions     4.16.0      **没有**    -                      0
+      tzdata                2026.2      **没有**    -                      0
+
+      没带类型、但被本项目用到的（逐包处置）：
+        scipy              31 个文件   处置：stub
+          用到的是 stats.norm / optimize.minimize / spatial 的几个函数；本地最小 stub 只声明这些签名，上游改名会在 mypy 里报
+        pandas              7 个文件   处置：accept-any
+          DataFrame 的类型在无 stub 时基本退化成 Any；本仓库对它的用法集中在数仓 IO 与列选择，靠测试与 schema 检查兜底
+        scikit-learn        4 个文件   处置：accept-any
+          只作为 nuisance 学习器（Ridge / RandomForest）出现，接口窄且被测试覆盖；上游一旦补上顶层 py.typed，本条会被判过时
+
+    清单覆盖锁文件全部条目，且每个无类型的包都有明确处置
+
+  第二句实测出来的是一个**藏了很久的事实**：本地 venv 曾经是混合环境
+  （`include-system-site-packages = true`），锁文件 48 个包里有
+  **14 个**（pandas / matplotlib / pytest / packaging…）实际解析自
+  **系统 Python 的 site-packages**，venv 里根本没有它们 —— 而
+  `lock_requirements.py --check` 照样全绿，因为**版本号恰好一样**。
+  也就是说「本地跑的东西」与「CI 装的东西」不是同一套文件。
+  修法两步：按锁文件把缺的包装进 venv（必须 `--ignore-installed`，
+  否则 pip 看到系统里的同名包就认为「已满足」——这一步实测踩过），
+  再把 `include-system-site-packages` 置为 false。修完的读数：
+    环境来源检查（锁文件管版本，这一条管**来源**）
+      venv: .venv
+      site-packages: .venv/Lib/site-packages
+
+      一、锁文件里的 48 个发行版装在哪
+        venv 内 48 个 / 外面 0 个
+
+      二、源码 import 的顶层模块：共 22 个，没人锁的 0 个
+        标准库         14
+        锁文件         8
+
+    环境来源与锁文件一致：所有包都来自 venv，源码没有未锁的 import
+
+  为什么值得单独记一条：这个漏检**不是**版本错，是**拓扑**错 ——
+  版本对、来源错，所有基于版本的自检都会说「没问题」（设计决策 53）。
+
 ### 7.5 并发：丢失更新（后写覆盖），以及乐观锁怎么挡住它
   场景：两个客户端（**两个独立连接**，不是同一个对象）都读到同一版本，
   然后都要改状态 —— 这就是「两个人同时改」的最小复现。

@@ -1240,11 +1240,19 @@ M1、M3、M4、M5、M6 各留下一个结论，它们其实是同一件事的五
 ## 二、快速开始
 
 ```bash
-python -m venv .venv
+python -m venv .venv            # 必须是**独立**环境：include-system-site-packages = false
 .venv/Scripts/activate          # Windows；Linux/macOS 用 source .venv/bin/activate
 pip install -r requirements.txt # 钉死到实测版本；要更严用 requirements.lock
 
-pytest tests                    # 579 个测试，约 6 分钟（别加 -q，会吞掉汇总行）
+# 环境不小心变成了"混合"（venv 能看见系统 Python 的 site-packages）：
+#   pip install --ignore-installed -r requirements.lock   # --ignore-installed 不能省
+#   # 再把 .venv/pyvenv.cfg 里的 include-system-site-packages 改成 false
+# 为什么必须这样：pip 看到系统里的同名包会说"已满足"，于是你以为装进 venv 了，
+# 其实什么都没发生 —— 而版本号恰好一样时，所有基于版本的自检都是绿的。
+# scripts/check_env_origin.py 核对的就是这一件事（来源，不只是版本）。
+
+pytest tests                    # 全部测试，约 7 分钟（别加 -q，会吞掉汇总行）；
+                                # 具体条数不写进文档 —— 它每次提交都会变（见第 14 节）
 python scripts/run_all_checks.py            # **全部检查**：测试 + lint + 类型 + M0–M6 + 数仓，约 20 分钟
 python scripts/run_all_checks.py --quick    # 快速版
 python scripts/run_all_checks.py --list     # 只列计划
@@ -1478,12 +1486,10 @@ tasks.ps1                  常用命令入口（与 CI 共用 run_all_checks.py�
 requirements.txt           直接依赖（钉死到实测版本）
 requirements.lock          直接依赖 + 传递闭包，共 48 个包（带 marker 的平台条件依赖）
 .gitattributes             统一换行符（这个仓库的行尾曾经是混的）
-tests/                     579 个测试（hashing 25 / assignment 25 / inference 20 /
-                           inference_m1 43 / methods 30 / sequential 70 /
-                           causal 49 / hte 47 / validation 38 / warehouse 23 /
-                           platform 53 / platform_warehouse 31 / platform_m6 28 /
-                           governance 14 / dependencies 18 / ci_contract 26 /
-                           reporting 39）
+tests/                     测试：分流/推断、M1 方法、序贯、因果（DiD/SCM/IV/RDD）、
+                           异质效应与策略学习、验证台、数仓、平台 HTTP、
+                           治理、依赖、CI 契约、报告可复现性
+                           （**刻意不写条数** —— 每次提交都会变，见第 14 节）
 ```
 
 ### 依赖
@@ -2078,6 +2084,20 @@ python -m mypy                                # 类型检查（范围与档位�
     同时成立 —— 这正是只看一档最容易漏掉的情形。
     所以结论是：没有哪一档能替代检验，只能是三档一起报、并说清用的是哪一档。
 
+53. **版本对不等于环境对：自检会漏掉"拓扑"错** —— 这一轮量出一个
+    藏了很久的事实：`requirements.lock` 的 48 个包里，**14 个**是从系统
+    Python 的 site-packages 里解析出来的（venv 里没有它们），而
+    `lock_requirements.py --check` 一直是绿的 —— 因为它比的是**版本**，
+    而版本恰好一样。CI 是干净的（`setup-python` + 全新 venv 装锁文件），
+    所以"本地通过"与"CI 通过"当时并不是同一件事的两次确认。
+    可操作的做法有两条，缺一条都会再犯：
+    （1）**自检要覆盖"来源"这一维**，不只是数值：装在哪、开关是什么、
+    有没有"能 import 但没人锁"的包 —— 这三条现在是检查集里的 `env` 步骤；
+    （2）**修复时要用 `--ignore-installed`**：pip 会把系统里的同名包当成
+    "已满足"，于是你以为装进 venv 了，其实什么都没发生（这一轮实测踩到）。
+    更一般地说：**任何"两个东西一致"的检查，都要问清比的是哪个维度** ——
+    版本、内容哈希、还是来源，三者的漏检方式完全不同。
+
 52. **"样本外"这个词有两种用法，而它们治的病不一样** —— 策略学习这一节里，
     样本内价值（+0.2499）与分离样本价值（+0.0740）在 τ ≡ 0 时都应当被读成
     "策略有多好"，而真相是：前者衡量**搜索空间**，后者才接近**策略本身**，
@@ -2103,8 +2123,12 @@ python -m mypy                                # 类型检查（范围与档位�
 > 因为这个仓库栽过三次同一类跟头：**功能做完了、README 还写着没做**
 > （簇级 CUPED、M2 决策层、数仓比值链路，见 `reports/governance_report.md` 第 7.11 节）。
 > 另外 3 条**无法机检**（数据里到底有没有真实流量、前端没有测试、
-> 三方库没有类型保证）
+> 类型的**数值语义**那一半）
 > 由检查器显式列出、只能人读 —— 清单不假装覆盖它们。
+> 其中「三方库没有类型保证」这一条**已经被拆掉一半**：哪些包带 `py.typed`、
+> 每个没带的包怎么处置，现在是 `scripts/check_typed_deps.py` 逐包核对的表；
+> 环境**来源**（不只是版本）由 `scripts/check_env_origin.py` 核对 ——
+> 两条都在检查集里，见治理报告 7.12 节。
 
 
 诚实列出这个版本**没有**做的事：
@@ -2145,6 +2169,19 @@ python -m mypy                                # 类型检查（范围与档位�
   · **模糊断点把 ITT 与 LATE 分开**：ITT **+0.7369** vs LATE **+1.7908**
     （真值 +2.0000），区间覆盖率 **0.8636**。"断点显著"说的是 ITT，
     "处置有效"说的是 LATE，两者差一个合规份额。
+* **锁文件管版本，"从哪来的"要另管**（这一轮补的）。本地 venv 曾经是
+  **混合环境**：`include-system-site-packages = true`，于是 `requirements.lock`
+  里 48 个包中有 **14 个**（pandas / matplotlib / pytest / packaging…）
+  实际解析自**系统 Python 的 site-packages**，venv 里根本没有它们 ——
+  而 `lock_requirements.py --check`（比版本）照样全绿，因为版本号恰好一样。
+  也就是说「本地跑的」与「CI 装的」不是同一套文件。
+  修法两步：按锁文件把缺的包装进 venv（要 `--ignore-installed`，
+  否则 pip 看到系统里的同名包就认为「已满足」），再把
+  `include-system-site-packages` 置为 false。修完的读数是
+  **48/48 全部来自 venv**，并且新增 `scripts/check_env_origin.py` 守三条：
+  开关必须是 false、每个锁文件发行版必须装在 venv 内、源码里不许出现
+  「既不是标准库、也不是本项目、也不在锁文件里」的 import。
+  教训写在设计决策 53 里：**版本对、来源错，所有基于版本的自检都会说没问题**。
 * **M4 的因果森林是简化版 GRF**。它实现了 honest splitting，
   但叶子效应用的是简单组间差（真实 GRF 解局部估计方程），
   所以水平估计偏噪 —— 这也是"森林 MSE 输给常数基线"的直接原因，

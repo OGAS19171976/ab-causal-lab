@@ -117,7 +117,17 @@ class Step:
 # 于是"改了报告内容 + 同时加声明"时**第一次跑必红、第二次才绿** ——
 # 本轮又踩了两次（治理清单的条数、m6 的新节）。那是最难查的一类假红灯：
 # 看起来像声明写错了，其实只是顺序。
-_ORDER_HEAD = ("lock", "lint", "types", "unimplemented", "warehouse", "gov", "cate")
+_ORDER_HEAD = (
+    "lock",
+    "env",
+    "typed",
+    "lint",
+    "types",
+    "unimplemented",
+    "warehouse",
+    "gov",
+    "cate",
+)
 
 
 def steps() -> list[Step]:
@@ -125,6 +135,12 @@ def steps() -> list[Step]:
     every = [
         Step("lock", "锁文件与当前环境一致",
              (py, "scripts/lock_requirements.py", "--check")),
+        # 紧跟着 lock：`lock_requirements.py --check` 比的是**版本**，
+        # 看不见"包是从哪来的" —— 这两条补的正是那一半（见 7.12 节）。
+        Step("env", "环境来源：锁文件里的每个包都必须来自 venv（不只是版本对）",
+             (py, "scripts/check_env_origin.py")),
+        Step("typed", "三方库类型清单：覆盖 100% 的锁文件条目，逐包给处置",
+             (py, "scripts/check_typed_deps.py")),
         # ruff 走 `python -m ruff` 而不是直接调可执行文件 —— 后者在 Windows 上叫
         # ruff.exe、在 Linux 上叫 ruff，路径拼接容易写错，而 python -m 是跨平台的。
         # 下面 mypy 同理。

@@ -62,6 +62,17 @@ def main() -> int:
     log: list[str] = []
     t0 = time.perf_counter()
 
+    def _run_checker(script: str) -> list[str]:
+        """跑一个检查脚本并把它**真实的输出**按行返回（治理报告要嵌它）。"""
+        import subprocess as _sp
+
+        proc = _sp.run(
+            [sys.executable, str(ROOT / "scripts" / script)],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            cwd=str(ROOT),
+        )
+        return (proc.stdout or "").splitlines()
+
     def emit(text: str = "") -> None:
         print(text)
         log.append(text)
@@ -473,6 +484,31 @@ def main() -> int:
     emit("    · M2「没做决策层」（护栏决策层已做，见 7.9）")
     emit("    · 「整簇路径只支持 post-only」（簇级 CUPED 已做并校准）")
     emit("    · 「数仓不支持比值指标」（06/07 两条 SQL 早已上线）")
+
+    emit("\n### 7.12 环境来源与三方库类型：两句「只能人看」变成两张表")
+    emit("  已知边界里原先有两句话是**无法核对**的：")
+    emit("    · 「三方库没有类型保证：取决于上游是否带 py.typed，只能人看」；")
+    emit("    · （隐含的）「锁文件 == 环境」—— 它比的是**版本**，看不见**来源**。")
+    emit("  这一轮把它们各变成一条机器检查。")
+    emit("")
+    emit("  第一句的实测（`scripts/check_typed_deps.py`）：")
+    for _line in _run_checker("check_typed_deps.py"):
+        emit("    " + _line)
+    emit("")
+    emit("  第二句实测出来的是一个**藏了很久的事实**：本地 venv 曾经是混合环境")
+    emit("  （`include-system-site-packages = true`），锁文件 48 个包里有")
+    emit("  **14 个**（pandas / matplotlib / pytest / packaging…）实际解析自")
+    emit("  **系统 Python 的 site-packages**，venv 里根本没有它们 —— 而")
+    emit("  `lock_requirements.py --check` 照样全绿，因为**版本号恰好一样**。")
+    emit("  也就是说「本地跑的东西」与「CI 装的东西」不是同一套文件。")
+    emit("  修法两步：按锁文件把缺的包装进 venv（必须 `--ignore-installed`，")
+    emit("  否则 pip 看到系统里的同名包就认为「已满足」——这一步实测踩过），")
+    emit("  再把 `include-system-site-packages` 置为 false。修完的读数：")
+    for _line in _run_checker("check_env_origin.py"):
+        emit("    " + _line)
+    emit("")
+    emit("  为什么值得单独记一条：这个漏检**不是**版本错，是**拓扑**错 ——")
+    emit("  版本对、来源错，所有基于版本的自检都会说「没问题」（设计决策 53）。")
 
     emit("\n### 7.5 并发：丢失更新（后写覆盖），以及乐观锁怎么挡住它")
     emit("  场景：两个客户端（**两个独立连接**，不是同一个对象）都读到同一版本，")
