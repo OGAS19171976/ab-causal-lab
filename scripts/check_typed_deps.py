@@ -35,7 +35,6 @@ from __future__ import annotations
 import ast
 import importlib.metadata as md
 import pathlib
-import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 LOCK = ROOT / "requirements.lock"
@@ -76,6 +75,27 @@ UNTYPED_DECISIONS: dict[str, tuple[str, str]] = {
 }
 
 
+def _lock_rules():
+    """把 ``scripts/lock_requirements.py`` 动态加载进来，复用它的 marker 判断。
+
+    为什么不写 ``import lock_requirements``：``scripts/`` 不是一个包，而且
+    ``tests/test_dependencies.py`` 会**正确地**把任何静态 import 的非标准库
+    名字当成"未声明的第三方依赖"报错 —— CI 上就是这样红的（本地那次只跑了
+    test_ci_contract.py，没发现）。动态加载规避的是那个假阳性，
+    不是规避"只留一份实现"这条规矩：marker 规则仍然只有一份。
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "_lock_requirements", ROOT / "scripts" / "lock_requirements.py"
+    )
+    if spec is None or spec.loader is None:  # pragma: no cover - 文件必然在
+        raise RuntimeError("加载 lock_requirements.py 失败")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def lock_pins() -> tuple[list[tuple[str, str]], list[str]]:
     """``([(发行版名, 版本)], [因 marker 不适用的])``。
 
@@ -83,9 +103,7 @@ def lock_pins() -> tuple[list[tuple[str, str]], list[str]]:
     本来就不该装，把它算成"缺失"会让 CI 红（第一版就是这样）。
     过滤逻辑复用 ``lock_requirements._marker_applies``，不重写。
     """
-    sys.path.insert(0, str(ROOT / "scripts"))
-    import lock_requirements as lr
-
+    lr = _lock_rules()
     entries = lr.parse_lock(LOCK)
     pins: list[tuple[str, str]] = []
     skipped: list[str] = []

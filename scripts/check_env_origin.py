@@ -65,6 +65,27 @@ DIST_TO_MODULE = {
 ALLOWED_EXTRA: dict[str, str] = {}
 
 
+def _lock_rules():
+    """把 ``scripts/lock_requirements.py`` 动态加载进来，复用它的 marker 判断。
+
+    为什么不写 ``import lock_requirements``：``scripts/`` 不是一个包，而且
+    ``tests/test_dependencies.py`` 会**正确地**把任何静态 import 的非标准库
+    名字当成"未声明的第三方依赖"报错 —— CI 上就是这样红的（本地那次只跑了
+    test_ci_contract.py，没发现）。动态加载规避的是那个假阳性，
+    不是规避"只留一份实现"这条规矩：marker 规则仍然只有一份。
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "_lock_requirements", ROOT / "scripts" / "lock_requirements.py"
+    )
+    if spec is None or spec.loader is None:  # pragma: no cover - 文件必然在
+        raise RuntimeError("加载 lock_requirements.py 失败")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def lock_pins() -> tuple[list[str], list[str]]:
     """``(在当前平台上适用的发行版名, 因 marker 不适用的)``。
 
@@ -77,9 +98,7 @@ def lock_pins() -> tuple[list[str], list[str]]:
     复用 ``lock_requirements.parse_lock`` / ``_marker_applies`` 而不是自己
     再写一遍：同一个规则实现两次，迟早会分叉（这个仓库已经栽过）。
     """
-    sys.path.insert(0, str(ROOT / "scripts"))
-    import lock_requirements as lr
-
+    lr = _lock_rules()
     entries = lr.parse_lock(LOCK)
     applicable: list[str] = []
     skipped: list[str] = []
