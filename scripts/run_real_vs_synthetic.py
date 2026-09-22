@@ -50,6 +50,7 @@ def shape_stats(con: duckdb.DuckDBPyConnection) -> dict[str, float]:
         from dwd_experiment_user
         """
     ).fetchone()
+    assert row is not None  # count(*) 永远有一行；mypy 要这句
     n, mean, sd, skew, kurt, zero_share, mx = row
     return {
         "n": float(n or 0),
@@ -143,6 +144,7 @@ def srm(con: duckdb.DuckDBPyConnection) -> dict[str, float]:
     row = con.execute(
         "select max(chi2_statistic), max(degrees_of_freedom) from ads_experiment_srm"
     ).fetchone()
+    assert row is not None
     return {"chi2": float(row[0] or 0.0), "df": float(row[1] or 0.0)}
 
 
@@ -196,6 +198,7 @@ def cluster_view(con: duckdb.DuckDBPyConnection) -> dict[str, float]:
     row = con.execute(
         "select count(*), count(distinct cluster_id) from dws_experiment_cluster_daily"
     ).fetchone()
+    assert row is not None
     return {"rows": float(row[0] or 0), "clusters": float(row[1] or 0)}
 
 
@@ -203,6 +206,7 @@ def true_lift_present(con: duckdb.DuckDBPyConnection) -> float:
     row = con.execute(
         "select count(*) from ads_experiment_result where true_lift is not null"
     ).fetchone()
+    assert row is not None
     return float(row[0] or 0)
 
 
