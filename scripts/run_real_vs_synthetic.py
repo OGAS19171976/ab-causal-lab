@@ -33,6 +33,19 @@ REAL = ROOT / "build" / "warehouse_real.duckdb"
 REPORT = ROOT / "reports" / "real_vs_synthetic.md"
 
 
+#: 当前的分日颗粒度。**两侧不该用同一个口径**：合成侧是"日历日 × 每天很多用户"，
+#: 真实侧 MovieLens 的曝光日是**每个用户自己的中位评分时间** —— 573 个不同曝光日、
+#: 每臂每个曝光日只有 1 个用户。拿"天数"比大小没有意义，所以真实侧按**季度**聚合。
+#: 第一版两边都按"曝光日"算，于是真实侧的 z 轨迹是 0 天（每天只有 1 人，样本不足），
+#: 报告里还留着"nan" —— 看着像缺数据，其实是口径选错了。
+_GRAIN = "day"
+
+
+def _bucket(column: str) -> str:
+    """按颗粒度把日期列切成桶。"""
+    return f"date_trunc('quarter', {column})" if _GRAIN == "quarter" else column
+
+
 #: 当前正在审计的实验名；由 ``readings`` 设定。
 #: 第一版**没有按实验过滤**：合成库里 3 个实验的 6 行被当成"两个臂"加在一起，
 #: 算出 z = −2.38、SRM χ² = 77.6 —— 数字看着像发现，其实是把三个实验混成了一个。
@@ -190,10 +203,12 @@ def daily_z(con: duckdb.DuckDBPyConnection) -> dict[str, float]:
     """按日累计的 z 轨迹（序贯视角的单次实现）。"""
     rows = con.execute(
         f"""
-        select variant, ds, user_cnt, pre_sum, post_sum, pre_sq_sum, post_sq_sum
+        select variant, {_bucket("ds")} as ds, sum(user_cnt), sum(pre_sum),
+               sum(post_sum), sum(pre_sq_sum), sum(post_sq_sum)
         from dws_experiment_variant_daily
         {_w()}
-        order by ds
+        group by 1, 2
+        order by 2
         """
     ).fetchall()
     acc: dict[str, list[float]] = {}
@@ -205,6 +220,9 @@ def daily_z(con: duckdb.DuckDBPyConnection) -> dict[str, float]:
         a[3] += 0.0
         # 逐日重算需要逐臂累计；这里只累计，最后一天统一算（见下）
     # 逐日轨迹：重新按 ds 累计并算 z
+    # 列顺序必须与 SQL 逐字对应：variant, ds, Σuser_cnt, Σpre_sum, Σpost_sum,
+    # Σpre_sq, Σpost_sq。第一版把第二个循环的下标写错（post_sum 拿到的是 pre_sum），
+    # 于是真实侧（pre 全 0）算出来的均值恒为 0、轨迹是空的。
     per_day: dict[str, dict[str, list[float]]] = {}
     for variant, ds, n, _pre_sum, post_sum, post_sq, _pre_sq in rows:
         per_day.setdefault(str(ds), {}).setdefault(str(variant), [0.0, 0.0, 0.0])
@@ -212,6 +230,7 @@ def daily_z(con: duckdb.DuckDBPyConnection) -> dict[str, float]:
         slot[0] += float(n)
         slot[1] += float(post_sum)
         slot[2] += float(post_sq)
+    _ = _pre_sum, _pre_sq  # 只用于说明列序；这两列这一层用不到
     running: dict[str, list[float]] = {}
     zs: list[float] = []
     for ds in sorted(per_day):
@@ -252,11 +271,15 @@ def true_lift_present(con: duckdb.DuckDBPyConnection) -> float:
     return float(row[0] or 0)
 
 
-def readings(db: pathlib.Path, experiment: str | None = None) -> dict[str, float]:
-    global _EXP
+def readings(
+    db: pathlib.Path, experiment: str | None = None, grain: str = "day"
+) -> dict[str, float]:
+    global _EXP, _GRAIN
     con = duckdb.connect(str(db), read_only=True)
     try:
+        global _GRAIN
         _EXP = experiment or pick_experiment(con)
+        _GRAIN = grain
         out: dict[str, Any] = {}
         out.update({f"shape.{k}": v for k, v in shape_stats(con).items()})
         out.update({f"effect.{k}": v for k, v in cuped_and_effect(con).items()})
@@ -287,9 +310,9 @@ ROWS: tuple[tuple[str, str, str], ...] = (
     ("  z（CUPED）", "effect.z_cuped", "{:+.3f}"),
     ("  p（CUPED）", "effect.p_cuped", "{:.4f}"),
     ("SRM χ²（最大）", "srm.chi2", "{:.4f}"),
-    ("按日累计 z：天数", "daily.days", "{:.0f}"),
-    ("按日累计 z：max|z|", "daily.max_abs_z", "{:.3f}"),
-    ("按日累计 z：最后一天", "daily.last_z", "{:+.3f}"),
+    ("累计 z 轨迹：桶数（合成按日/真实按季度）", "daily.days", "{:.0f}"),
+    ("累计 z 轨迹：max|z|", "daily.max_abs_z", "{:.3f}"),
+    ("累计 z 轨迹：最后一个桶", "daily.last_z", "{:+.3f}"),
     ("簇级日表行数", "cluster.rows", "{:.0f}"),
     ("不同簇数", "cluster.clusters", "{:.0f}"),
     ("有 true_lift 的行数", "true_lift_rows", "{:.0f}"),
@@ -300,7 +323,8 @@ def main() -> int:
     if not SYNTHETIC.exists() or not REAL.exists():
         print("缺仓库文件：先跑 scripts/run_warehouse.py 与 scripts/check_real_traffic.py")
         return 1
-    syn, real = readings(SYNTHETIC), readings(REAL)
+    syn = readings(SYNTHETIC, grain="day")
+    real = readings(REAL, grain="quarter")
     lines = [
         "# 差异审计：合成数据 vs 真实外部数据（MovieLens）",
         "",
@@ -386,7 +410,11 @@ def main() -> int:
         f"（合成侧 {syn['true_lift_rows']:.0f}）——",
         "   外部数据没有演示真值，所以它只能做校准，不能做「效应估得准不准」的验收。",
         "",
-        "4. **序贯视角只能看量级**：按日累计 z 的 max|z| 真实 "
+        "4. **序贯视角只能看量级，而且两侧颗粒度不同**：合成的桶是**日历日**"
+        "（每天很多用户），真实的是**季度**"
+        "（MovieLens 的曝光日是每人自己的中位评分时间：573 个曝光日、每臂每日 1 人，"
+        "按日根本没有样本）—— 拿「天数」比大小没有意义，只能比「轨迹像不像随机游走」。",
+        "   max|z| 真实 "
         f"{real['daily.max_abs_z']:.3f} / 合成 {syn['daily.max_abs_z']:.3f}"
         f"（天数 {real['daily.days']:.0f} / {syn['daily.days']:.0f}）——",
         "   这是**一次实现**，不是 FWER；真实的 FWER 要用重随机化（本仓库在合成数据上做过，",
