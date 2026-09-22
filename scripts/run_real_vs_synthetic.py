@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import math
 import pathlib
+from typing import Any
 
 import duckdb
 
@@ -32,6 +33,40 @@ REAL = ROOT / "build" / "warehouse_real.duckdb"
 REPORT = ROOT / "reports" / "real_vs_synthetic.md"
 
 
+#: 当前正在审计的实验名；由 ``readings`` 设定。
+#: 第一版**没有按实验过滤**：合成库里 3 个实验的 6 行被当成"两个臂"加在一起，
+#: 算出 z = −2.38、SRM χ² = 77.6 —— 数字看着像发现，其实是把三个实验混成了一个。
+_EXP = ""
+
+
+def _w(join: str = "where") -> str:
+    return f"{join} experiment = '{_EXP}'"
+
+
+def pick_experiment(con: duckdb.DuckDBPyConnection) -> str:
+    """选一个**负对照**实验来代表该仓库（真实的 ml_aa 也是 A/A）。
+
+    排序规则刻意写死成"先看真实效应是不是 0"：合成库里有 3 个演示实验，
+    其中 exp_rank_v2 / exp_city_ctr **本来就有效应**（后者还是整簇随机化，
+    用户数天生不平衡）。拿它们跟 A/A 对比，等于把"有效应"读成"校准坏了" ——
+    第一版就是这么错的（挑到 exp_city_ctr，z=+7.6、SRM χ²=77.6，
+    看着像大发现，其实是选错了对照）。
+    """
+    rows = con.execute(
+        """
+        select experiment,
+               max(case when true_lift = 0 then 1 else 0 end) as is_aa,
+               sum(user_cnt) as n
+        from ads_experiment_result
+        group by 1
+        order by is_aa desc, n desc
+        """
+    ).fetchall()
+    if not rows:
+        raise ValueError("ads_experiment_result 是空的")
+    return str(rows[0][0])
+
+
 def normal_two_sided_p(z: float) -> float:
     return math.erfc(abs(z) / math.sqrt(2.0))
 
@@ -39,7 +74,7 @@ def normal_two_sided_p(z: float) -> float:
 def shape_stats(con: duckdb.DuckDBPyConnection) -> dict[str, float]:
     """用户级结果指标的分布形状（两库同一 SQL）。"""
     row = con.execute(
-        """
+        f"""
         select count(*) as n,
                avg(post_metric) as mean,
                stddev_samp(post_metric) as sd,
@@ -48,6 +83,7 @@ def shape_stats(con: duckdb.DuckDBPyConnection) -> dict[str, float]:
                avg(case when post_metric = 0 then 1.0 else 0.0 end) as zero_share,
                max(post_metric) as mx
         from dwd_experiment_user
+        {_w()}
         """
     ).fetchone()
     assert row is not None  # count(*) 永远有一行；mypy 要这句
@@ -66,10 +102,11 @@ def shape_stats(con: duckdb.DuckDBPyConnection) -> dict[str, float]:
 def cuped_and_effect(con: duckdb.DuckDBPyConnection) -> dict[str, float]:
     """CUPED 方差缩减 + 主效应（两个口径），全部由充分统计量闭式算。"""
     rows = con.execute(
-        """
+        f"""
         select variant, user_cnt, pre_sum, post_sum, pre_sq_sum, post_sq_sum,
                pre_post_cross_sum
         from ads_experiment_result
+        {_w()}
         """
     ).fetchall()
     arms: dict[str, dict[str, float]] = {}
@@ -142,7 +179,8 @@ def cuped_and_effect(con: duckdb.DuckDBPyConnection) -> dict[str, float]:
 
 def srm(con: duckdb.DuckDBPyConnection) -> dict[str, float]:
     row = con.execute(
-        "select max(chi2_statistic), max(degrees_of_freedom) from ads_experiment_srm"
+        "select max(chi2_statistic), max(degrees_of_freedom) from ads_experiment_srm "
+        + _w()
     ).fetchone()
     assert row is not None
     return {"chi2": float(row[0] or 0.0), "df": float(row[1] or 0.0)}
@@ -151,9 +189,11 @@ def srm(con: duckdb.DuckDBPyConnection) -> dict[str, float]:
 def daily_z(con: duckdb.DuckDBPyConnection) -> dict[str, float]:
     """按日累计的 z 轨迹（序贯视角的单次实现）。"""
     rows = con.execute(
-        """
+        f"""
         select variant, ds, user_cnt, pre_sum, post_sum, pre_sq_sum, post_sq_sum
-        from dws_experiment_variant_daily order by ds
+        from dws_experiment_variant_daily
+        {_w()}
+        order by ds
         """
     ).fetchall()
     acc: dict[str, list[float]] = {}
@@ -196,7 +236,8 @@ def daily_z(con: duckdb.DuckDBPyConnection) -> dict[str, float]:
 
 def cluster_view(con: duckdb.DuckDBPyConnection) -> dict[str, float]:
     row = con.execute(
-        "select count(*), count(distinct cluster_id) from dws_experiment_cluster_daily"
+        "select count(*), count(distinct cluster_id) from dws_experiment_cluster_daily "
+        + _w()
     ).fetchone()
     assert row is not None
     return {"rows": float(row[0] or 0), "clusters": float(row[1] or 0)}
@@ -204,22 +245,26 @@ def cluster_view(con: duckdb.DuckDBPyConnection) -> dict[str, float]:
 
 def true_lift_present(con: duckdb.DuckDBPyConnection) -> float:
     row = con.execute(
-        "select count(*) from ads_experiment_result where true_lift is not null"
+        "select count(*) from ads_experiment_result "
+        + _w("where") + " and true_lift is not null"
     ).fetchone()
     assert row is not None
     return float(row[0] or 0)
 
 
-def readings(db: pathlib.Path) -> dict[str, float]:
+def readings(db: pathlib.Path, experiment: str | None = None) -> dict[str, float]:
+    global _EXP
     con = duckdb.connect(str(db), read_only=True)
     try:
-        out: dict[str, float] = {}
+        _EXP = experiment or pick_experiment(con)
+        out: dict[str, Any] = {}
         out.update({f"shape.{k}": v for k, v in shape_stats(con).items()})
         out.update({f"effect.{k}": v for k, v in cuped_and_effect(con).items()})
         out.update({f"srm.{k}": v for k, v in srm(con).items()})
         out.update({f"daily.{k}": v for k, v in daily_z(con).items()})
         out.update({f"cluster.{k}": v for k, v in cluster_view(con).items()})
         out["true_lift_rows"] = true_lift_present(con)
+        out["experiment_name"] = _EXP
         return out
     finally:
         con.close()
@@ -266,6 +311,9 @@ def main() -> int:
         f"| 读数 | 合成（{SYNTHETIC.name}） | 真实（{REAL.name}） |",
         "|---|---|---|",
     ]
+    lines.append(f"（合成侧取负对照实验：{syn['experiment_name']}；"
+                 f"真实侧：{real['experiment_name']}）")
+    lines.append("")
     for label, key, fmt in ROWS:
         a = syn.get(key, float("nan"))
         b = real.get(key, float("nan"))

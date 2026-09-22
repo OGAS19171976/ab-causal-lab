@@ -174,6 +174,31 @@ def check_generator_traces(base: pathlib.Path, tables: list[dict]) -> list[str]:
     return problems
 
 
+def check_metric_is_alive() -> list[str]:
+    """主指标全 0 / 无方差 ⇒ 报错（并指出最可能的原因）。"""
+    import duckdb
+
+    con = duckdb.connect(str(DB_PATH), read_only=True)
+    try:
+        row = con.execute(
+            "select count(*), sum(case when post_metric > 0 then 1 else 0 end) "
+            "from dwd_experiment_user"
+        ).fetchone()
+    finally:
+        con.close()
+    assert row is not None
+    users, positive = int(row[0] or 0), int(row[1] or 0)
+    if users == 0:
+        return ["接入后 DWD 里一个用户都没有 —— 曝光表与事件表没对上"]
+    if positive == 0:
+        return [
+            f"DWD 里 {users} 个用户的**主指标全是 0** —— 大概率是事件名没对上："
+            "provenance 的 metric_event 必须与 event_log 里的 event_name 一致"
+            "（第一版 SQL 里写死了 'interaction'，接 rating 数据时就是这样全 0 的）"
+        ]
+    return []
+
+
 def run_ingest(prov: dict) -> dict:
     """契约通过后的真接入：归一化 + 跑同一套 SQL。"""
     sys.path.insert(0, str(ROOT / "src"))
@@ -197,15 +222,23 @@ def run_ingest(prov: dict) -> dict:
     # 度量事件名与护栏事件名必须从 provenance 读：
     # 上一轮的版本写死用 load_real_traffic 的默认值（"interaction"），
     # 那等于"接进来的数据被迫改名"—— 真实数据的度量就叫它自己的名字。
+    metric_event = str(prov.get("metric_event", "interaction"))
     report = load_real_traffic(
         DATA,
         target_dir=TARGET,
         experiments=specs,
-        metric_event=str(prov.get("metric_event", "interaction")),
+        metric_event=metric_event,
         guardrail_events=tuple(str(e) for e in prov.get("guardrail_events", ())),
     )
-    build_warehouse(DB_PATH, TARGET, SQL_DIR, generate=False, verbose=False)
+    build_warehouse(
+        DB_PATH, TARGET, SQL_DIR, generate=False, verbose=False, metric_event=metric_event
+    )
+    # **指标退化必须报红**：接真实数据的第一版就栽在这里 ——
+    # SQL 里写死了 'interaction'，于是 exposure 计数正常、SRM 正常、指标全 0，
+    # 门却全绿。现在这里直接查 DWD：主指标没有方差就是失败。
+    degenerate = check_metric_is_alive()
     return {
+        "metric_problems": degenerate,
         "experiments": [s.name for s in specs],
         "target": str(TARGET),
         "db": str(DB_PATH),
@@ -239,6 +272,11 @@ def main() -> int:
           f"exported_at={prov['exported_at']}，{len(tables)} 张表，"
           f"{len(prov['experiments'])} 个实验声明")
     result = run_ingest(prov)
+    if result["metric_problems"]:
+        print(f"\n**{len(result['metric_problems'])} 条不成立**（接入跑完了，但指标没活）：")
+        for p in result["metric_problems"]:
+            print(f"  - {p}")
+        return 1
     print(f"  真接入完成：归一化 → {result['target']}；SQL → {result['db']}")
     print(f"  实验：{', '.join(result['experiments'])}")
     print("  注意口径：这只能叫「**接入过**外部数据」，不等于在生产流量上验证过 ——")

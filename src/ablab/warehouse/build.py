@@ -132,6 +132,7 @@ def build_warehouse(
     force_data: bool = False,
     generate: bool = True,
     verbose: bool = True,
+    metric_event: str = "interaction",
 ) -> duckdb.DuckDBPyConnection:
     """建源数据 → 跑四层 SQL → 返回已就绪的 DuckDB 连接。
 
@@ -198,6 +199,10 @@ def build_warehouse(
             "DATA_DIR": data_dir.as_posix(),
             "PRE_DAYS": cfg.pre_days,
             "POST_DAYS": cfg.post_days,
+            # 主指标事件名：以前它**写死**在 01_dwd 里（'interaction'），
+            # 接真实数据（事件叫 rating）时 exposure 与 SRM 都正常、**指标全 0** ——
+            # 差异审计第一次跑就抓到了。现在跟着声明走。
+            "metric_event": metric_event,
         },
         verbose=verbose,
     )
