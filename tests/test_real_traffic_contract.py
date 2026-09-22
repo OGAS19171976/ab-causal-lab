@@ -98,6 +98,10 @@ def _provenance(base: Path, **overrides) -> dict:
         "source": "某业务线导出（2026-09-01 ~ 2026-09-02）",
         "exported_at": "2026-09-03",
         "external_generator": True,
+        # 度量事件名与护栏事件名是**契约的一部分**（门会从 provenance 读它们，
+        # 不许写死默认值 —— 真实数据的度量就叫它自己的名字）
+        "metric_event": "interaction",
+        "guardrail_events": [],
         "notes": "外部系统导出",
         "experiments": [
             {

@@ -1,16 +1,36 @@
 # 真实数据入口：契约与「门」
 
-这个目录**现在是空的**，而它空着本身是一件被检查的事：
-`src/ablab/validation/unimplemented.py` 里有一条机检项
+这个目录里现在**真的有外部数据**（不再是空的）：
+
+| 文件 | 是什么 |
+|---|---|
+| `provenance.json` | 数据来源声明 + 三张表的行数与 sha256（门的输入） |
+| `exposure_log.parquet` | 610 个用户的 A/A 分流（`sha256(user_id)` 奇偶） |
+| `event_log.parquet` | 100,836 条**真实**评分（+ 低分率护栏事件），时间戳 1996–2018 |
+| `user_profile.parquet` | 用户 + 派生的 `reg_ds`（最早评分日）；`city` 缺失 ⇒ 簇级路径不可用 |
+
+数据来自 **MovieLens ml-latest-small（GroupLens）**，由
+`scripts/build_real_aa_dataset.py` 转换而来（可重跑：先下 zip 再跑脚本，见脚本 docstring）。
+**它买到了什么**：真实分布（评分严重偏向 4 分、用户活跃度差两个数量级）与真实时间戳，
+于是能在这条链路上做**不需要真值的 A/A 校准** —— 实测 control 315 / treatment 295
+（期望各 305，χ² = 0.6557）。
+**它买不到什么**：分流是**我们做的 A/A**，所以只能校准口径与方差，不能验证效应；
+也不是生产流量（没有埋点丢失、跨端合并、实验互斥）。
+
+## 这个目录曾经是空的（那也是一种被检查的状态）
+
+在接入之前，`src/ablab/validation/unimplemented.py` 里有一条机检项：
 
 ```
 id="real_traffic"  kind="file_absent"  target="data/real/provenance.json"
 ```
 
-意思是：**只要 `data/real/provenance.json` 不存在，README 里那句
-「数据里没有真实流量」就仍然成立**；一旦有人把真实数据接进来，
-`scripts/check_unimplemented.py` 会在检查集里直接红，逼着 README 改口径。
-这是把一句"无法核对的话"变成**带证据的记录**——与"没做"清单里其他条同一个机制。
+只要那份 provenance 不存在，README 里那句「数据里没有真实流量」就成立；
+一旦有人把真实数据接进来，检查会红并逼着 README 改口径。
+**这条机制刚刚真的走了一遍**：接入之后它按规矩翻红，于是 README 改成了
+「接入过外部数据」，而这条机检项被**换成正面检查** ——
+`realdata` 步骤现在每个 push 都跑一遍契约 + 反冒充 + 真接入。
+"证明没做"换成了"证明做对了"。
 
 ## 怎么把真实数据接进来
 

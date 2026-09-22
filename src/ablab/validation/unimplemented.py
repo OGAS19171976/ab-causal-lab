@@ -59,36 +59,25 @@ class UnimplementedItem:
 
 
 #: 清单本体。**只放能机检的**；无法机检的归到人工核对，不混进来充数。
-#: 现有 1 条：`real_traffic` —— 它以前只能靠人看，现在有了可核对的证据：
-#: **`data/real/provenance.json` 不存在**。一旦有人真的把外部数据接进来，
-#: 这条会红并逼着 README 改口径（而"接进来的数据是不是合成的"由
-#: `scripts/check_real_traffic.py` 的反冒充那两条守着）。
+#: 现在**又是空的**：`real_traffic` 那条被"做完了"——真的接进了外部数据
+#: （MovieLens，610 用户 / 10 万条评分），所以它按规矩离开了这份清单。
+#: 净效果不是"少了一条约束"，而是**约束变强了**：
+#:   之前：机检"provenance.json 不存在"（证明*没有*真数据）；
+#:   现在：`realdata` 检查步骤每个 push 都跑一遍**契约 + 反冒充 + 真接入**
+#:         （证明"接进来的确实是外部数据，而且链路真的能跑"）。
+#: 前者只能证明"没做"，后者能证明"做对了"——这也是这份清单该有的归宿：
+#: 它管"没做"，做完了就换成正面检查。
 #:
-#: 现在的状态：**空**。曾经挂在里面的五条（簇级 CUPED、M2 决策层、数仓比值链路、
-#: mSPRT 的 tau、时间安慰剂、非线性敏感性、策略学习、RDD）都被做出来了，
-#: 每一次都是这条检查先把 README 顶红、再改文档 —— 清单空着不是"没有未做事项"，
-#: 而是"所有**能机检**的未做事项都被清掉了"；剩下三条无法机检的见
-#: ``human_reviewed_notes()``。清单空着也意味着检查器现在抓不到新的过时声明，
-#: 所以新增"没做"时**照旧要往这里加一条**，否则那句话又回到没人管的状态。
-ITEMS: tuple[UnimplementedItem, ...] = (
-    UnimplementedItem(
-        id="real_traffic",
-        readme_phrase="仓库里没有真实流量数据",
-        kind="file_absent",
-        target="data/real/provenance.json",
-        when_done=(
-            "README 要改成「接入过外部数据」，并给出与合成路径的**差异审计**"
-            "（哪些数字变了、哪些没变）；同时把 data/real/README.md 里的契约"
-            "与实际接入的 provenance 对齐"
-        ),
-        notes=[
-            "证据是「这个文件不存在」，而不是「某人说过没有数据」。",
-            "反冒充由 scripts/check_real_traffic.py 独立把关：合成器的 "
-            ".generated 标记与 config_fingerprint 列都不许出现。",
-        ],
-    ),
-
-)
+#: 现在的状态：**空**（``()``）。曾经挂在这里的每一条（簇级 CUPED、M2 决策层、
+#: 数仓比值链路、mSPRT 的 tau、时间安慰剂、Rambachan-Roth 三档限制、策略学习、
+#: RDD、真实流量）都被做出来了，每一次都是这条检查先把 README 顶红、再改文档。
+#: 清单空着不是"没有未做事项"，而是"所有**能机检**的未做事项都被清掉了"；
+#: 剩下两条无法机检的见 ``human_reviewed_notes()``。
+#: 最后一条 `real_traffic` 的去向值得记：它做完之后**不是消失，而是换了方向** ——
+#: 过去它机检"provenance.json 不存在"（证明*没有*真数据），现在由 `realdata`
+#: 检查步骤每个 push 跑"契约 + 反冒充 + 真接入"（证明*接进来的确实是外部数据*）。
+#: 所以新增"没做"时照旧往这里加一条；而做完了，就该想想能不能换成正面检查。
+ITEMS: tuple[UnimplementedItem, ...] = ()
 
 
 def human_reviewed_notes() -> tuple[str, ...]:

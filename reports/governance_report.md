@@ -149,9 +149,8 @@ ab-causal-lab · 治理验证：操作审计（append-only）+ 护栏指标显�
   （某个符号确实不存在 / 某个串搜不到 / 某个文件不存在），
   一旦不成立就在检查集里报错并指出该改哪一句。
 
-  [OK  ] real_traffic: data/real/provenance.json 仍不存在 ✓
 
-  机检 1 条『没做』：1 条仍成立，0 条已经过时。
+  机检 0 条『没做』：0 条仍成立，0 条已经过时。
   另有 2 条**无法机检**、只能人读 ——清单不假装覆盖它们。
   退出码：0（0 = 清单与事实一致）
 
@@ -177,7 +176,7 @@ ab-causal-lab · 治理验证：操作审计（append-only）+ 护栏指标显�
       numpy                 2.5.3       有         -                     70
       scipy                 1.18.1      **没有**    -                     31
       pytest                9.1.1       有         -                     19
-      pandas                3.0.3       **没有**    -                      9
+      pandas                3.0.3       **没有**    -                     10
       fastapi               0.141.1     有         -                      7
       duckdb                1.5.5       有         -                      4
       scikit-learn          1.9.1       **没有**    -                      4
@@ -202,7 +201,7 @@ ab-causal-lab · 治理验证：操作审计（append-only）+ 护栏指标显�
       没带类型、但被本项目用到的（逐包处置）：
         scipy              31 个文件   处置：stub
           用到的是 stats.norm / optimize.minimize / spatial 的几个函数；本地最小 stub 只声明这些签名，上游改名会在 mypy 里报
-        pandas              9 个文件   处置：accept-any
+        pandas             10 个文件   处置：accept-any
           DataFrame 的类型在无 stub 时基本退化成 Any；本仓库对它的用法集中在数仓 IO 与列选择，靠测试与 schema 检查兜底
         scikit-learn        4 个文件   处置：accept-any
           只作为 nuisance 学习器（Ridge / RandomForest）出现，接口窄且被测试覆盖；上游一旦补上顶层 py.typed，本条会被判过时
@@ -322,17 +321,20 @@ ab-causal-lab · 治理验证：操作审计（append-only）+ 护栏指标显�
        本仓库合成器的痕迹（`.generated` 标记、`config_fingerprint` 列）——
        没有这一条，「合成数据 + 手写 provenance」就能把这句话骗过去。
   三层都过了才**真接入**：load_real_traffic 归一化 → build_warehouse
-  (generate=False) 跑同一套 SQL。CI 里目录为空，所以它打印'没有接入'并返回 0。
+  (generate=False) 跑同一套 SQL。**现在目录里真的有数据**（MovieLens：
+  610 用户 / 100,836 条真实评分 / 1996–2018），所以这一步在 CI 里
+  每个 push 都会真的把外部数据接进数仓并跑完整条链路 ——
+  真实分布上的 A/A 读数：control 315 / treatment 295（期望各 305，
+  χ² = 0.6557）。在这之前它只打印'没有接入'并返回 0。
 
     真实数据的门（契约 + 反冒充 + 真接入）
       目录：data/real
 
-      当前状态：**没有接入真实数据** —— 目录里没有 provenance.json。
-      这不是失败：unimplemented.py 里那条机检项（kind=file_absent，
-      target=data/real/provenance.json）正是靠『它不存在』成立的；
-      一旦有人接进来，那条检查会红，并逼着 README 改口径。
-
-      接进来的做法见 data/real/README.md（三张表的列 + provenance 契约）。
+      契约通过：source='MovieLens ml-latest-small（GroupLens Research，外部分发）'，exported_at=2026-09-22，3 张表，1 个实验声明
+      真接入完成：归一化 → build/real_traffic；SQL → build/warehouse_real.duckdb
+      实验：ml_aa
+      注意口径：这只能叫「**接入过**外部数据」，不等于在生产流量上验证过 ——
+      差异审计（哪些数字变了、哪些没变）才是这一步真正买到的东西。
 
   契约被实测修正过一次，值得记：第一版把 `user_profile.reg_ds` 写成「可选」，
   依据是 `_normalize_profile` 里那个 `if reg_ds in out.columns` 的写法。

@@ -171,7 +171,7 @@ CLAIMS: list[tuple[str, str, str]] = [
     ("治理·决策层：服务端复核", "governance_report.md", "服务端自己复核"),
     ("治理·没做清单：检查器会抓过时声明", "governance_report.md", "没做」的清单"),
     # 条数会随"做完了"变化（这正是这条声明的用处：做完一条就会红，逼着改文档）
-    ("治理·没做清单：机检条数与清单一致", "governance_report.md", "机检 1 条"),
+    ("治理·没做清单：机检条数与清单一致", "governance_report.md", "机检 0 条"),
     # 环境来源与类型清单（治理报告 7.12 节）
     # 判据文字要用**跨平台稳定**的那一句：本地（Windows）适用的锁文件条目是 48，
     # Linux 上 colorama / tzdata 因 marker 不适用被跳过 —— 写死"48 个"会在 CI 上红，
@@ -186,8 +186,10 @@ CLAIMS: list[tuple[str, str, str]] = [
     ("治理·前端契约：FastAPI 自带路由单独归类",
      "governance_report.md", "FastAPI **自带** 4 条路由"),
     # 真实数据的门（治理报告 7.14 节）
-    ("治理·真实数据：目录为空时明说而不是静默返回",
-     "governance_report.md", "没有接入真实数据"),
+    ("治理·真实数据：有数据时真的接入（契约 + 反冒充 + SQL）",
+     "governance_report.md", "真接入完成"),
+    ("治理·真实数据：MovieLens A/A 的 SRM 读数",
+     "governance_report.md", "control"),
     ("治理·真实数据：契约要从链路写（reg_ds 那次修正）",
      "governance_report.md", "归一化器认为可选，链路认为必需"),
     # SCM 三条检查（m3 第 4 节随 --quick 变 → 只加文本类声明）

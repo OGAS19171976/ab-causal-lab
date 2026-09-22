@@ -1,0 +1,48 @@
+{
+  "source": "MovieLens ml-latest-small（GroupLens Research，外部分发）",
+  "exported_at": "2026-09-22",
+  "external_generator": true,
+  "metric_event": "rating",
+  "guardrail_events": [
+    "rating_low"
+  ],
+  "notes": "评分与时间戳来自 MovieLens（真实），ds/ts 直接用评分时间，未编造。切分方式是**一人一条分界线**（该用户自己的中位评分时间）：前段当处置前指标、后段当结果 —— A/A 里没有真实处置，所以这不是一个真实的实验窗口，前段只用来做 CUPED 的协变量。分流由 build_real_aa_dataset.py 按 sha256(user_id) 奇偶决定：这是**我们做的 A/A**，只能校准口径与方差，不能验证效应。reg_ds 是派生列（该用户最早评分日）；city 缺失 ⇒ 簇级路径不可用。原始文件 https://files.grouplens.org/datasets/movielens/ml-latest-small.zip",
+  "experiments": [
+    {
+      "name": "ml_aa",
+      "variants": {
+        "control": 0.5,
+        "treatment": 0.5
+      },
+      "control": "control",
+      "treatment": "treatment",
+      "guardrails": [
+        [
+          "rating_low",
+          "lower_is_better",
+          0.02
+        ]
+      ]
+    }
+  ],
+  "tables": [
+    {
+      "name": "exposure_log",
+      "file": "exposure_log.parquet",
+      "rows": 610,
+      "sha256": "845352e840e3ae16282e976ab0d6124fa9f249c84e10fb1c7c1ef0b594683374"
+    },
+    {
+      "name": "event_log",
+      "file": "event_log.parquet",
+      "rows": 201672,
+      "sha256": "34f326b65622c87ba8d7d58d2901adfaf390d0a32f030624bbddc35d4f1bdb1f"
+    },
+    {
+      "name": "user_profile",
+      "file": "user_profile.parquet",
+      "rows": 610,
+      "sha256": "8e00971781e48a1ab96d1167ea003c1404c23c24231aea77c02e70051f3ee58d"
+    }
+  ]
+}

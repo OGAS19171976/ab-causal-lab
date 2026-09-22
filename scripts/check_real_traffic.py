@@ -66,7 +66,14 @@ def sha256_of(path: pathlib.Path) -> str:
 def validate(prov: dict, base: pathlib.Path) -> tuple[list[str], list[dict]]:
     """``(问题列表, 表清单)``。表清单只在契约通过时有意义。"""
     problems: list[str] = []
-    for key in ("source", "exported_at", "external_generator", "experiments", "tables"):
+    for key in (
+        "source",
+        "exported_at",
+        "external_generator",
+        "experiments",
+        "tables",
+        "metric_event",
+    ):
         if key not in prov:
             problems.append(f"provenance.json 缺字段 {key!r}")
     if problems:
@@ -187,7 +194,16 @@ def run_ingest(prov: dict) -> dict:
                 guardrails=guardrails,
             )
         )
-    report = load_real_traffic(DATA, target_dir=TARGET, experiments=specs)
+    # 度量事件名与护栏事件名必须从 provenance 读：
+    # 上一轮的版本写死用 load_real_traffic 的默认值（"interaction"），
+    # 那等于"接进来的数据被迫改名"—— 真实数据的度量就叫它自己的名字。
+    report = load_real_traffic(
+        DATA,
+        target_dir=TARGET,
+        experiments=specs,
+        metric_event=str(prov.get("metric_event", "interaction")),
+        guardrail_events=tuple(str(e) for e in prov.get("guardrail_events", ())),
+    )
     build_warehouse(DB_PATH, TARGET, SQL_DIR, generate=False, verbose=False)
     return {
         "experiments": [s.name for s in specs],
