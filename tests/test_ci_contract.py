@@ -93,6 +93,7 @@ class TestCheckPlan:
             ("typed", "check_typed_deps.py"),
             ("frontend", "check_frontend.py"),
             ("realdata", "check_real_traffic.py"),
+            ("realdiff", "run_real_vs_synthetic.py"),
         ):
             assert key in by_key, key
             assert any(script in a for a in by_key[key].argv), by_key[key].argv

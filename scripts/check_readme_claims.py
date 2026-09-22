@@ -190,6 +190,11 @@ CLAIMS: list[tuple[str, str, str]] = [
      "governance_report.md", "真接入完成"),
     ("治理·真实数据：MovieLens A/A 的 SRM 读数",
      "governance_report.md", "control"),
+    # 差异审计（reports/real_vs_synthetic.md）
+    ("差异审计：真实侧指标为空（写死的事件名）",
+     "real_vs_synthetic.md", "写死"),
+    ("差异审计：真实侧簇级退化成一个占位簇",
+     "real_vs_synthetic.md", "1 个簇"),
     ("治理·真实数据：契约要从链路写（reg_ds 那次修正）",
      "governance_report.md", "归一化器认为可选，链路认为必需"),
     # SCM 三条检查（m3 第 4 节随 --quick 变 → 只加文本类声明）

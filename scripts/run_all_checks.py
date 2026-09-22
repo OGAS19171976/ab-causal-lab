@@ -188,6 +188,10 @@ def steps() -> list[Step]:
              (py, "scripts/run_m5_validation.py"), accepts_quick=True),
         Step("m6", "M6 生产口径（口径一致 / 分析单元 / MDE）",
              (py, "scripts/run_m6_validation.py"), accepts_quick=True),
+        # 差异审计：合成 vs 真实外部数据（MovieLens）。它要两个仓库都在，
+        # 所以排在 warehouse 与 realdata 之后（属于 rest 组，claims 仍收尾）。
+        Step("realdiff", "差异审计：合成 vs 真实外部数据（哪些数字变了）",
+             (py, "scripts/run_real_vs_synthetic.py")),
     ]
     head = [s for k in _ORDER_HEAD for s in every if s.key == k]
     # claims 收尾：它要读的 reports/ 由前面所有步骤生成
