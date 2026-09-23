@@ -150,7 +150,7 @@ class TestAuditAPI:
         """走真实的建应用路径（``create_app(库路径)``），而不是自己拼一个 registry。
 
         这样接口测的是**产品里那套装配**，不是测试自己接的一根线。
-        返回 ``(client, auth)``：写接口现在需要凭据，``auth`` 是一个 admin 的请求头。
+        返回 ``(client, auth)``：读接口现在也要凭据，``auth`` 是一个 admin 的请求头。
         """
         from fastapi.testclient import TestClient
 

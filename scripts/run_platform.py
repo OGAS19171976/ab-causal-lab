@@ -67,7 +67,7 @@ def main() -> int:
     existing = registry.count()
     added = 0 if args.no_seed else seed_demo(registry, warehouse_available=wh_ok)
     total = registry.count()
-    # 写接口要求凭据；一个用户都没有时把话说清楚，而不是让人对着 401 猜
+    # 读写接口都要求凭据；一个用户都没有时把话说清楚，而不是让人对着 401 猜
     no_users = not registry.list_users()
     registry.close()
 
@@ -83,7 +83,7 @@ def main() -> int:
     print(f"接口文档: http://{args.host}:{args.port}/docs")
     if no_users:
         print("")
-        print("⚠ 库里还没有任何用户 —— **写接口会全部返回 401**（读接口匿名可用）。")
+        print("⚠ 库里还没有任何用户 —— **读写接口都会返回 401**（公开面只剩 /healthz 与文档）。")
         print("  先建一个（token 只显示一次）：")
         print("    python scripts/manage_users.py add --id <你的名字> --role admin")
     print("（这是本项目自带的演示服务，与 DSH Web GUI 的 3080 端口无关）")

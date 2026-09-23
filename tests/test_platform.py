@@ -30,7 +30,7 @@ TWO_ARM = [
 ]
 
 
-#: 写接口现在需要凭据。测试里统一用这个助手：建一个 admin 用户，
+#: 读写接口都要凭据。测试里统一用这个助手：建一个 admin 用户，
 #: 把 token 挂到 client 上（`client.headers`），这样各测试的调用点不用逐个改。
 def authed_client(app):
     """给 TestClient 装上 admin 凭据。返回 client 本身。"""

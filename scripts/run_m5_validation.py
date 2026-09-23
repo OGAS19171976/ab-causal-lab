@@ -331,7 +331,7 @@ def main() -> int:
     api_wh = default_warehouse_path()
     app = create_app(tmp, warehouse_path=api_wh if api_wh.exists() else None)
     seeded = seed_demo(app.state.registry, warehouse_available=api_wh.exists())
-    # 写接口现在需要凭据（服务端从凭据推导操作者，见 README 设计决策第 45 条）。
+    # 读写接口都要凭据（服务端从凭据推导操作者，见 README 设计决策第 45 条）。
     # 这个脚本是"平台自己的验收客户端"，所以它自己建一个 admin 用户并带上 token。
     api_token = app.state.registry.add_user("m5-validator", role="admin")
     auth = {"Authorization": f"Bearer {api_token}"}
