@@ -152,6 +152,13 @@ NOT_DONE_STATEMENTS: tuple[NotDoneStatement, ...] = (
         "模型预测值 —— 它在分析时才算得出来，落不进「可加量」这一层",
     ),
     NotDoneStatement(
+        key="platform_multi_covariate",
+        phrase="平台侧的多协变量口径",
+        why="数仓侧有原料了（10/11），平台侧没动：estimator 仍只有 cuped/post_only。"
+        "多协变量在平台上要先有产品设计（用户从哪儿选协变量、选几个、"
+        "共线性怎么解释），所以是有意留在数仓那一层之外",
+    ),
+    NotDoneStatement(
         key="cluster_pairing",
         phrase="簇级配对/协变量调整",
         why="整簇随机化下设计层面的补救（配对、协变量调整）没有做",
