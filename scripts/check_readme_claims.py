@@ -199,6 +199,12 @@ CLAIMS: list[tuple[str, str, str]] = [
      "real_vs_synthetic.md", "+9.690"),
     ("差异审计：CUPED 在外推上不成立",
      "real_vs_synthetic.md", "+0.0405"),
+    # 序贯那一段的两个读数：修掉列序错位之后才有数（上一版真实侧是"0 天"）。
+    # 数据是确定的（真实库由 MovieLens parquet 重建），所以这两个数可以进清单。
+    ("差异审计：真实侧序贯轨迹的 max|z|（修好之后）",
+     "real_vs_synthetic.md", "1.567"),
+    ("差异审计：序贯末桶与主效应 z 的自洽检查",
+     "real_vs_synthetic.md", "自洽检查"),
     ("治理·真实数据：契约要从链路写（reg_ds 那次修正）",
      "governance_report.md", "归一化器认为可选，链路认为必需"),
     # SCM 三条检查（m3 第 4 节随 --quick 变 → 只加文本类声明）

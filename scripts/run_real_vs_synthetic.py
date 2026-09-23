@@ -200,41 +200,45 @@ def srm(con: duckdb.DuckDBPyConnection) -> dict[str, float]:
 
 
 def daily_z(con: duckdb.DuckDBPyConnection) -> dict[str, float]:
-    """按日累计的 z 轨迹（序贯视角的单次实现）。"""
+    """按桶累计的 z 轨迹（序贯视角的单次实现）。
+
+    这一层只用到 post 的充分统计量（n / Σpost / Σpost²），所以 SQL **只取这三列**。
+    这是被两次事故逼出来的，两次都出在"解包顺序"上：
+
+    * 第一版把 ``post_sum`` 接到了 ``pre_sum`` 上 —— 真实侧 pre 全 0，
+      于是均值恒为 0；
+    * 第二版修好了 ``post_sum``，却把 ``post_sq`` 接到了 ``pre_sq_sum`` 上。
+      真实库 594 行里 ``pre_sq_sum`` 只有 **111 行**非 0（不是每个用户都有
+      处置前评分），于是两臂方差恒为 0 ⇒ ``se = 0`` ⇒ **一个桶都发不出来**，
+      而报告里只显示一句体面的"0 天" —— 看着像没数据，其实是列接到了别的列上。
+
+    根因不是列序本身，而是"同一次查询解包两遍、两遍顺序不一样"。现在只解包
+    一次、只查要用的列；并且**有行却发不出一个桶**时返回 ``degenerate=1``，
+    由 ``main`` 报红 —— 这类失败不能再靠人读报告发现。
+    """
     rows = con.execute(
         f"""
-        select variant, {_bucket("ds")} as ds, sum(user_cnt), sum(pre_sum),
-               sum(post_sum), sum(pre_sq_sum), sum(post_sq_sum)
+        select variant, {_bucket("ds")} as ds,
+               sum(user_cnt), sum(post_sum), sum(post_sq_sum)
         from dws_experiment_variant_daily
         {_w()}
         group by 1, 2
         order by 2
         """
     ).fetchall()
-    acc: dict[str, list[float]] = {}
-    for variant, _ds, n, pre_sum, post_sum, pre_sq, post_sq in rows:
-        a = acc.setdefault(str(variant), [0.0] * 4)
-        a[0] += float(n)
-        a[1] += float(post_sum)
-        a[2] += float(post_sq)
-        a[3] += 0.0
-        # 逐日重算需要逐臂累计；这里只累计，最后一天统一算（见下）
-    # 逐日轨迹：重新按 ds 累计并算 z
-    # 列顺序必须与 SQL 逐字对应：variant, ds, Σuser_cnt, Σpre_sum, Σpost_sum,
-    # Σpre_sq, Σpost_sq。第一版把第二个循环的下标写错（post_sum 拿到的是 pre_sum），
-    # 于是真实侧（pre 全 0）算出来的均值恒为 0、轨迹是空的。
-    per_day: dict[str, dict[str, list[float]]] = {}
-    for variant, ds, n, _pre_sum, post_sum, post_sq, _pre_sq in rows:
-        per_day.setdefault(str(ds), {}).setdefault(str(variant), [0.0, 0.0, 0.0])
-        slot = per_day[str(ds)][str(variant)]
+    slots: dict[str, dict[str, list[float]]] = {}
+    for variant, ds, n, post_sum, post_sq in rows:
+        slot = slots.setdefault(str(ds), {}).setdefault(str(variant), [0.0, 0.0, 0.0])
         slot[0] += float(n)
         slot[1] += float(post_sum)
         slot[2] += float(post_sq)
-    _ = _pre_sum, _pre_sq  # 只用于说明列序；这两列这一层用不到
+    # 逐桶累计：每桶先把该桶各臂的量加进 running，再用**当刻累计量**算 z。
+    # 跳过是正常的：桶里只有一臂（比如真实侧 1996Q1 只有 control），
+    # 或者累计样本还不够（n <= 1）。
     running: dict[str, list[float]] = {}
     zs: list[float] = []
-    for ds in sorted(per_day):
-        for variant, slot in per_day[ds].items():
+    for ds in sorted(slots):
+        for variant, slot in slots[ds].items():
             run = running.setdefault(variant, [0.0, 0.0, 0.0])
             run[0] += slot[0]
             run[1] += slot[1]
@@ -248,9 +252,21 @@ def daily_z(con: duckdb.DuckDBPyConnection) -> dict[str, float]:
                 se = math.sqrt(vt / t[0] + vc / c[0])
                 if se > 0:
                     zs.append((mt - mc) / se)
-    if not zs:
-        return {"days": 0.0, "max_abs_z": float("nan"), "last_z": float("nan")}
-    return {"days": float(len(zs)), "max_abs_z": max(abs(z) for z in zs), "last_z": zs[-1]}
+    out = {
+        "days": float(len(zs)),
+        "max_abs_z": float("nan"),
+        "last_z": float("nan"),
+        "buckets": float(len(slots)),
+        "degenerate": 0.0,
+    }
+    if zs:
+        out["max_abs_z"] = max(abs(z) for z in zs)
+        out["last_z"] = zs[-1]
+    elif rows:
+        # 拿到行却一个桶都算不出来：链路级失败（列序 / 颗粒度 / 方差退化），
+        # 不能静默变成"0 天"。
+        out["degenerate"] = 1.0
+    return out
 
 
 def cluster_view(con: duckdb.DuckDBPyConnection) -> dict[str, float]:
@@ -284,10 +300,23 @@ def readings(
         out.update({f"shape.{k}": v for k, v in shape_stats(con).items()})
         out.update({f"effect.{k}": v for k, v in cuped_and_effect(con).items()})
         out.update({f"srm.{k}": v for k, v in srm(con).items()})
-        out.update({f"daily.{k}": v for k, v in daily_z(con).items()})
+        daily = daily_z(con)
+        out.update({f"daily.{k}": v for k, v in daily.items()})
         out.update({f"cluster.{k}": v for k, v in cluster_view(con).items()})
         out["true_lift_rows"] = true_lift_present(con)
         out["experiment_name"] = _EXP
+        # **自洽检查**：累计 z 轨迹的末桶就是全样本，所以它必须等于
+        # ads_experiment_result 上算出来的 post-only z。两个口径走的是同一批
+        # 充分统计量，对不上就说明有一层接错了列 / 漏了过滤 —— 两次列序错位
+        # 都属于这一类：两边都算得出数，只是那个数不是那个数。
+        z_last, z_agg = daily["last_z"], out["effect.z"]
+        if math.isnan(z_last) or math.isnan(z_agg):
+            # 任一侧没有数：由 daily.degenerate / effect.degenerate 负责报红
+            out["daily.matches_effect"] = float("nan")
+        else:
+            out["daily.matches_effect"] = (
+                1.0 if abs(z_last - z_agg) <= 1e-9 * max(1.0, abs(z_agg)) else 0.0
+            )
         return out
     finally:
         con.close()
@@ -310,9 +339,12 @@ ROWS: tuple[tuple[str, str, str], ...] = (
     ("  z（CUPED）", "effect.z_cuped", "{:+.3f}"),
     ("  p（CUPED）", "effect.p_cuped", "{:.4f}"),
     ("SRM χ²（最大）", "srm.chi2", "{:.4f}"),
-    ("累计 z 轨迹：桶数（合成按日/真实按季度）", "daily.days", "{:.0f}"),
+    ("累计 z 轨迹：分桶数（含被跳过的桶）", "daily.buckets", "{:.0f}"),
+    ("累计 z 轨迹：可用桶数（合成按日/真实按季度）", "daily.days", "{:.0f}"),
     ("累计 z 轨迹：max|z|", "daily.max_abs_z", "{:.3f}"),
     ("累计 z 轨迹：最后一个桶", "daily.last_z", "{:+.3f}"),
+    ("累计 z 轨迹：末桶 == 主效应 z（自洽检查，1=通过）",
+     "daily.matches_effect", "{:.0f}"),
     ("簇级日表行数", "cluster.rows", "{:.0f}"),
     ("不同簇数", "cluster.clusters", "{:.0f}"),
     ("有 true_lift 的行数", "true_lift_rows", "{:.0f}"),
@@ -342,57 +374,62 @@ def main() -> int:
         a = syn.get(key, float("nan"))
         b = real.get(key, float("nan"))
         lines.append(f"| {label} | {fmt.format(a)} | {fmt.format(b)} |")
-    if real.get("effect.degenerate") or syn.get("effect.degenerate"):
-        lines += [
-            "",
-            "> **注意：有一侧的指标是退化的**（方差为 0 / 全 0）—— 见下面第 0 条。",
-        ]
+    effect_bad = bool(real.get("effect.degenerate") or syn.get("effect.degenerate"))
+    daily_bad = bool(real.get("daily.degenerate") or syn.get("daily.degenerate"))
+    notes = []
+    if effect_bad:
+        notes.append("> **注意：有一侧的指标是退化的**（方差为 0 / 全 0）—— 下面第 1 条不可用。")
+    if daily_bad:
+        notes.append("> **注意：有一侧的序贯轨迹退化为 0 桶**（拿到了行却发不出桶）—— 见第 4 条。")
+    mismatch = [
+        name
+        for name, side in (("合成", syn), ("真实", real))
+        if side.get("daily.matches_effect") == 0.0
+    ]
+    if mismatch:
+        notes.append(
+            f"> **注意：{'、'.join(mismatch)}侧的序贯末桶与主效应 z 对不上**"
+            "（两个口径本该逐位相等）—— 见第 4 条。"
+        )
+    if notes:
+        lines += ["", *notes]
     lines += [
         "",
         "## 结论（哪些变了、哪些没变）",
         "",
-        "0. **第一次跑就抓到一个真问题**：真实侧的 pre/post 指标全是 0。",
-        "   根因不在数据：数仓 SQL `sql/01_dwd_experiment_user.sql` 第 59 行**写死**了",
-        "   `ev.event_name = \'interaction\'`（合成器的事件名），而真实数据的事件叫",
-        "   `rating` —— 于是 exposure 计数正常、SRM 正常、**指标却是空的**。",
-        "   这正是「接入外部数据」该买到的东西：契约与反冒充都过了，",
-        "   但**链路里的假设**（事件名）只有换成真数据才会暴露。",
-        "   下一轮做：把事件名从声明传到 SQL（参数化），并让门在「指标全 0」时直接报红。",
+        "**两个链路 bug 已经修掉** —— 留在这里，因为它们正是「接入外部数据」买到的东西：",
         "",
-        *(
-            []
-            if real.get("effect.degenerate")
-            else [
-                "1. **该一致的一致**：两个仓库的 SRM 都在正常量级（真实那一份是 A/A，"
-            ]
-        ),
-        *(
-            []
-            if real.get("effect.degenerate")
-            else [
-                f"   χ² = {real['srm.chi2']:.4f}，不显著 ⇒ 分流没坏）；CUPED 在两个仓库上都",
-                "   是**正**的方差缩减（真实 {:+.4f} vs 合成 {:+.4f}）；".format(
-                    real["effect.reduction_weighted"], syn["effect.reduction_weighted"]
-                ),
-                f"   真实的 A/A 主效应 z = {real['effect.z']:+.3f}（p = {real['effect.p']:.4f}），",
-                "   即「没有效应」这个结论在真实分布上也守得住。",
-                "",
-            ]
-        ),
-        "1b. **该一致的一致（本次只做到一半）**：分流的 SRM 两侧都正常"
-        f"（真实 χ² = {real['srm.chi2']:.4f}），但真实侧的 CUPED 与主效应**算不出来** ——",
-        "   因为指标是空的（见第 0 条）。所以「合成 vs 真实」这一步现在只完成了",
-        "   分流那一半，方差与口径那一半要等事件名接上之后重跑。",
-        "",
-        "1. ~~该一致的一致~~（见 1b：本次只有 SRM 那一半）",
+        "* **事件名写死**：数仓 SQL 曾经**写死** `ev.event_name = 'interaction'`"
+        "（合成器的事件名），",
+        "  而真实数据的事件叫 `rating` —— exposure 计数正常、SRM 正常、**指标却全 0**。",
+        "  事件名现在从 provenance 一路传到 SQL，而且门会在「主指标全 0」时直接报红",
+        "  （`check_metric_is_alive`）：这类「链路假设不匹配」以后由机器抓，"
+        "不靠人读审计报告。",
+        "* **序贯轨迹的列序**：`daily_z` 把同一次查询解包两遍、第二遍顺序错位，"
+        "`post_sq` 接到了",
+        "  `pre_sq_sum` 上，于是真实侧两臂方差恒为 0、**一个桶都发不出来**"
+        "（见第 4 条）。",
         "",
     ]
+    if effect_bad:
+        lines += [
+            "1. **该一致的一致：本次只做到分流那一半** —— 指标退化，"
+            "CUPED 与主效应算不出来。",
+            "",
+        ]
+    else:
+        lines += [
+            "1. **该一致的一致**：两个仓库的 SRM 都在正常量级（真实那一份是 A/A，",
+            f"   χ² = {real['srm.chi2']:.4f}，不显著 ⇒ 分流没坏）；CUPED 在两个仓库上都",
+            "   是**正**的方差缩减（真实 {:+.4f} vs 合成 {:+.4f}）；".format(
+                real["effect.reduction_weighted"], syn["effect.reduction_weighted"]
+            ),
+            f"   真实的 A/A 主效应 z = {real['effect.z']:+.3f}"
+            f"（p = {real['effect.p']:.4f}），",
+            "   即「没有效应」这个结论在真实分布上也守得住。",
+            "",
+        ]
     lines += [
-
-        f"   χ² = {real['srm.chi2']:.4f}，不显著 ⇒ 分流没坏）；CUPED 在两个仓库上都",
-        "   CUPED 方差缩减：合成 {:+.4f}；真实侧本次**算不出**"
-        "（指标为空，见第 0 条）。".format(syn["effect.reduction_weighted"]),
-        "",
         "2. **该不一致的不一致**（这一份报告真正买到的东西）：",
         f"   分布形状差得很远 —— 零值占比 {syn['shape.zero_share']:.4f} → "
         f"{real['shape.zero_share']:.4f}，峰度 {syn['shape.kurt']:+.3f} → "
@@ -410,13 +447,28 @@ def main() -> int:
         f"（合成侧 {syn['true_lift_rows']:.0f}）——",
         "   外部数据没有演示真值，所以它只能做校准，不能做「效应估得准不准」的验收。",
         "",
-        "4. **序贯视角只能看量级，而且两侧颗粒度不同**：合成的桶是**日历日**"
-        "（每天很多用户），真实的是**季度**"
-        "（MovieLens 的曝光日是每人自己的中位评分时间：573 个曝光日、每臂每日 1 人，"
-        "按日根本没有样本）—— 拿「天数」比大小没有意义，只能比「轨迹像不像随机游走」。",
-        "   max|z| 真实 "
+        "4. **序贯视角：口径按仓库分开，两侧的「天数」本来就不可比**。"
+        "合成的桶是**日历日**",
+        "（每天很多用户）；真实侧 MovieLens 的曝光日是**每人自己的中位评分时间**"
+        "（573 个曝光日、每臂每日只有 1 人）—— 按日根本没有样本，所以真实侧按**季度**聚合。",
+        "   能比的只有「轨迹像不像随机游走」：max|z| 真实 "
         f"{real['daily.max_abs_z']:.3f} / 合成 {syn['daily.max_abs_z']:.3f}"
-        f"（天数 {real['daily.days']:.0f} / {syn['daily.days']:.0f}）——",
+        f"（可用桶 {real['daily.days']:.0f} / {syn['daily.days']:.0f}，"
+        f"分桶 {real['daily.buckets']:.0f} / {syn['daily.buckets']:.0f}）——",
+        "   被跳过的桶不是「没有数据」：真实侧第一个季度只有一臂（1996Q1 只有 control），",
+        "   或者累计样本还不够（n ≤ 1）。",
+        "   **上一版这里真实侧是 0 个桶**，根因就是开头那条列序错位：真实库 594 行里",
+        "   `pre_sq_sum` 只有 **111 行**非 0（不是每个用户都有处置前评分），"
+        "两臂方差因此恒为 0，",
+        "   `se = 0` ⇒ 一个桶都发不出来，而报告只显示一句体面的「0 天」——"
+        "看着像没数据，其实是列接到了别的列上。",
+        "   现在 `daily_z` 只解包一次、只查用得到的列，并且**有行却发不出一个桶就报红**",
+        "   （`daily.degenerate`）。另外多了一条不变量：末桶就是全样本，所以它必须等于",
+        "   `ads_experiment_result` 上的 post-only z —— 两个口径走的是同一批充分统计量，"
+        "对不上就报红",
+        "   （`daily.matches_effect`）。这条不变量比「有桶」更强："
+        "它能抓到两个口径都算出数、但接错了列的情况。",
+        "   合成侧的 max|z| 也随之变了：旧数用的也是错的方差列。",
         "   这是**一次实现**，不是 FWER；真实的 FWER 要用重随机化（本仓库在合成数据上做过，",
         "   见 m2 报告），外部数据上做不了，因为分流是我们自己做的 A/A。",
         "",
@@ -424,6 +476,27 @@ def main() -> int:
     REPORT.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
     print("\n".join(lines))
     print(f"\n报告已写入 {REPORT}")
+    if daily_bad:
+        # 序贯那一段拿不到桶：这正是上一版静默显示"0 天"的那种失败。
+        # 报告已经写下来了，但这一步必须红 —— 否则没人会去看那三个数。
+        print(
+            "\n**序贯轨迹退化**：daily_z 拿到了行，却一个桶都算不出来"
+            "（见报告第 4 条与 `daily.buckets` / `daily.days`）——"
+            "这是链路级失败，不是「这段时间没有数据」。"
+        )
+        return 1
+    if mismatch:
+        # 末桶就是全样本 ⇒ 它必须等于 ads_experiment_result 上的 post-only z。
+        # 对不上说明有一层接错了列 / 漏了过滤，而两边都能算出数来 ——
+        # 这种"看着正常的错"正是要靠不变量抓的。
+        print(
+            f"\n**序贯末桶与主效应 z 对不上**：{'、'.join(mismatch)}侧 "
+            f"daily.last_z 与 effect.z 不一致（合成 "
+            f"{syn['daily.last_z']:+.6f} / {syn['effect.z']:+.6f}，真实 "
+            f"{real['daily.last_z']:+.6f} / {real['effect.z']:+.6f}）——"
+            "两者本该是同一个数。"
+        )
+        return 1
     return 0
 
 
