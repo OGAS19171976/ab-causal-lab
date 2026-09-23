@@ -17,6 +17,7 @@ Python 负责推断（t 检验、置信区间、SRM 体检），
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 import sys
 import time
@@ -35,14 +36,21 @@ from ablab.inference import (  # noqa: E402
 )
 from ablab.reporting import for_report  # noqa: E402
 from ablab.warehouse import (  # noqa: E402
+    DECLARED_LINEAGE,
     DEFAULT_EXPERIMENTS,
+    SQL_ORDER,
     ExternalExperiment,
     WarehouseConfig,
     analyse_ads,
     build_warehouse,
+    check_lineage,
+    check_manifest,
+    check_quality,
     cluster_replicate_experiments,
     covariate_adjustment_report,
     load_real_traffic,
+    manifest_path,
+    parse_lineage,
     ratio_replicate_experiments,
     ratio_replicate_experiments_with_lift,
     render_report,
@@ -740,6 +748,57 @@ def main() -> int:
     emit("      曝光里出现未声明的变体名会直接报错，未声明的事件名只报告、")
     emit("      不会被任何指标读走（DWD 按 event_name 过滤）；")
     emit("    · 没有 user_profile 时簇级路径不可用（城市/注册日期缺失），其余链路不受影响。")
+
+    # ---- 9. 运营层：血缘 / 质量 / 新鲜度 -------------------------------- #
+    #
+    # 前八个问题回答的都是"算得对"。这一节回答另外三个，而它们在 dbt 那类工具里
+    # 是内置的：这张表从哪来（血缘）、这一列现在干净吗（质量）、
+    # 我读的是现在这份 SQL 建出来的吗（新鲜度）。
+    # 判据在 ablab/warehouse/ops.py，这里只报读数 —— 与门（check_warehouse_quality）
+    # 走的是同一个函数，不存在"报告里绿、门上红"的可能。
+    emit("\n### 9. 运营层：血缘 / 质量 / 新鲜度（这一轮补的）")
+    edges = parse_lineage(ROOT / "sql")
+    views = sum(1 for e in edges if e.is_view)
+    lineage_problems = check_lineage(ROOT / "sql", SQL_ORDER, DECLARED_LINEAGE)
+    emit(f"  血缘：{len(edges)} 个节点（其中**视图 {views} 个**）、"
+         f"{sum(len(e.reads) for e in edges)} 条边；"
+         f"与人工声明一致且满足拓扑序：{not lineage_problems}")
+    emit("  血缘是**解析出来的**，不是手写的 —— 手写的会漂（这个仓库栽过的正是"
+         "『声明没人对』）")
+    emit("  做法是：解析结果必须与 `DECLARED_LINEAGE` 对得上，两边都要有。")
+    emit("  **第一次跑就纠正了我四处声明**，其中一处是结构性的：")
+    emit("    08 路护栏链读的是 **ODS 三张视图**，不是 DWD —— 护栏是别的**事件**"
+         "（延迟/崩溃），")
+    emit("    而 01 路的 metric_value 只装了主指标事件。它自己重写了一遍"
+         "『首次曝光』口径，")
+    emit("    这是有意为之（08 的注释写着『与 01 路同一套口径』），"
+         "但**血缘上它是一条独立入口**，")
+    emit("    这一点以前没人写下来过；另外三处是：ODS/DIM 其实是视图、"
+         "SRM 读的是 ADS 而不是 DWD、")
+    emit("    09 不读 DIM（名单在 08 就 join 完了）。")
+    quality_problems, checks = check_quality(con)
+    emit(f"  质量：跑了 **{checks} 条**检查，{len(quality_problems)} 条不成立；"
+         "其中包含**跨层一致性**")
+    emit("  （DWD→ADS、DWS→ADS、比值 DWS→ADS、协变量 DWS→ADS）——"
+         "主键不重复只说明键写对了，")
+    emit("  这一条才说明**分层没写歪**（分层写歪时，所有列级约束都会通过）。")
+    emit("  判据也被实测改写了一次：第一版把 `pre_metric` / `post_metric` / `sum_y`"
+         " 也标成非负，")
+    emit("  一跑就红（最小 −98.9）—— 而这不是数据脏：主指标在 DGP 里是**高斯连续量**，")
+    emit("  值之和当然可以是负的。于是**非负只留给计数**；"
+         "一条『靠运气通过』的约束比没有更糟，")
+    emit("  因为它让人以为自己被保护着。")
+    manifest = manifest_path(ROOT / "build" / "warehouse.duckdb")
+    fresh_problems = check_manifest(
+        ROOT / "build" / "warehouse.duckdb", ROOT / "sql", con, [e.table for e in edges]
+    )
+    recorded = json.loads(manifest.read_text(encoding="utf-8")) if manifest.exists() else {}
+    emit(f"  新鲜度：{'一致' if not fresh_problems else '对不上'} —— "
+         f"清单记了 {len(recorded.get('sql_fingerprints', {}))} 个 SQL 文件的指纹与 "
+         f"{len(recorded.get('row_counts', {}))} 个节点的行数")
+    emit("  它抓的是两类事故：**改了 SQL 忘重建**（读到旧数据配新 SQL）、"
+         "以及重建后行数悄悄变了。")
+
     emit(f"\n总耗时 {time.perf_counter() - t0:.1f}s")
     con.close()
 

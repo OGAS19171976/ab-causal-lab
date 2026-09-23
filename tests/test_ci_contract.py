@@ -110,12 +110,13 @@ class TestCheckPlan:
         所以它必须收尾（见下一条测试）。
         """
         keys = [s.key for s in runner.steps()]
-        # 前 9 个是**声明过的顺序**（run_all_checks._ORDER_HEAD）：
-        # lock → env → typed → lint → types → unimplemented → warehouse → gov → cate
-        assert keys[:11] == [
+        # 前 12 个是**声明过的顺序**（run_all_checks._ORDER_HEAD）：
+        # lock → env → typed → lint → types → unimplemented → warehouse → whquality
+        # → gov → cate。whquality 紧跟 warehouse：它读的是上一步建出来的库。
+        assert keys[:12] == [
             "lock", "env", "typed", "frontend", "realdata", "lint", "types",
-            "unimplemented", "warehouse", "gov", "cate"
-        ], keys[:11]
+            "unimplemented", "warehouse", "whquality", "gov", "cate"
+        ], keys[:12]
 
     def test_claims_runs_last(self, runner):
         """**声明核对必须排在最后**：它检查的"README 数字能否在报告里找到"
@@ -127,6 +128,19 @@ class TestCheckPlan:
         """
         keys = [s.key for s in runner.steps()]
         assert keys[-1] == "claims", keys[-3:]
+
+    def test_whquality_follows_the_warehouse(self, runner):
+        """运营层必须**排在数仓之后**：它读的是上一步建出来的库。
+
+        排反了不会报错 —— 它会拿**上一次**的库去核对指纹，然后在"SQL 改了没重建"
+        这件事上给出随机结论。这类"顺序错了但看起来在工作"的问题，
+        与 `warehouse` 必须早于 m5/m6 是同一类，所以同样用测试钉住。
+        """
+        keys = [s.key for s in runner.steps()]
+        assert "whquality" in keys and "warehouse" in keys
+        assert keys.index("warehouse") < keys.index("whquality")
+        step = next(s for s in runner.steps() if s.key == "whquality")
+        assert any("check_warehouse_quality.py" in a for a in step.argv), step.argv
 
     def test_unimplemented_step_exists(self, runner):
         """**"没做"的清单也必须在检查集里** —— 与声明核对同一个理由：

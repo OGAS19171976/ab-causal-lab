@@ -253,6 +253,13 @@ CLAIMS: list[tuple[str, str, str]] = [
      "warehouse_report.md", "最大相对差"),
     ("数仓·真实数据入口：true_lift 在外部路径上为空",
      "warehouse_report.md", "真实数据没有演示真值"),
+    # 运营层（这一轮补的）：血缘 / 质量 / 新鲜度。读数稳定（同一份 DGP + 同一叠 SQL）。
+    ("数仓·运营层：血缘节点数与边数",
+     "warehouse_report.md", "16 个节点（其中**视图 5 个**）、16 条边"),
+    ("数仓·运营层：质量检查条数",
+     "warehouse_report.md", "**103 条**检查"),
+    ("数仓·运营层：非负只留给计数（判据被实测改写）",
+     "warehouse_report.md", "非负只留给计数"),
     # 少簇推断（m6 7b 节）：该节n与重复数随 --quick 变，所以只加文本类声明。
     ("M6·少簇：wild cluster bootstrap 已实现",
      "m6_validation.md", "CR1 到底有多过度拒绝"),

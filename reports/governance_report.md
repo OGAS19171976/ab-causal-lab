@@ -210,10 +210,10 @@ ab-causal-lab · 治理验证：操作审计（append-only）+ 护栏指标显�
       包                     版本          py.typed  stub 包          用到它的源码文件
       numpy                 2.5.3       有         -                     71
       scipy                 1.18.1      **没有**    -                     31
-      pytest                9.1.1       有         -                     22
+      pytest                9.1.1       有         -                     23
+      duckdb                1.5.5       有         -                     10
       pandas                3.0.3       **没有**    -                     10
       fastapi               0.141.1     有         -                      8
-      duckdb                1.5.5       有         -                      7
       scikit-learn          1.9.1       **没有**    -                      4
       packaging             26.3        有         -                      2
       matplotlib            3.11.1      有         -                      1
@@ -264,8 +264,8 @@ ab-causal-lab · 治理验证：操作审计（append-only）+ 护栏指标显�
 
         另有 0 个因平台 marker 不适用（本平台不该装）：无
 
-      二、源码 import 的顶层模块：共 24 个，没人锁的 0 个
-        标准库         16
+      二、源码 import 的顶层模块：共 25 个，没人锁的 0 个
+        标准库         17
         锁文件         8
 
     环境来源与锁文件一致：所有包都来自当前解释器，源码没有未锁的 import

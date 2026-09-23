@@ -36,6 +36,7 @@ from ..inference import (
     welch_ttest_from_stats,
 )
 from .generate import WarehouseConfig, generate_source_data
+from .ops import parse_lineage, write_manifest
 
 __all__ = [
     "SQL_ORDER",
@@ -211,6 +212,14 @@ def build_warehouse(
         },
         verbose=verbose,
     )
+    # **新鲜度清单**：建完立刻写下"这次是用哪一版 SQL、建出了多少行"。
+    # 放在 SQL 跑完之后，因为它描述的是"这次建出来的东西"；
+    # 之后有人改了 SQL 没重建，check_warehouse_quality 就会拿指纹对出来。
+    manifest = write_manifest(
+        db_path, sql_dir, con, [edge.table for edge in parse_lineage(sql_dir)]
+    )
+    if verbose:
+        print(f"  [清单] {manifest.name} 已写入（SQL 指纹 + 各节点行数）")
     return con
 
 

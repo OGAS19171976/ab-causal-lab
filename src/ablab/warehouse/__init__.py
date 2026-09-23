@@ -36,6 +36,17 @@ from .ingest import (
     IngestReport,
     load_real_traffic,
 )
+from .ops import (
+    DECLARED_LINEAGE,
+    TABLE_SPECS,
+    BuildManifest,
+    check_lineage,
+    check_manifest,
+    check_quality,
+    manifest_path,
+    parse_lineage,
+    write_manifest,
+)
 
 __all__ = [
     "ExternalExperiment",
@@ -64,4 +75,14 @@ __all__ = [
     "ExperimentDef",
     "WarehouseConfig",
     "generate_source_data",
+    # 运营层（血缘 / 数据质量 / 新鲜度）
+    "DECLARED_LINEAGE",
+    "TABLE_SPECS",
+    "BuildManifest",
+    "check_lineage",
+    "check_manifest",
+    "check_quality",
+    "manifest_path",
+    "parse_lineage",
+    "write_manifest",
 ]

@@ -127,6 +127,8 @@ _ORDER_HEAD = (
     "types",
     "unimplemented",
     "warehouse",
+    # 运营层紧跟数仓链路：它读的是上一步建出来的库，秒级、且失败要早报
+    "whquality",
     "gov",
     "cate",
 )
@@ -170,6 +172,10 @@ def steps() -> list[Step]:
         # —— 那正是第 31 条说的"假红灯"。脚本自己留了 --quick 供人工冒烟。
         Step("warehouse", "数仓链路（m5/m6 的前提）",
              (py, "scripts/run_warehouse.py")),
+        # 数仓的**运营层**：血缘 / 数据质量 / 新鲜度。它不重建库，只读上一步的产物 ——
+        # 所以必须排在 warehouse 之后（排前面会读到上一次的库）。
+        Step("whquality", "数仓运营层：血缘 / 质量测试 / 新鲜度指纹",
+             (py, "scripts/check_warehouse_quality.py")),
         Step("gov", "治理：操作审计（append-only）+ 护栏指标显式化",
              (py, "scripts/run_governance_validation.py")),
         Step("cate", "M4 CATE 区间：两条路线的覆盖率（含「校准不了」这个结论）",
