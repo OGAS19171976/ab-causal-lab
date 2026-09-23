@@ -39,6 +39,7 @@ from .analysis import (
     run_aa_validation,
 )
 from .datasource import list_warehouse_experiments
+from .ratelimit import WindowRateLimiter
 from .registry import (
     ROLES,
     STATUSES,
@@ -233,23 +234,44 @@ class DesignIn(_Strict):
 # 身份：凭据 -> 操作者
 # --------------------------------------------------------------------------- #
 #
-# 三条不可动摇的规则（都在测试里钉着）：
+# 四条不可动摇的规则（都在测试里钉着）：
 #   1. **操作者只从凭据推导**，永远不从请求体里读 —— 客户端能填的名字不是身份，
 #      只是声明。审计字段一旦可以被请求方指定，它就比没有更糟（看起来权威）。
 #   2. **认不出来就是 401，角色不够就是 403**，而且被拒绝的操作**不写审计** ——
 #      否则审计会被失败的尝试淹没，"谁改了什么"要翻十页才看得见。
-#   3. **读接口匿名**。这是单机实验平台的取舍，不是遗漏；说出来，别让人以为
-#      "做了鉴权 = 什么都挡住了"。
-#: 不需要凭据的写路径。**目前为空** —— 将来加"登录接口"时放这里，
-#: 并且测试会读同一个常量，不会出现"测试名单和实现名单不一致"。
-PUBLIC_WRITE_PATHS: frozenset[str] = frozenset()
+#   3. **读接口从这一轮起也要凭据**（在此之前是匿名的）。改这一条的理由不是
+#      "读更危险了"，而是：一个"做了鉴权"的平台如果只挡写，读者会以为全都挡住了 ——
+#      边界说在文档里，但**代码只挡一半**这件事，文档挡不住误用。
+#      公开面因此缩小到：``/healthz``、``/docs`` 与静态页面（它们都不是 ``/api``）。
+#   4. **被拒的请求也要计入限速**（按来源 IP）：认证之前就限，否则"猜 token"
+#      这条路径一次都不花成本。
+#: 不需要凭据的 ``/api`` 路径。**目前为空** —— 将来加"登录接口"时放这里。
+#: 注意测试**故意不读这个常量**：``tests/test_credentials.py`` 枚举所有 ``/api``
+#: 路由逐个断言 401，所以往这个名单里加一条，那条测试会红 ——
+#: 免检是要有人解释的，不该是一次静默的白名单编辑。
+PUBLIC_API_PATHS: frozenset[str] = frozenset()
 
-#: 哪些方法算"写"。读（GET/HEAD/OPTIONS）不受影响：本平台读接口是匿名的，
-#: 这是单机实验平台的取舍，写在这里以免被当成遗漏。
+#: 哪些方法算"写"。写要 ``editor``（``DELETE`` 要 ``admin``），读只要 ``viewer``。
 WRITE_METHODS = ("POST", "PUT", "PATCH", "DELETE")
+
+#: 限速默认值（每身份每分钟）。**刻意宽松**：它挡的是"跑飞的脚本"与"猜 token"，
+#: 不是节流正常使用 —— 一个"刚好够用"的默认值只会在正常使用下制造假红。
+#: 要收紧就在 ``create_app(rate_limits=...)`` 里给（测试就是这么验 429 的）。
+DEFAULT_READ_PER_MINUTE = 600
+DEFAULT_WRITE_PER_MINUTE = 120
+DEFAULT_ANONYMOUS_PER_MINUTE = 300
 
 _BEARER_PREFIX = "bearer "
 _READ_ROLES = {"viewer", "editor", "admin"}
+
+#: 401 的文案按**原因**分——"没给"和"过期了"要指导两个不同的动作。
+_UNAUTHORIZED_DETAIL = {
+    "missing": "需要凭据：Authorization: Bearer <token>（读写接口都要）",
+    "unknown": "凭据无效：这个 token 不在库里（拼错了，或已被换发）",
+    "disabled": "该凭据已被停用 —— 找管理员 enable，或换一个账号",
+    "expired": "凭据已过期 —— 用 scripts/manage_users.py rotate --id <user> 换发",
+}
+
 
 
 def bearer_token(authorization: str | None) -> str | None:
@@ -288,26 +310,13 @@ def expected_version_of(request: Request) -> int | None:
     return version
 
 
-def require_role(app: FastAPI, authorization: str | None, minimum: str) -> str:
-    """校验凭据与角色，返回**用户 id**（而不是请求里声称的名字）。
+def role_satisfies(role: str | None, minimum: str) -> bool:
+    """角色够不够。``None``（用户不存在/被停用）一律不够。
 
-    `app` 走参数而不是闭包：`create_app` 里定义的依赖解析不到注解（见那里的注释）。
+    独立成一个小函数是为了让中间件**只认证一次**：先 ``auth_status`` 拿用户，
+    再用它查角色 —— 不走 ``authenticate`` 那条路再查第二遍哈希。
     """
-    registry: ExperimentRegistry = app.state.registry
-    user_id = registry.authenticate(bearer_token(authorization))
-    if user_id is None:
-        raise HTTPException(
-            status_code=401,
-            detail="需要凭据：Authorization: Bearer <token>",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    role = registry.role_of(user_id)
-    if role not in _READ_ROLES or ROLES.index(role) < ROLES.index(minimum):
-        raise HTTPException(
-            status_code=403,
-            detail=f"该操作需要 {minimum} 及以上角色，当前是 {role}",
-        )
-    return user_id
+    return bool(role) and role in _READ_ROLES and ROLES.index(str(role)) >= ROLES.index(minimum)
 
 
 # --------------------------------------------------------------------------- #
@@ -316,11 +325,16 @@ def require_role(app: FastAPI, authorization: str | None, minimum: str) -> str:
 def create_app(
     registry_path: str | Path,
     warehouse_path: str | Path | None = None,
+    *,
+    rate_limits: dict[str, int] | None = None,
 ) -> FastAPI:
     """构造应用。
 
     ``warehouse_path`` 指向 DuckDB 数仓（可选）。给了它，绑定了数仓实验的记录
     就能走真实链路；没给则所有分析都走合成数据。
+
+    ``rate_limits`` 覆盖限速默认值（键：``read`` / ``write`` / ``anonymous``）。
+    测试靠它把额度调到个位数，从而**几条请求就能证明 429**。
     """
     app = FastAPI(
         title="ab-causal-lab 实验平台",
@@ -332,6 +346,18 @@ def create_app(
     )
     registry = ExperimentRegistry(registry_path)
     app.state.registry = registry
+    # 限速窗口挂在**应用实例**上，不是模块级全局：每个实例一套计数，
+    # 于是测试里各用例互不消耗额度（否则测试顺序会变成隐藏的耦合）。
+    limiters = {
+        name: WindowRateLimiter(per_minute)
+        for name, per_minute in {
+            "read": DEFAULT_READ_PER_MINUTE,
+            "write": DEFAULT_WRITE_PER_MINUTE,
+            "anonymous": DEFAULT_ANONYMOUS_PER_MINUTE,
+            **(rate_limits or {}),
+        }.items()
+    }
+    app.state.rate_limiters = limiters
     wh_path = Path(warehouse_path) if warehouse_path is not None else None
     app.state.warehouse_path = wh_path if wh_path and wh_path.exists() else None
 
@@ -381,26 +407,69 @@ def create_app(
             raise HTTPException(401, "这条写路径没有经过身份校验（内部错误，已拒绝）")
         return str(user_id)
 
-    # ---- 身份中间件：在**请求体校验之前**拦下无凭据的写请求 -------------- #
+    # ---- 身份 + 限速中间件 ------------------------------------------------ #
     #
     # 为什么必须是中间件而不是"在端点里调用一次"：FastAPI 先校验请求体、
     # 再进入函数体，所以匿名调用者会先拿到 422（还附带了 schema 详情），
     # 而不是 401 —— 实测就是这样，被自动枚举路由的测试抓出来了。
-    # 放在中间件里，顺序就变成"先认证、再校验"，也顺带保证**没有哪个写端点
+    # 放在中间件里，顺序就变成"先认证、再校验"，也顺带保证**没有哪个端点
     # 能绕过它**（包括将来新加的）。
+    #
+    # 顺序（每一步都有理由，顺序错了就是洞）：
+    #   1. 认证：拿不到身份就 401 —— 但**先过限速**（按来源 IP），
+    #      否则"猜 token"不花成本；
+    #   2. 限速：按身份分读/写两个窗口（写更贵，额度更小）；
+    #   3. 角色：写要 editor、DELETE 要 admin；读只要 viewer。
+    def _too_many(decision: Any) -> JSONResponse:
+        """429。``Retry-After`` 是必须的：没有它，客户端只能靠猜什么时候再来。"""
+        return JSONResponse(
+            status_code=429,
+            content={"detail": f"请求过于频繁：每分钟上限 {decision.limit} 次"},
+            headers={
+                "Retry-After": str(decision.retry_after),
+                "X-RateLimit-Limit": str(decision.limit),
+                "X-RateLimit-Remaining": "0",
+            },
+        )
+
     @app.middleware("http")
-    async def _guard_mutations(request: Request, call_next: Any) -> Any:
+    async def _guard_api(request: Request, call_next: Any) -> Any:
         path = request.url.path
-        if request.method in WRITE_METHODS and path.startswith("/api") and path not in PUBLIC_WRITE_PATHS:
+        if not path.startswith("/api") or path in PUBLIC_API_PATHS:
+            return await call_next(request)
+
+        host = request.client.host if request.client else "unknown"
+        # 限速键用 **socket 对端**，不取 `X-Forwarded-For`：那个头是请求方写的，
+        # 拿它当键等于把"要不要限速"交给被限速的人决定。放在反代后面时，
+        # 正确的做法是让反代自己限速（或显式配置可信代理），不是在这里信一个头。
+        status = registry.auth_status(bearer_token(request.headers.get("authorization")))
+        if not status.ok:
+            decision = limiters["anonymous"].check(f"ip:{host}")
+            if not decision.allowed:
+                return _too_many(decision)
+            return JSONResponse(
+                status_code=401,
+                content={"detail": _UNAUTHORIZED_DETAIL.get(status.reason, status.reason)},
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        is_write = request.method in WRITE_METHODS
+        user_id = status.user_id
+        assert user_id is not None  # status.ok 为真时必然有；失败要关闭，不靠类型系统
+        decision = limiters["write" if is_write else "read"].check(f"user:{user_id}")
+        if not decision.allowed:
+            return _too_many(decision)
+
+        if is_write:
             minimum = "admin" if request.method == "DELETE" else "editor"
-            try:
-                request.state.actor = require_role(
-                    app, request.headers.get("authorization"), minimum
-                )
-            except HTTPException as exc:
+            role = registry.role_of(user_id)
+            if not role_satisfies(role, minimum):
                 return JSONResponse(
-                    status_code=exc.status_code, content={"detail": exc.detail}
+                    status_code=403,
+                    content={"detail": f"该操作需要 {minimum} 及以上角色，当前是 {role}"},
                 )
+        # 身份放进请求状态：写端点用 ``actor_of`` 取，读端点也可以读（例如审计）
+        request.state.actor = user_id
         return await call_next(request)
 
     # ---- 基础 ------------------------------------------------------------ #

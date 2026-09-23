@@ -25,7 +25,7 @@
   header .sub { color: var(--dim); font-size: 12px; }
   header .links { margin-left: auto; font-size: 12px; }
   header a { color: var(--blue); text-decoration: none; margin-left: 12px; }
-  /* 写操作凭据：只有写请求会带 Authorization，GET 读接口依旧是匿名的 */
+  /* 接口凭据：读写都要带 Authorization（写要 editor，删要 admin，读只要 viewer） */
   header .tok {
     display: flex; align-items: center; gap: 6px; margin-left: 14px;
     align-self: center; font-size: 12px; color: var(--dim);
@@ -97,8 +97,8 @@
     <a href="/docs" target="_blank">API 文档</a>
     <a href="/openapi.json" target="_blank">OpenAPI</a>
   </span>
-  <span class="tok" title="写操作（新建 / 分析 / 在线验证）需要 editor 角色的 token；GET 读接口不需要">
-    <input id="token-input" type="password" placeholder="editor token" autocomplete="off" spellcheck="false">
+  <span class="tok" title="读写接口都要 token：读需要 viewer，写（新建 / 分析 / 在线验证）需要 editor，删除需要 admin">
+    <input id="token-input" type="password" placeholder="viewer / editor token" autocomplete="off" spellcheck="false">
     <button class="act" id="token-save" type="button">保存</button>
     <button class="act" id="token-clear" type="button">清除</button>
     <span class="hint" id="token-hint"></span>
@@ -194,10 +194,10 @@ const $ = (s) => document.querySelector(s);
 const fmt = (v, d = 4) => (v === null || v === undefined) ? "—" : Number(v).toFixed(d);
 const pct = (v) => (v === null || v === undefined) ? "—" : (100 * v).toFixed(1) + "%";
 
-/* ---------- 写操作凭据 ---------- */
-// 后端中间件 _guard_mutations 要求所有 method ∈ {POST,PUT,PATCH,DELETE} 且
-// 路径以 /api 开头的请求带 Authorization: Bearer <token>（editor 起，DELETE 要 admin）。
-// GET 读接口是匿名的，不带 token 也能用。
+/* ---------- 接口凭据 ---------- */
+// 后端中间件 _guard_api 要求所有路径以 /api 开头的请求（读和写都要）带
+// Authorization: Bearer <token>：读 viewer 起，写 editor 起，DELETE 要 admin。
+// 公开面只有 /healthz、/docs 与这个页面本身。
 const TOKEN_KEY = "acl_token";
 let TOKEN_MEM = ""; // localStorage 不可用（隐私模式等）时的降级存储
 
@@ -213,7 +213,7 @@ function writeToken(v) {
   } catch (e) { /* 存不下就只在本次页面生命周期内生效 */ }
 }
 function renderTokenHint() {
-  $("#token-hint").textContent = readToken() ? "已保存 token" : "未填 token：写操作会 401";
+  $("#token-hint").textContent = readToken() ? "已保存 token" : "未填 token：接口会 401";
 }
 
 $("#token-input").value = readToken();
@@ -232,7 +232,7 @@ async function api(path, opts) {
   const req = Object.assign({}, opts || {});
   const token = readToken();
   if (token) {
-    // 只在 token 非空时附加；读接口本来匿名，带上也无害（后端不校验 GET）。
+    // 读写接口都要凭据，所以非空就附上（空 token 时后端会 401，提示见下面）
     req.headers = Object.assign({}, req.headers || {}, { Authorization: "Bearer " + token });
   }
   const res = await fetch(path, req);
@@ -241,7 +241,7 @@ async function api(path, opts) {
   if (!res.ok) {
     const msg = (body && body.detail) || res.statusText;
     if (res.status === 401 || res.status === 403) {
-      throw new Error(`${msg}\n需要 editor 凭据：请在页面右上角填入 token，保存后重试。`);
+      throw new Error(`${msg}\n请在页面右上角填入 token 后重试（读需要 viewer，写需要 editor）。`);
     }
     throw new Error(msg);
   }

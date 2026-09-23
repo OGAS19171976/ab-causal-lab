@@ -29,6 +29,7 @@ import shutil
 import sqlite3
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -179,7 +180,9 @@ def main() -> int:
         },
     )
     made = spoof.json()
-    events = ac.get(f"/api/experiments/{made['id']}/events").json()["events"]
+    admin_hdr = {"Authorization": f"Bearer {a_admin}"}
+    # 读接口现在也要凭据（这一轮改的）—— 治理脚本自己的读也要带上
+    events = ac.get(f"/api/experiments/{made['id']}/events", headers=admin_hdr).json()["events"]
     editor_cannot_delete = ac.delete(
         f"/api/experiments/{made['id']}",
         headers={"Authorization": f"Bearer {a_editor}"},
@@ -196,11 +199,69 @@ def main() -> int:
     emit(f"    editor DELETE                    -> {editor_cannot_delete}（删是 admin 的权限）")
     emit(f"    admin DELETE                     -> {admin_can_delete}")
     emit(f"    被拒的三次尝试留下审计条数        -> "
-         f"{ac.get('/api/events').json()['count'] - 2}（只记成功的那两条）")
+         f"{ac.get('/api/events', headers=admin_hdr).json()['count'] - 2}（只记成功的那两条）")
     emit("    另外 `actor` 也不是请求体字段（`_Strict` 直接 422），见 "
          "`tests/test_governance.py::TestAuthAndActor`：")
     emit("    · 有一条测试**自动枚举所有写路由**逐个断言 401，")
     emit("      所以「新加了端点忘了鉴权」会在 CI 上直接红。")
+
+    # ---- 1.6 凭据的生命周期与限速（这一轮补的） --------------------------- #
+    emit("\n### 1.6 读接口要凭据，凭据有生命周期，请求有限速")
+    emit("  在此之前这三件都没有（README 已知边界里写着）。三条都用真实接口/注册表")
+    emit("  量出来，**不靠 sleep**：过期与宽限期用显式的 `at=` 摆出来。")
+    emit("")
+    emit("  ① **读接口不再匿名**（公开面只剩 `/healthz`、`/docs`、静态页面）：")
+    emit(f"    无凭据 GET /api/experiments  -> HTTP "
+         f"{ac.get('/api/experiments').status_code}")
+    emit(f"    错 token GET                 -> HTTP "
+         f"{ac.get('/api/experiments', headers={'Authorization': 'Bearer nope'}).status_code}")
+    emit(f"    viewer 凭据 GET              -> HTTP "
+         f"{ac.get('/api/experiments', headers={'Authorization': f'Bearer {a_viewer}'}).status_code}"
+         "（读只要 viewer）")
+    emit(f"    无凭据 GET /healthz          -> HTTP "
+         f"{ac.get('/healthz').status_code}（健康检查必须公开，否则监控先死）")
+
+    life_reg = create_app(tmpdir / "life_api.db").state.registry
+    now_utc = datetime.now(timezone.utc)
+    expired = life_reg.add_user(
+        "expired_user", role="viewer", ttl_days=1, at=now_utc - timedelta(days=2)
+    )
+    fresh = life_reg.add_user("fresh_user", role="viewer", ttl_days=1, at=now_utc)
+    grace_old = life_reg.add_user("grace_user", role="viewer")
+    grace_new = life_reg.rotate_token("grace_user", grace_minutes=30)
+    no_grace_old = life_reg.add_user("no_grace_user", role="viewer")
+    life_reg.rotate_token("no_grace_user", grace_minutes=0)
+    long_gone = life_reg.add_user(
+        "long_gone_user", role="viewer", at=now_utc - timedelta(hours=1)
+    )
+    life_reg.rotate_token(
+        "long_gone_user", grace_minutes=5, at=now_utc - timedelta(hours=1)
+    )
+    emit("")
+    emit("  ② **有效期**（默认 90 天；0 = 永不过期。老库迁移后是『永不过期』，")
+    emit("     否则一次迁移就把所有在用的凭据踢下线）：")
+    emit(f"    有效期 1 天、两天前签发 -> {life_reg.auth_status(expired).reason}"
+         "（说过期，不说不认识）")
+    emit(f"    有效期 1 天、刚签发     -> {life_reg.auth_status(fresh).reason}")
+    emit("")
+    emit("  ③ **轮换的宽限期**（换发是滚动动作，不是停机动作）：")
+    emit(f"    宽限 30 分钟：旧 {life_reg.auth_status(grace_old).reason}"
+         f" / 新 {life_reg.auth_status(grace_new).reason}（窗口内两个都有效）")
+    emit(f"    宽限 0        ：旧 {life_reg.auth_status(no_grace_old).reason}（立即失效）")
+    emit(f"    宽限已过      ：旧 {life_reg.auth_status(long_gone).reason}")
+    emit("")
+    emit("  ④ **限速**：按身份分成读/写两个固定窗口（默认 600 / 120 次每分钟，")
+    emit("     刻意宽松 —— 它挡的是跑飞的脚本与猜 token，不是节流正常使用）：")
+    rl_app = create_app(tmpdir / "rate_api.db", rate_limits={"read": 3})
+    rl_token = rl_app.state.registry.add_user("rl_user", role="viewer")
+    rl_client = _TC(rl_app)
+    rl_client.headers.update({"Authorization": f"Bearer {rl_token}"})
+    codes = [rl_client.get("/api/experiments").status_code for _ in range(4)]
+    retry = rl_client.get("/api/experiments").headers.get("Retry-After")
+    emit(f"    额度调成 3/分钟，连读 5 次 -> {codes}；"
+         f"429 上的 `Retry-After` 头：{'有' if retry else '无（那客户端只能靠猜）'}")
+    emit("    诚实边界：固定窗口在窗口边界上允许**两倍突发**，而且它在**进程内存**里 ——")
+    emit("    多副本部署会退化成「每副本各自限速」，那时才需要把窗口挪到共享存储。")
 
     # ---- 2. 删掉实验之后审计仍在 ------------------------------------------ #
     emit("\n### 2. 删掉实验之后，审计必须还在")
@@ -448,7 +509,10 @@ def main() -> int:
          f"admin -> HTTP {r_force.status_code}（forced={r_force.json().get('forced')}）")
     emit("")
     emit("  审计里留下的依据（**动作名单独记为 stop**，理由进 note）：")
-    for e in sc.get(f"/api/experiments/{tripped_id}/events").json()["events"]:
+    for e in sc.get(
+        f"/api/experiments/{tripped_id}/events",
+        headers={"Authorization": f"Bearer {stop_admin}"},
+    ).json()["events"]:
         if e["action"] == "stop":
             emit(f"    {e['actor']} | {e['note']}")
     emit("")
@@ -635,8 +699,13 @@ def main() -> int:
     emit("  * 仍未做的（写在这里而不是留着让人误会）：")
     emit("    - ~~审计没有「操作者」字段~~ **已补**：静态 token 鉴权 + `actor` 列，")
     emit("      见第 1.5 节与 README 设计决策第 45 条。")
-    emit("      **边界**：静态 token 无过期、无轮换、无限速，token 泄露即冒充；")
-    emit("      读接口仍然匿名；迁移前的老记录操作者是「（迁移前未知）」。")
+    emit("    - ~~静态 token 无过期、无轮换、无限速；读接口仍然匿名~~ **已补**（见第 1.6 节）：")
+    emit("      有效期（默认 90 天；老库迁移后为「永不过期」）、带宽限期的轮换、")
+    emit("      按身份分读/写两个窗口的限速（429 + `Retry-After`），读接口也要凭据。")
+    emit("      **边界**：仍然不是 OAuth —— 没有刷新令牌、撤销列表下发与设备绑定，")
+    emit("      所以 token 在有效期内泄露仍然等于该用户被冒充，`disable` 才是立即止损；")
+    emit("      限速器在进程内存里，多副本部署会退化成「每副本各自限速」；")
+    emit("      迁移前的老记录操作者是「（迁移前未知）」。")
     emit("    - ~~注册表没有并发控制~~ **已补**：`version` 列 + `If-Match` 头，")
     emit("      冲突返回 412 而不是静默覆盖（见第 7.5 节）。**边界**：乐观锁是")
     emit("      可选的（不带 If-Match 仍是后写覆盖），且没有自动重试与合并。")

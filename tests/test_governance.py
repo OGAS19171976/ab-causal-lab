@@ -156,7 +156,11 @@ class TestAuditAPI:
 
         client = TestClient(create_app(work_dir / "audit_api.db"))
         token = client.app.state.registry.add_user("api_admin", role="admin")
-        return client, {"Authorization": f"Bearer {token}"}
+        auth = {"Authorization": f"Bearer {token}"}
+        # 读接口现在也要凭据。挂成**默认头**：这一组测试里每个调用点本来就该带它，
+        # 逐个加一遍只会让"读要凭据"这件事在调用点上显得像例外。
+        client.headers.update(auth)
+        return client, auth
 
     def test_events_endpoint_lists_history(self, work_dir):
         client, auth = self._client(work_dir)
@@ -322,7 +326,9 @@ class TestAuthAndActor:
             },
             headers={**self._auth(tokens["editor"]), "X-Actor": "boss"},
         ).json()
-        events = client.get(f"/api/experiments/{rec['id']}/events").json()["events"]
+        events = client.get(
+            f"/api/experiments/{rec['id']}/events", headers=self._auth(tokens["editor"])
+        ).json()["events"]
         assert [e["actor"] for e in events] == ["alice"], events
 
     def test_rejected_writes_leave_no_audit_row(self, work_dir):
@@ -338,7 +344,11 @@ class TestAuthAndActor:
             ).status_code
             == 403
         )
-        assert client.get("/api/events").json()["count"] == 0
+        # 读接口现在也要凭据，而这条测试的 client 是"裸"的（上面刚断言过无凭据 401）
+        assert (
+            client.get("/api/events", headers=self._auth(tokens["editor"])).json()["count"]
+            == 0
+        )
 
     def test_every_mutating_route_needs_a_token(self, work_dir):
         """**自动枚举所有写路由**，逐个断言无凭据时是 401。
@@ -444,6 +454,15 @@ class TestGuardrailStopDecision:
     def _auth(token: str) -> dict[str, str]:
         return {"Authorization": f"Bearer {token}"}
 
+    def _get(self, client, tokens, path: str):
+        """读接口现在也要凭据 —— 这一组测试的读统一用 admin 的。
+
+        不把凭据挂成默认头，是因为这个类里有一条测试专门断言"**无凭据** POST 是 401"
+        （``test_stop_needs_credentials_and_respects_the_optimistic_lock``）：
+        默认头会让那条断言失去意义。
+        """
+        return client.get(path, headers=self._auth(tokens["admin"]))
+
     def _make(self, client, tokens, name: str, max_harm: float, demo_harm: float):
         body = {
             "name": name,
@@ -478,8 +497,8 @@ class TestGuardrailStopDecision:
         body = resp.json()
         assert body["guardrail_tripped"] is True and body["forced"] is False
         assert body["status"] == "stopped"
-        assert client.get(f"/api/experiments/{rec['id']}").json()["status"] == "stopped"
-        events = client.get(f"/api/experiments/{rec['id']}/events").json()["events"]
+        assert self._get(client, tokens, f"/api/experiments/{rec['id']}").json()["status"] == "stopped"
+        events = self._get(client, tokens, f"/api/experiments/{rec['id']}/events").json()["events"]
         stop_events = [e for e in events if e["action"] == "stop"]
         assert len(stop_events) == 1
         assert stop_events[0]["actor"] == "alice"
@@ -501,10 +520,12 @@ class TestGuardrailStopDecision:
         )
         assert resp.status_code == 409
         assert "没有越界" in resp.json()["detail"]
-        assert client.get(f"/api/experiments/{rec['id']}").json()["status"] == "running"
+        assert self._get(client, tokens, f"/api/experiments/{rec['id']}").json()["status"] == "running"
         actions = [
             e["action"]
-            for e in client.get(f"/api/experiments/{rec['id']}/events").json()["events"]
+            for e in self._get(
+                client, tokens, f"/api/experiments/{rec['id']}/events"
+            ).json()["events"]
         ]
         assert actions == ["create"]
 
@@ -527,7 +548,9 @@ class TestGuardrailStopDecision:
         assert allowed.json()["forced"] is True
         note = next(
             e["note"]
-            for e in client.get(f"/api/experiments/{rec['id']}/events").json()["events"]
+            for e in self._get(
+                client, tokens, f"/api/experiments/{rec['id']}/events"
+            ).json()["events"]
             if e["action"] == "stop"
         )
         assert "护栏未触发" in note and "业务方要求" in note
@@ -869,7 +892,10 @@ class TestOptimisticLocking:
 
         client = TestClient(create_app(work_dir / "optlock.db"))
         token = client.app.state.registry.add_user("lock_admin", role="admin")
-        return client, {"Authorization": f"Bearer {token}"}
+        auth = {"Authorization": f"Bearer {token}"}
+        # 读也要凭据（与 TestAuditAPI 同一个理由）：挂默认头，写调用点仍显式带 auth。
+        client.headers.update(auth)
+        return client, auth
 
     def _new(self, client, auth, name="lock_demo"):
         return client.post(

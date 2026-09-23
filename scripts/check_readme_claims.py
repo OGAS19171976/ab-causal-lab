@@ -155,6 +155,9 @@ CLAIMS: list[tuple[str, str, str]] = [
     ("治理：护栏判定含停实验建议", "governance_report.md", "判定规则"),
     # 身份与审计操作者（静态 token）：用户 id 与角色是稳定的字符串，可以进清单
     ("治理·身份：静态 token + 角色", "governance_report.md", "静态 token"),
+    # 凭据的生命周期与限速（治理报告 1.6 节）：读数稳定（不随 --quick 变）
+    ("治理·凭据：读接口不再匿名", "governance_report.md", "读接口不再匿名"),
+    ("治理·限速：额度用尽给 429", "governance_report.md", "[200, 200, 200, 429]"),
     ("治理·身份：凭据只存哈希", "governance_report.md", "sha256"),
     ("治理·身份：伪造无效", "governance_report.md", "http_alice"),
     # 并发（乐观锁）：文本类声明 —— 版本号随操作次数变，不把数字写进清单

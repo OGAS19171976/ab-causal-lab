@@ -28,13 +28,15 @@ import secrets
 import sqlite3
 import uuid
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
 from ..assignment import ExperimentSpec, Variant
 
 __all__ = [
+    "DEFAULT_TOKEN_TTL_DAYS",
+    "AuthStatus",
     "ExperimentEvent",
     "ExperimentRecord",
     "ExperimentRegistry",
@@ -102,13 +104,22 @@ CREATE INDEX IF NOT EXISTS idx_events_experiment
 -- 用户与凭据。**存 token 的 sha256，不存 token 本身**：
 -- 库文件泄露不应该等于凭据泄露。token 是高熵随机串（`secrets.token_urlsafe`），
 -- 所以直接哈希就够，不需要抗暴力破解的口令哈希 —— 没有"猜口令"这条捷径。
+--
+-- 凭据的**生命周期**（这一轮补上，之前三件都没有）：
+--   * expires_at：到期即失效。NULL = 永不过期 —— 老库迁移后就是 NULL，
+--     这是刻意的：加一列就把所有人踢下线，等于用一次迁移换一次停机；
+--   * prev_token_hash / prev_valid_until：轮换时旧 token 的**宽限期**。
+--     换发是滚动动作而不是停机动作，代价是那一小段时间里两个 token 同时有效。
 CREATE TABLE IF NOT EXISTS users (
     id            TEXT PRIMARY KEY,
     token_hash    TEXT NOT NULL UNIQUE,
     role          TEXT NOT NULL CHECK (role IN ('viewer', 'editor', 'admin')),
     created_at    TEXT NOT NULL,
     disabled      INTEGER NOT NULL DEFAULT 0,
-    note          TEXT NOT NULL DEFAULT ''
+    note          TEXT NOT NULL DEFAULT '',
+    expires_at    TEXT,
+    prev_token_hash   TEXT,
+    prev_valid_until  TEXT
 );
 
 CREATE TRIGGER IF NOT EXISTS experiment_events_no_update
@@ -149,6 +160,58 @@ _MIGRATIONS: dict[str, str] = {
 _EVENT_MIGRATIONS: dict[str, str] = {
     "actor": "TEXT NOT NULL DEFAULT '（迁移前未知）'",
 }
+
+#: 用户表新增的列。三条都允许 NULL，理由见上面 ``users`` 表的注释：
+#: 老的 token 迁移后**不设过期**，否则一次迁移就把所有在用的凭据踢下线。
+_USER_MIGRATIONS: dict[str, str] = {
+    "expires_at": "TEXT",
+    "prev_token_hash": "TEXT",
+    "prev_valid_until": "TEXT",
+}
+
+#: 新签发的 token 默认有效期（天）。
+#:
+#: 90 天不是行业标准数字，是这台机器上的权衡：比它短，长跑的自动化
+#: （CI、看板、别人终端里的 curl）会频繁断开；比它长，"泄露窗口"就接近
+#: 永不过期 —— 而这一列存在的全部意义就是让泄露有个头。
+#: 要别的值就在 `add_user` / `rotate_token` 时显式给（0 或 None = 永不过期）。
+DEFAULT_TOKEN_TTL_DAYS = 90
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _expires_at(ttl_days: int | None, at: datetime) -> str | None:
+    """TTL -> ``expires_at``。``None`` 与 ``0`` 都表示**永不过期**（要显式选）。"""
+    if not ttl_days:
+        return None
+    return (at + timedelta(days=ttl_days)).isoformat(timespec="seconds")
+
+
+def _is_past(stamp: str | None, at: datetime) -> bool:
+    """``stamp`` 是否已经过期。空字符串与 NULL 都算"没有这条限制"。"""
+    if not stamp:
+        return False
+    return datetime.fromisoformat(stamp) <= at
+
+
+@dataclass(frozen=True)
+class AuthStatus:
+    """凭据解析的结果。
+
+    ``reason`` 存在的唯一目的是**说清为什么被拒**（401 的文案要能指导动作：
+    是没给、是过期了、还是被停用了），它**绝不参与授权判断** ——
+    判断只看 ``user_id`` 是否为空（见 ``ok``）。
+    """
+
+    user_id: str | None
+    reason: str
+    expires_at: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.user_id is not None
 
 def _coerce_spec(raw: Any) -> Any:
     """把 dict / GuardrailSpec 统一成 ``GuardrailSpec``。
@@ -336,17 +399,30 @@ class ExperimentRegistry:
                     f"ALTER TABLE experiment_events ADD COLUMN {column} {decl}"
                 )
 
+        user_cols = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(users)")
+        }
+        for column, decl in _USER_MIGRATIONS.items():
+            if column not in user_cols:
+                self._conn.execute(f"ALTER TABLE users ADD COLUMN {column} {decl}")
+
     def close(self) -> None:
         self._conn.close()
 
     # -- 用户与凭据 ---------------------------------------------------------- #
     #
     # 这一节的边界（写在代码里，不是只写在 README 里）：
-    #   * 这是**静态 token** 鉴权：没有过期、没有轮换、没有限速。
-    #     token 泄露 = 该用户被冒充，且只有 `disable_user` 能止损。
+    #   * 这是**静态 token** 鉴权：这一轮补上了过期、带宽限期的轮换与限速
+    #     （在此之前三件都没有 —— README 设计决策 58）。
+    #     但它仍然**不是** OAuth：没有刷新令牌、没有撤销列表下发、没有设备绑定，
+    #     所以 token 在有效期内泄露仍然等于该用户被冒充，`disable_user`
+    #     才是立即止损的手段（它不依赖任何时钟）。
+    #   * 时间只在凭据这一个面上被用到，所以这里不注入全局时钟，
+    #     而是给三个方法留一个**可选的 ``at``**：生产路径用系统时间，
+    #     测试可以显式传"现在"。这样"过期"是能测的，而不是要靠 sleep 等出来。
     #   * 它只解决"写操作记谁"，不解决"两个人同时改会互相覆盖"（那是并发控制）。
-    #   * 读接口仍然匿名（单机实验平台，读不是威胁面）—— 这一点必须说出来，
-    #     否则"平台做了鉴权"会被理解成"什么都挡住了"。
+    #   * 读接口从这一轮起**不再匿名**：鉴权中间件覆盖所有 ``/api``。
+    #     ``/healthz``、``/docs`` 与静态页面仍然公开 —— 它们不是 ``/api``。
     @staticmethod
     def hash_token(token: str) -> str:
         return hashlib.sha256(token.encode("utf-8")).hexdigest()
@@ -358,32 +434,72 @@ class ExperimentRegistry:
         role: str = "editor",
         note: str = "",
         token: str | None = None,
+        ttl_days: int | None = DEFAULT_TOKEN_TTL_DAYS,
+        at: datetime | None = None,
     ) -> str:
         """建用户并返回**明文 token（只此一次）**。
 
         库里只留哈希，所以这个返回值是拿到凭据的唯一机会 ——
         丢了只能重新发一个（`rotate_token`），不能"再查一次"。
+
+        ``ttl_days`` 默认 90 天；传 ``0`` 或 ``None`` 表示**永不过期**（显式选）。
         """
         if role not in ROLES:
             raise RegistryError(f"角色必须是 {ROLES} 之一，收到 {role!r}")
         if not user_id.strip():
             raise RegistryError("user_id 不能为空")
+        now = at or _utcnow()
         raw = token if token is not None else secrets.token_urlsafe(32)
         with self._conn:
             self._conn.execute(
-                "INSERT INTO users (id, token_hash, role, created_at, disabled, note) "
-                "VALUES (?,?,?,?,0,?)",
-                (user_id, self.hash_token(raw), role, _now(), note),
+                "INSERT INTO users "
+                "(id, token_hash, role, created_at, disabled, note, expires_at) "
+                "VALUES (?,?,?,?,0,?,?)",
+                (
+                    user_id,
+                    self.hash_token(raw),
+                    role,
+                    _now(),
+                    note,
+                    _expires_at(ttl_days, now),
+                ),
             )
         return raw
 
-    def rotate_token(self, user_id: str) -> str:
-        """换发 token（旧 token 立即失效）。用户不存在时抛错。"""
+    def rotate_token(
+        self,
+        user_id: str,
+        *,
+        grace_minutes: int = 0,
+        ttl_days: int | None = DEFAULT_TOKEN_TTL_DAYS,
+        at: datetime | None = None,
+    ) -> str:
+        """换发 token：新的立即生效，旧的按 ``grace_minutes`` 决定还能用多久。
+
+        默认 ``grace_minutes=0``（旧 token 立刻失效，与这一轮之前的行为一致）。
+        宽限期解决的是一个很具体的运维问题：换发之后**正在跑的客户端**
+        （CI、看板、别人终端里的 curl）手里只有旧 token，会同时 401 ——
+        给一段窗口，换发就从"停机动作"变成"滚动动作"。
+        代价必须说清楚：**那段时间里两个 token 同时有效**（不是"更安全"，是"更平滑"）。
+
+        换发同时**重置有效期**（``ttl_days``）：这是"续期"的标准做法，
+        否则一个 90 天的 token 在第 89 天轮换后立刻又要过期。
+        """
+        if grace_minutes < 0:
+            raise RegistryError("grace_minutes 不能是负数")
+        now = at or _utcnow()
         raw = secrets.token_urlsafe(32)
+        grace_until = (
+            (now + timedelta(minutes=grace_minutes)).isoformat(timespec="seconds")
+            if grace_minutes > 0
+            else None
+        )
         with self._conn:
+            # SQL 的赋值右侧读的都是**旧行**，所以 prev_token_hash 拿到的是换发前的哈希
             cur = self._conn.execute(
-                "UPDATE users SET token_hash = ? WHERE id = ?",
-                (self.hash_token(raw), user_id),
+                "UPDATE users SET prev_token_hash = token_hash, prev_valid_until = ?, "
+                "token_hash = ?, expires_at = ? WHERE id = ?",
+                (grace_until, self.hash_token(raw), _expires_at(ttl_days, now), user_id),
             )
             if cur.rowcount == 0:
                 raise RegistryError(f"用户不存在：{user_id}")
@@ -407,27 +523,52 @@ class ExperimentRegistry:
                 "created_at": row["created_at"],
                 "disabled": bool(row["disabled"]),
                 "note": row["note"],
+                "expires_at": row["expires_at"],
+                "grace_until": row["prev_valid_until"],
             }
             for row in self._conn.execute(
-                "SELECT id, role, created_at, disabled, note FROM users ORDER BY id"
+                "SELECT id, role, created_at, disabled, note, expires_at, "
+                "prev_valid_until FROM users ORDER BY id"
             )
         ]
 
-    def authenticate(self, token: str | None) -> str | None:
-        """凭据 -> 用户 id。认不出来、被停用、或没给，都返回 ``None``。
+    def auth_status(self, token: str | None, *, at: datetime | None = None) -> AuthStatus:
+        """凭据 -> 用户 id **与拒绝原因**。
+
+        ``reason`` 取值：``ok`` / ``missing`` / ``unknown`` / ``disabled`` / ``expired``。
+        宽限期内的旧 token 认（``ok``），过期的旧 token 报 ``expired`` ——
+        它的确"存在过"，说成 ``unknown`` 会让运维去查一个不存在的问题。
+        """
+        if not token:
+            return AuthStatus(None, "missing")
+        now = at or _utcnow()
+        digest = self.hash_token(token)
+        row = self._conn.execute(
+            "SELECT id, disabled, expires_at, token_hash, prev_valid_until "
+            "FROM users WHERE token_hash = ? OR prev_token_hash = ?",
+            (digest, digest),
+        ).fetchone()
+        if row is None:
+            return AuthStatus(None, "unknown")
+        if row["disabled"]:
+            return AuthStatus(None, "disabled", row["expires_at"])
+        if row["token_hash"] != digest:
+            # 轮换前的旧 token：只在宽限期内认
+            if _is_past(row["prev_valid_until"], now) or not row["prev_valid_until"]:
+                return AuthStatus(None, "expired", row["expires_at"])
+        if _is_past(row["expires_at"], now):
+            return AuthStatus(None, "expired", row["expires_at"])
+        return AuthStatus(str(row["id"]), "ok", row["expires_at"])
+
+    def authenticate(self, token: str | None, *, at: datetime | None = None) -> str | None:
+        """凭据 -> 用户 id。认不出来、被停用、已过期、或没给，都返回 ``None``。
 
         **这是身份的唯一起点**：调用方（API 层）只能从这里拿 actor，
         绝不允许把请求体里的名字当身份传进 ``_record_event``。
+
+        想看"为什么被拒"就用 ``auth_status`` —— 401 的文案需要它。
         """
-        if not token:
-            return None
-        row = self._conn.execute(
-            "SELECT id, disabled FROM users WHERE token_hash = ?",
-            (self.hash_token(token),),
-        ).fetchone()
-        if row is None or row["disabled"]:
-            return None
-        return str(row["id"])
+        return self.auth_status(token, at=at).user_id
 
     def role_of(self, user_id: str) -> str | None:
         row = self._conn.execute(
