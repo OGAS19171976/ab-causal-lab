@@ -196,6 +196,15 @@ CLAIMS: list[tuple[str, str, str]] = [
      "governance_report.md", "真接入完成"),
     ("治理·真实数据：MovieLens A/A 的 SRM 读数",
      "governance_report.md", "control"),
+    # LaLonde NSW（真实处置 + 公开基准）：报告是 reports/nsw_lalonde.md。
+    # 这三个 needle 都是**稳定的**：一个是发表值（写死在脚本里的常量）、
+    # 两句是文本类声明。CUPED 方差缩减那几个数只报量级，不进清单（末位会漂）。
+    ("NSW·真实处置：复现发表的实验基准",
+     "nsw_lalonde.md", "发表值 +1794.34"),
+    ("NSW·真实处置：明细与 ADS 同一个数",
+     "nsw_lalonde.md", "两条路径用的是同一批充分统计量"),
+    ("NSW·真实处置：这份数据上 SRM 无解",
+     "nsw_lalonde.md", "这份数据上 SRM 无解"),
     # 差异审计（reports/real_vs_synthetic.md）
     ("差异审计：真实侧指标为空（写死的事件名）",
      "real_vs_synthetic.md", "写死"),

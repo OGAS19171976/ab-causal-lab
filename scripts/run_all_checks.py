@@ -198,6 +198,10 @@ def steps() -> list[Step]:
         # 所以排在 warehouse 与 realdata 之后（属于 rest 组，claims 仍收尾）。
         Step("realdiff", "差异审计：合成 vs 真实外部数据（哪些数字变了）",
              (py, "scripts/run_real_vs_synthetic.py")),
+        # 真实**处置**的验证（LaLonde NSW）：MovieLens 那份是自造分流的 A/A，只能校准；
+        # 这一份有公开的实验基准与两条路径不变量。它自带数据、不依赖前面任何一步。
+        Step("nsw", "真实处置：LaLonde NSW（复现发表基准 + 明细/ADS 同一个数）",
+             (py, "scripts/run_nsw_validation.py")),
     ]
     head = [s for k in _ORDER_HEAD for s in every if s.key == k]
     # claims 收尾：它要读的 reports/ 由前面所有步骤生成

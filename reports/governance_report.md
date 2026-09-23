@@ -208,11 +208,11 @@ ab-causal-lab · 治理验证：操作审计（append-only）+ 护栏指标显�
       锁文件条目 48 个（另有 0 个因平台 marker 不适用：无）；带 py.typed 的 32 个；本项目实际 import 的 11 个
 
       包                     版本          py.typed  stub 包          用到它的源码文件
-      numpy                 2.5.3       有         -                     71
+      numpy                 2.5.3       有         -                     73
       scipy                 1.18.1      **没有**    -                     31
-      pytest                9.1.1       有         -                     23
-      duckdb                1.5.5       有         -                     10
-      pandas                3.0.3       **没有**    -                     10
+      pytest                9.1.1       有         -                     24
+      pandas                3.0.3       **没有**    -                     12
+      duckdb                1.5.5       有         -                     11
       fastapi               0.141.1     有         -                      8
       scikit-learn          1.9.1       **没有**    -                      4
       packaging             26.3        有         -                      2
@@ -236,7 +236,7 @@ ab-causal-lab · 治理验证：操作审计（append-only）+ 护栏指标显�
       没带类型、但被本项目用到的（逐包处置）：
         scipy              31 个文件   处置：stub
           用到的是 stats.norm / optimize.minimize / spatial 的几个函数；本地最小 stub 只声明这些签名，上游改名会在 mypy 里报
-        pandas             10 个文件   处置：accept-any
+        pandas             12 个文件   处置：accept-any
           DataFrame 的类型在无 stub 时基本退化成 Any；本仓库对它的用法集中在数仓 IO 与列选择，靠测试与 schema 检查兜底
         scikit-learn        4 个文件   处置：accept-any
           只作为 nuisance 学习器（Ridge / RandomForest）出现，接口窄且被测试覆盖；上游一旦补上顶层 py.typed，本条会被判过时

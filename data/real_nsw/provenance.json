@@ -1,0 +1,67 @@
+{
+ "citation": [
+  "Dehejia & Wahba (1999), JASA 94(448): 1053-1062",
+  "Dehejia & Wahba (2002), Review of Economics and Statistics 84: 151-161",
+  "LaLonde (1986), American Economic Review 76: 604-620"
+ ],
+ "experiments": [
+  {
+   "control": "control",
+   "guardrails": [],
+   "name": "nsw_dw",
+   "treatment": "treatment",
+   "variants": {
+    "control": 0.58427,
+    "treatment": 0.41573
+   }
+  }
+ ],
+ "exported_at": "2026-09-23",
+ "external_generator": true,
+ "license": "CC BY-NC 2.0（署名、非商业）",
+ "metric_event": "earnings",
+ "notes": {
+  "benchmark": {
+   "att": 1794.3424,
+   "published": 1794.34,
+   "se": 670.9965,
+   "source": "Dehejia–Wahba 子样本的两个实验臂直接比较 re78"
+  },
+  "reg_ds_is_a_placeholder": "user_profile.reg_ds 是 1970-01-01 的**占位值**：这份数据里没有『注册日』这个概念，契约要求这一列。",
+  "time_mapping": "re74/re75 落在 1974/75-01-01（前置），曝光 1976-01-01，re78 落在 1978-01-01（后置）；窗口宽度由 WarehouseConfig 给（pre_days=800 / post_days=1200），年度数据不能沿用合成的 14 天。",
+  "weights_are_realized": "variants 用的是**实测份额**（185/260），不是设计值 —— 源站没有给出分配比例，而按实测份额算 SRM 恒为 0。这一点写在报告里。"
+ },
+ "source": "National Supported Work Demonstration (LaLonde 1986) 的 Dehejia–Wahba 子样本；取自 Rajeev Dehejia 在 NBER 的公开页面 https://users.nber.org/~rdehejia/nswdata2.html",
+ "tables": [
+  {
+   "file": "exposure_log.parquet",
+   "name": "exposure_log",
+   "rows": 445,
+   "sha256": "3a58008cd681067a84cb26aec0cae0a0c31d7f92566c773c5c7f8312d18d8335"
+  },
+  {
+   "file": "event_log.parquet",
+   "name": "event_log",
+   "rows": 1335,
+   "sha256": "c4763e35102d50e7f526ba252fa6905e0488d7ee4b959659a48d228de61faeb3"
+  },
+  {
+   "file": "user_profile.parquet",
+   "name": "user_profile",
+   "rows": 445,
+   "sha256": "ebd00a30c8a70762b53fc222afe3a3e8e006aace23f67e307daf2f2370e783df"
+  }
+ ],
+ "upstream_files": [
+  {
+   "name": "nswre74_treated.txt",
+   "sha256": "e7b742fe0ff07a0f45e129b4ff108bb9611cd83d53604732c48a8a0a3e20eda3",
+   "url": "https://users.nber.org/~rdehejia/data/nswre74_treated.txt"
+  },
+  {
+   "name": "nswre74_control.txt",
+   "sha256": "a1364cea459d953dc691a667d99194b4ad335d6d550354fe23a5d2dc58d729b5",
+   "url": "https://users.nber.org/~rdehejia/data/nswre74_control.txt"
+  }
+ ]
+}
