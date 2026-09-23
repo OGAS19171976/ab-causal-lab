@@ -1241,6 +1241,99 @@ class TestWarehouseRatioMetric:
         tables = {r[0] for r in con.execute("SHOW TABLES").fetchall()}
         assert {"dws_experiment_ratio_daily", "ads_experiment_ratio_result"} <= tables
 
+    def test_covariate_moments_are_also_new_tables(self, warehouse_con):
+        """多协变量 CUPED 的二阶矩同样必须是**新表**（10/11），理由与比值那条一样：
+        02/03 上挂着 README 里所有已引用的数仓数字。
+
+        与比值那条的区别在**交叉项**：p=1 时 Σ_X 是标量，所以 03 里没有
+        "协变量×协变量"这一项；p=2 必须有 `pre_metric_pre_cnt_cross_sum`，
+        否则 2×2 的 Σ_X 复原不出来 —— 这一列的存在就是"这一层真的能算多协变量"
+        的结构证据，而不是靠报告里那个 0.744 说话。
+        """
+        con = warehouse_con
+        mean_cols = {
+            r[1] for r in con.execute("PRAGMA table_info(dws_experiment_variant_daily)").fetchall()
+        }
+        assert "pre_metric_sum" not in mean_cols, mean_cols
+        assert "pre_metric_pre_cnt_cross_sum" not in mean_cols, mean_cols
+
+        cov_cols = {
+            r[1]
+            for r in con.execute(
+                "PRAGMA table_info(dws_experiment_covariate_daily)"
+            ).fetchall()
+        }
+        assert {
+            "user_cnt",
+            "pre_metric_sum",
+            "pre_metric_sq_sum",
+            "pre_cnt_sum",
+            "pre_cnt_sq_sum",
+            "pre_metric_pre_cnt_cross_sum",
+            "pre_metric_post_cross_sum",
+            "pre_cnt_post_cross_sum",
+            "post_metric_sum",
+            "post_metric_sq_sum",
+        } <= cov_cols, cov_cols
+
+        tables = {r[0] for r in con.execute("SHOW TABLES").fetchall()}
+        assert {
+            "dws_experiment_covariate_daily",
+            "ads_experiment_covariate_result",
+        } <= tables
+
+    def test_covariate_ads_reproduces_the_cuped_theta(self, warehouse_con):
+        """**两条路径必须给出同一个数**：ADS 充分统计量 vs DWD 明细。
+
+        这一条是这一层存在的理由本身 —— 落了二阶矩却算不出同一个 θ̂，
+        那两张表就只是装饰。所以拿明细路径当裁判（与第 6 节比值链路同一个套路），
+        并断言条件数也一致（它决定 θ̂ 可不可信）。
+        """
+        import numpy as np
+
+        from ablab.inference import (
+            CovariateMoments,
+            fit_multivariate_cuped,
+            multivariate_cuped_from_moments,
+        )
+
+        con = warehouse_con
+        rows = con.execute(
+            """
+            SELECT user_cnt,
+                   pre_metric_sum, pre_metric_sq_sum, pre_cnt_sum, pre_cnt_sq_sum,
+                   pre_metric_pre_cnt_cross_sum, pre_metric_post_cross_sum,
+                   pre_cnt_post_cross_sum, post_metric_sum, post_metric_sq_sum
+            FROM ads_experiment_covariate_result WHERE experiment = 'exp_rank_v2'
+            """
+        ).fetchall()
+        assert rows, "比值/协变量 ADS 里没有 exp_rank_v2"
+        total = [sum(float(r[i]) for r in rows) for i in range(1, 10)]
+        moments = CovariateMoments(
+            n=float(sum(float(r[0]) for r in rows)),
+            sum_x=np.array([total[0], total[2]]),
+            sum_xx=np.array([[total[1], total[4]], [total[4], total[3]]]),
+            sum_xy=np.array([total[5], total[6]]),
+            sum_y=total[7],
+            sum_yy=total[8],
+        )
+        from_ads = multivariate_cuped_from_moments(moments)
+
+        detail = con.execute(
+            "SELECT pre_metric, pre_cnt, post_metric FROM dwd_experiment_user"
+            " WHERE experiment = 'exp_rank_v2'"
+        ).df()
+        X = detail[["pre_metric", "pre_cnt"]].to_numpy(dtype=float)
+        y = detail["post_metric"].to_numpy(dtype=float)
+        from_detail = fit_multivariate_cuped(X, y, n_folds=1)
+
+        assert abs(from_ads.variance_reduction - from_detail.variance_reduction) < 1e-9
+        assert abs(from_ads.condition_number - from_detail.condition_number) < 1e-6
+        assert np.allclose(from_ads.theta, from_detail.theta, rtol=1e-9, atol=1e-9)
+        # 而且是**两个**协变量：单协变量的缩减明显低于两协变量
+        assert from_ads.n_covariates == 2
+        assert from_ads.variance_reduction > from_ads.best_univariate_reduction
+
         # 两张 DWS 出自同一张 DWD、同一组分组键 → 行数必须相同
         mean_rows = con.execute("SELECT COUNT(*) FROM dws_experiment_variant_daily").fetchone()[0]
         ratio_rows = con.execute("SELECT COUNT(*) FROM dws_experiment_ratio_daily").fetchone()[0]

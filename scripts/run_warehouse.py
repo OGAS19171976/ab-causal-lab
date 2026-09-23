@@ -22,12 +22,17 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from ablab.inference import fit_multivariate_cuped  # noqa: E402
+from ablab.inference import (  # noqa: E402
+    CovariateMoments,
+    fit_multivariate_cuped,
+    multivariate_cuped_from_moments,
+)
 from ablab.reporting import for_report  # noqa: E402
 from ablab.warehouse import (  # noqa: E402
     DEFAULT_EXPERIMENTS,
@@ -233,6 +238,59 @@ def main() -> int:
          f"，条件数 {mv_two.condition_number:.2f}")
     emit("    -> 多一个真实协变量确实多拿了一点；而样本内与交叉拟合的差就是"
          "「多协变量看起来更有效」的那一部分。")
+
+    # 同一条口径，从**充分统计量**算（10/11）：
+    #
+    # 上面那两个数是**扫 DWD 明细**算出来的。而"能不能不回扫明细"是个工程问题：
+    # 多协变量 CUPED 只依赖二阶矩，而二阶矩是可加的 —— 所以这一轮把它们落成
+    # 两张新表（10/11）。这一节的意义与第 6 节（比值链路）一样：
+    # **换了读取路径，口径必须还是那个口径**，所以拿明细路径当裁判。
+    emit("")
+    emit("  **同一条口径，从充分统计量算（10/11）**")
+    emit("  上面的数是**扫明细**算出来的。多协变量 CUPED 只依赖二阶矩")
+    emit("  （n, Σx_i, Σx_i x_j, Σx_i y, Σy, Σy²），而二阶矩是可加的 ——")
+    emit("  所以把它们落成 DWS/ADS 两张新表（10/11），上层就能不回扫明细地复原 θ̂。")
+    cov_rows = con.execute(
+        """
+        SELECT user_cnt,
+               pre_metric_sum, pre_metric_sq_sum, pre_cnt_sum, pre_cnt_sq_sum,
+               pre_metric_pre_cnt_cross_sum, pre_metric_post_cross_sum,
+               pre_cnt_post_cross_sum, post_metric_sum, post_metric_sq_sum
+        FROM ads_experiment_covariate_result WHERE experiment = 'exp_rank_v2'
+        """
+    ).fetchall()
+    # 两臂**加起来**再喂给估计器：θ̂ 是在全样本上估的（见 11 号 SQL 的注释）
+    total = [sum(float(row[i]) for row in cov_rows) for i in range(1, 10)]
+    n_cov = float(sum(float(row[0]) for row in cov_rows))
+    moments = CovariateMoments(
+        n=n_cov,
+        sum_x=np.array([total[0], total[2]]),
+        sum_xx=np.array([[total[1], total[4]], [total[4], total[3]]]),
+        sum_xy=np.array([total[5], total[6]]),
+        sum_y=total[7],
+        sum_yy=total[8],
+    )
+    mv_ads = multivariate_cuped_from_moments(moments)
+    mv_detail_in = fit_multivariate_cuped(X_two, y_post, n_folds=1)
+    # 报三位小数 + 偏差的**量级**（而不是位数）：这几个数由 DuckDB 并行聚合算出来，
+    # 浮点末位会漂（实测 0.7438 / 0.7440）。把会漂的位数写进报告，
+    # 声明清单就会随机变红 —— 与"最大相对差只报量级"是同一条规矩（决策 31）。
+    emit(f"    ADS 充分统计量 {n_cov:,.0f} 人 -> **样本内**缩减 "
+         f"{mv_ads.variance_reduction:.3f}")
+    deviation = abs(mv_ads.variance_reduction - mv_detail_in.variance_reduction)
+    emit(f"    明细路径同口径          -> **样本内**缩减 "
+         f"{mv_detail_in.variance_reduction:.3f}"
+         f"，偏差量级 1e{int(round(np.log10(max(deviation, 1e-300))))}"
+         "（< 1e-9，与测试同一条阈值）")
+    emit(f"    条件数：ADS {mv_ads.condition_number:.2f}"
+         f" / 明细 {mv_detail_in.condition_number:.2f}")
+    emit("    **边界（这一层最重要的结论）：交叉拟合的 θ̂ 从充分统计量算不出来。**")
+    emit("    它要求「留出那一折用**别的折**估的 θ̂」，而「哪个用户在哪个折」不是")
+    emit("    可加量 —— 折号一旦落库，随机划分就变成数据的一部分（换一个 seed")
+    emit("    就得重跑整条数仓）。所以 ADS 路径给的是**样本内**口径，")
+    emit("    交叉拟合仍然只能在明细上做：诚实口径 "
+         f"{mv_two.variance_reduction:.3f}，与样本内差 "
+         f"{mv_in.variance_reduction - mv_two.variance_reduction:+.3f}。")
 
     # ---- 6. 比值链路（06/07）的交叉验证 -------------------------------- #
     #

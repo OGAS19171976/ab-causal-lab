@@ -208,7 +208,7 @@ ab-causal-lab · 治理验证：操作审计（append-only）+ 护栏指标显�
       锁文件条目 48 个（另有 0 个因平台 marker 不适用：无）；带 py.typed 的 32 个；本项目实际 import 的 11 个
 
       包                     版本          py.typed  stub 包          用到它的源码文件
-      numpy                 2.5.3       有         -                     70
+      numpy                 2.5.3       有         -                     71
       scipy                 1.18.1      **没有**    -                     31
       pytest                9.1.1       有         -                     22
       pandas                3.0.3       **没有**    -                     10

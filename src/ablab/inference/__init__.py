@@ -10,12 +10,14 @@ from .clustered import (
     wild_cluster_bootstrap,
 )
 from .cuped import (
+    CovariateMoments,
     CupedFit,
     MultivariateCupedFit,
     cuped_estimate,
     cuped_ttest,
     fit_cuped,
     fit_multivariate_cuped,
+    multivariate_cuped_from_moments,
     multivariate_theta,
 )
 from .power import mde, required_n_per_arm, se_of_mean_diff, z_power
@@ -40,6 +42,8 @@ __all__ = [
     "estimate_icc",
     "CupedFit",
     "MultivariateCupedFit",
+    "CovariateMoments",
+    "multivariate_cuped_from_moments",
     "cuped_estimate",
     "cuped_ttest",
     "fit_cuped",

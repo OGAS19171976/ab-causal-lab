@@ -146,9 +146,10 @@ NOT_DONE_STATEMENTS: tuple[NotDoneStatement, ...] = (
         why="合成控制需要交互固定效应一类的方法，本仓库的 SCM 没做这一档",
     ),
     NotDoneStatement(
-        key="second_covariate_in_warehouse",
-        phrase="把第二个协变量接进 DWS/ADS",
-        why="ADS 只落了一个 pre_sum；多协变量目前只能在明细/合成路径上算",
+        key="cupac",
+        phrase="CUPAC（用模型预测值当协变量）",
+        why="多协变量本身已经落进 DWS/ADS（10/11），但 CUPAC 要的协变量是一个"
+        "模型预测值 —— 它在分析时才算得出来，落不进「可加量」这一层",
     ),
     NotDoneStatement(
         key="cluster_pairing",

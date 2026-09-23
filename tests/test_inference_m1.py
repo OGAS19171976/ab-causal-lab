@@ -6,6 +6,7 @@ from scipy import stats
 
 from ablab.inference import (
     AggregateStats,
+    CovariateMoments,
     cluster_level_ttest,
     cluster_robust_ttest,
     cuped_estimate,
@@ -13,6 +14,7 @@ from ablab.inference import (
     estimate_icc,
     fit_cuped,
     fit_multivariate_cuped,
+    multivariate_cuped_from_moments,
     multivariate_theta,
     naive_unit_ratio_ttest,
     ratio_delta_method,
@@ -405,6 +407,99 @@ class TestMultivariateCuped:
         assert audit.noise_covariates_overfit_in_sample
         assert audit.p_over_n_looks_perfect
         assert audit.ridge_tames_p_over_n_but_stays_honest
+
+
+class TestCovariateMoments:
+    """**充分统计量路径**：数仓只落可加量，多协变量 CUPED 必须能从那上面复原。
+
+    对应的表是 `dws/ads_experiment_covariate_*`（10/11）。这里钉两件事：
+    ① 从矩复原的结果与"扫明细"逐位一致（否则那两张表只是装饰）；
+    ② **它做不到的事**要在类型上就不存在 —— 交叉拟合需要逐单元的折号，
+    折号不是可加量，所以这条路径只接受 ``n_folds=1`` 这个口径。
+    """
+
+    @staticmethod
+    def _moments(X, y) -> CovariateMoments:
+        """把明细压成可加量 —— 数仓 10/11 两层的 SUM 做的事，这里手写一遍。"""
+        X = np.asarray(X, dtype=float)
+        y = np.asarray(y, dtype=float)
+        return CovariateMoments(
+            n=float(X.shape[0]),
+            sum_x=X.sum(axis=0),
+            sum_xx=X.T @ X,
+            sum_xy=X.T @ y,
+            sum_y=float(y.sum()),
+            sum_yy=float(y @ y),
+        )
+
+    def _data(self, n=400, seed=3):
+        rng = np.random.default_rng(seed)
+        x1 = rng.normal(10.0, 3.0, n)
+        x2 = 0.4 * x1 + rng.normal(0.0, 2.0, n)
+        y = 2.0 * x1 + 3.0 * x2 + rng.normal(0.0, 5.0, n)
+        return np.column_stack([x1, x2]), y
+
+    def test_matches_the_detail_path(self):
+        X, y = self._data()
+        detail = fit_multivariate_cuped(X, y, n_folds=1)
+        from_moments = multivariate_cuped_from_moments(self._moments(X, y))
+        assert from_moments.variance_reduction == pytest.approx(
+            detail.variance_reduction, rel=1e-12, abs=1e-15
+        )
+        assert from_moments.condition_number == pytest.approx(
+            detail.condition_number, rel=1e-9
+        )
+        assert from_moments.best_univariate_reduction == pytest.approx(
+            detail.best_univariate_reduction, rel=1e-12
+        )
+        assert np.allclose(from_moments.theta, detail.theta, rtol=1e-10, atol=1e-10)
+
+    def test_single_covariate_agrees_too(self):
+        """p=1 时它必须退化成 ``Cov(x,y)/Var(x)``（与 ``fit_cuped`` 同一个数）。"""
+        X, y = self._data()
+        one_from_moments = multivariate_cuped_from_moments(
+            self._moments(X[:, :1], y)
+        )
+        one_detail = fit_multivariate_cuped(X[:, :1], y, n_folds=1)
+        assert one_from_moments.variance_reduction == pytest.approx(
+            one_detail.variance_reduction, rel=1e-12, abs=1e-15
+        )
+
+    def test_it_is_explicitly_in_sample(self):
+        """它**只能**是样本内：``n_folds`` 恒为 1，好让调用方一眼看到口径。"""
+        X, y = self._data()
+        fit = multivariate_cuped_from_moments(self._moments(X, y))
+        assert fit.n_folds == 1
+        assert "样本内" in fit.summary()
+
+    def test_ridge_and_validation(self):
+        X, y = self._data()
+        plain = multivariate_cuped_from_moments(self._moments(X, y))
+        ridged = multivariate_cuped_from_moments(self._moments(X, y), ridge=0.1)
+        assert ridged.variance_reduction <= plain.variance_reduction
+        with pytest.raises(ValueError, match="ridge"):
+            multivariate_cuped_from_moments(self._moments(X, y), ridge=-1.0)
+        with pytest.raises(ValueError, match="样本量"):
+            multivariate_cuped_from_moments(
+                CovariateMoments(
+                    n=1.0, sum_x=np.zeros(2), sum_xx=np.zeros((2, 2)),
+                    sum_xy=np.zeros(2), sum_y=0.0, sum_yy=0.0,
+                )
+            )
+        with pytest.raises(ValueError, match="至少要一个协变量"):
+            multivariate_cuped_from_moments(
+                CovariateMoments(
+                    n=10.0, sum_x=np.zeros(0), sum_xx=np.zeros((0, 0)),
+                    sum_xy=np.zeros(0), sum_y=0.0, sum_yy=0.0,
+                )
+            )
+        with pytest.raises(ValueError, match="形状"):
+            multivariate_cuped_from_moments(
+                CovariateMoments(
+                    n=10.0, sum_x=np.zeros(2), sum_xx=np.zeros((3, 3)),
+                    sum_xy=np.zeros(2), sum_y=0.0, sum_yy=0.0,
+                )
+            )
 
 
 class TestRatioMetric:

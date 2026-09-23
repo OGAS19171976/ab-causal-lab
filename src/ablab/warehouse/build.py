@@ -72,6 +72,11 @@ SQL_ORDER: tuple[str, ...] = (
     # 也不是比值口径，而是"另一组指标"。名单来自声明（dim_guardrail_config）。
     "08_dws_experiment_guardrail_daily.sql",
     "09_ads_experiment_guardrail_result.sql",
+    # 多协变量 CUPED 的充分统计量（10/11）：同样是独立成表。
+    # 它落的十个可加量能复原 θ̂ = Σ_X⁻¹ Σ_XY 与方差缩减，但**复不出交叉拟合的
+    # 诚实口径**（折号不是可加量）—— 那条边界写在那两个 SQL 的注释里。
+    "10_dws_experiment_covariate_daily.sql",
+    "11_ads_experiment_covariate_result.sql",
 )
 
 

@@ -237,6 +237,12 @@ CLAIMS: list[tuple[str, str, str]] = [
     # 三位小数：这两个数从 DWD 明细算出来，第 4 位会随 DuckDB 并行聚合漂
     ("数仓·多协变量 CUPED：两个协变量的诚实缩减",
      "warehouse_report.md", "诚实方差缩减 0.744"),
+    # 10/11 两张新表（这一轮）：充分统计量路径 vs 明细路径。
+    # 偏差只报**量级**（DuckDB 并行聚合会让末位漂），所以声明只钉标签不钉位数。
+    ("数仓·多协变量 CUPED：二阶矩落进 DWS/ADS（10/11）",
+     "warehouse_report.md", "偏差量级"),
+    ("数仓·多协变量 CUPED：交叉拟合算不出来（这一层的边界）",
+     "warehouse_report.md", "从充分统计量算不出来"),
     # 真实数据入口（warehouse 报告第 8 节）：数值稳定（不随 --quick 变）
     ("数仓·真实数据入口：两条路径数字相同",
      "warehouse_report.md", "两条完全不同的数据路径"),

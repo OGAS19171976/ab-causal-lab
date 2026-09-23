@@ -52,6 +52,7 @@ from .srm import srm_check
 from .welch import welch_inference
 
 __all__ = [
+    "CovariateMoments",
     "CupedFit",
     "MultivariateCupedFit",
     "ThetaSource",
@@ -59,6 +60,7 @@ __all__ = [
     "cuped_ttest",
     "fit_cuped",
     "fit_multivariate_cuped",
+    "multivariate_cuped_from_moments",
     "multivariate_theta",
 ]
 
@@ -413,6 +415,114 @@ def _covariance_matrix(X: np.ndarray) -> np.ndarray:
     """中心化的协方差矩阵 ``Sigma_X``（除以 n，与 AggregateStats 的口径一致）。"""
     Xc = X - X.mean(axis=0, keepdims=True)
     return (Xc.T @ Xc) / X.shape[0]
+
+
+@dataclass(frozen=True)
+class CovariateMoments:
+    """多协变量 CUPED 的**可加充分统计量**。
+
+    为什么单独有这么一个类型：数仓的 DWS/ADS 只落**可加量**（设计决策 4），
+    而多协变量 CUPED 需要的恰好是可以从可加量复原的那一组二阶矩：
+
+        n, Σx_i, Σx_i x_j, Σx_i y, Σy, Σy²
+
+    有了它，``theta = Σ_X⁻¹ Σ_XY``、条件数与方差缩减都能在上层算出来，
+    **不需要回扫明细**。数仓那边对应 ``dws/ads_experiment_covariate_*``（10/11）。
+
+    **它复不出来的东西**：交叉拟合的"诚实"θ̂。那要求"留出那一折用别的折估的 θ̂"，
+    而"哪个用户在哪个折"不是可加量 —— 折号一旦落库，随机划分就变成了数据的一部分
+    （换一个 seed 就要重跑数仓）。所以这条路径给的是**样本内**口径，
+    交叉拟合仍然只能在明细上做；两个数要并排报，见 ``multivariate_cuped_from_moments``。
+    """
+
+    n: float
+    #: k 个协变量的一阶矩和（Σx_i）
+    sum_x: np.ndarray
+    #: k×k 二阶矩（Σx_i x_j，对称；只用到上三角的语义，存在即完整）
+    sum_xx: np.ndarray
+    #: Σx_i y
+    sum_xy: np.ndarray
+    sum_y: float
+    sum_yy: float
+
+    @property
+    def n_covariates(self) -> int:
+        return int(np.asarray(self.sum_x).size)
+
+
+def multivariate_cuped_from_moments(
+    moments: CovariateMoments, *, ridge: float = 0.0
+) -> MultivariateCupedFit:
+    """从充分统计量复原多协变量 CUPED 的**样本内**口径。
+
+    与 ``fit_multivariate_cuped(X, y, n_folds=1)`` 是同一个估计量，
+    只是输入换成了聚合矩（所以结果是闭式的、**逐位可对**）：
+    实测两条路径的方差缩减偏差在 1e-16 量级（有测试与报告读数守着）。
+
+    这里刻意**不接受** ``n_folds > 1``：交叉拟合在这条路径上做不到，
+    与其加一个会静默退化成样本内的参数，不如让它在类型上就不存在。
+    """
+    n = float(moments.n)
+    if n <= 1:
+        raise ValueError("样本量必须 > 1，否则协方差无定义")
+    if ridge < 0:
+        raise ValueError("ridge 不能为负")
+
+    sum_x = np.asarray(moments.sum_x, dtype=float)
+    sum_xx = np.asarray(moments.sum_xx, dtype=float)
+    sum_xy = np.asarray(moments.sum_xy, dtype=float)
+    p = sum_x.size
+    if p == 0:
+        raise ValueError("至少要一个协变量")
+    if sum_xx.shape != (p, p) or sum_xy.shape != (p,):
+        raise ValueError("Σxx / Σxy 的形状与协变量个数不一致")
+
+    mean_x = sum_x / n
+    mean_y = float(moments.sum_y) / n
+    # 中心化二阶矩：E[xx'] - E[x]E[x]'（与 _covariance_matrix 同一个口径：除以 n）
+    sigma = sum_xx / n - np.outer(mean_x, mean_x)
+    cov_xy = sum_xy / n - mean_x * mean_y
+    var_y = float(moments.sum_yy) / n - mean_y * mean_y
+
+    sigma_used = sigma + ridge * np.eye(p) if ridge > 0 else sigma
+    # 条件数算在**真正用于求解**的矩阵上（M1 那边踩过的坑，见 fit_multivariate_cuped）
+    cond = float(np.linalg.cond(sigma_used)) if p else float("nan")
+    try:
+        theta = np.linalg.solve(sigma_used, cov_xy)
+    except np.linalg.LinAlgError as exc:  # pragma: no cover - 需要极端共线性
+        raise ValueError(
+            "Sigma_X 奇异，无法求 θ —— 协变量之间完全共线；"
+            "请去掉冗余协变量或显式给 ridge"
+        ) from exc
+
+    # Var(y_adj) = Var(y − (x−E[x])'θ) = Var(y) − 2θ'Cov + θ'Σθ（闭式，
+    # 与明细路径"先算 y_adj 再 np.var"是同一个量）
+    var_adj = var_y - 2.0 * float(theta @ cov_xy) + float(theta @ (sigma_used @ theta))
+    if var_y > 0:
+        reduction = 1.0 - var_adj / var_y
+        cov_y_adj = var_y - float(theta @ cov_xy)
+        rho = cov_y_adj / math.sqrt(var_y * var_adj) if var_adj > 0 else 0.0
+    else:  # pragma: no cover - 常数结果
+        reduction, rho = 0.0, 0.0
+    diag = np.diag(sigma_used)
+    univariate = (
+        np.where(diag * var_y > 0, cov_xy * cov_xy / (diag * var_y), 0.0)
+        if var_y > 0
+        else np.zeros(p)
+    )
+
+    return MultivariateCupedFit(
+        theta=np.asarray(theta, dtype=float),
+        n_used=int(n),
+        n_covariates=p,
+        variance_reduction_measured=float(reduction),
+        rho=float(rho),
+        univariate_reductions=np.asarray(univariate, dtype=float),
+        condition_number=cond,
+        ridge=float(ridge),
+        # 这条路径**只能**是样本内：交叉拟合需要逐单元的折号，而折号不是可加量
+        n_folds=1,
+    )
 
 
 def multivariate_theta(
