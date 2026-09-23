@@ -2087,11 +2087,11 @@ python -m mypy                                # 类型检查（范围与档位�
 
 57. **同一个环境假设踩了三次：检查集不能自己创建系统临时目录** —— 这一类事故在
     这个仓库里出现过三次，前两次都只修了当时踩到的那一处：
-    （1）`tests/conftest.py`：pytest 的 `tmp_path` 落在系统 TEMP 下，会话结束还要
+    * `tests/conftest.py`：pytest 的 `tmp_path` 落在系统 TEMP 下，会话结束还要
     rmtree + chmod，而受限环境里两步都可能被拒 —— 于是统一迁到项目内的 `work_dir`；
-    （2）`run_governance_validation.py`：`tempfile.mkdtemp()` 建的目录带 0o700，
+    * `run_governance_validation.py`：`tempfile.mkdtemp()` 建的目录带 0o700，
     "**建得出来、写不进去**"，整个 gov 检查变红（CI 上正常，所以一直没被发现）；
-    （3）**这一轮**：`check_frontend.py` 的 node 语法检查还在用
+    * **这一轮**：`check_frontend.py` 的 node 语法检查还在用
     `tempfile.TemporaryDirectory`，而两个契约测试还在用 `tmp_path`。
     第三次的形态最坏，值得单独记：语法检查**本身**没跑成，异常却发生在**清理**阶段，
     于是前端检查变成一段 traceback → 治理报告里少了"页面与接口的契约一致" →
@@ -2111,11 +2111,11 @@ python -m mypy                                # 类型检查（范围与档位�
     一个完全不碰 tempfile 的测试文件也照样失败（`_pytest/capture.py` 用的是
     `tempfile.TemporaryFile`）。那不在仓库控制范围内，也不是这次事故的原因：
     当时 780 个测试是过的，坏的只有"**新建子目录**"与 chmod 两件事。
-    验收用两条互补证据，都跑过：
-    **① 把 `TMP`/`TEMP` 指到一个可写的观察目录**：控制组的旧写法确实在里面建了
+    验收用两条互补证据（都跑过）：
+    **① 把 `TMP`/`TEMP` 指到一个可写的观察目录** —— 控制组的旧写法确实在里面建了
     `frontend-js-xxxx/page.js`（证明"依赖系统 TEMP"这个前提是真的），
     而新实现跑完（`check_frontend.py` + 三个测试文件），那个目录里**一个条目都不多**；
-    **② 把临时目录 API 彻底废掉**（`tempfile.tempdir` 指向一个文件）：
+    **② 把临时目录 API 彻底废掉**（`tempfile.tempdir` 指向一个文件）——
     旧写法当场失败，`check_frontend.py` 照常绿。
 
 56. **"看着正常的错"要靠不变量抓，不是靠多改几处** —— 真实侧（MovieLens）的
