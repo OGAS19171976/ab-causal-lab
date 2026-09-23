@@ -74,10 +74,18 @@ class TestFrontendHelpers:
 
 
 class TestFrontendFailureInjection:
-    """**核心断言**：页面写错时必须报红，而且要说清错在哪一行。"""
+    """**核心断言**：页面写错时必须报红，而且要说清错在哪一行。
 
-    def _run_with(self, fe, tmp_path: Path, html: str) -> tuple[int, str, str]:
-        index = tmp_path / "index.html"
+    这里用 ``work_dir``（项目内的 ``build/_test_tmp``）而不是 pytest 自带的
+    ``tmp_path``：后者落在系统 TEMP 下，会话结束时还要 rmtree + chmod，
+    而受限（沙箱）环境里那两步都可能被拒 —— 于是**测试本身**变成 15 条 error，
+    看着像"页面坏了"，其实只是临时目录写不进去。理由与
+    ``tests/conftest.py::work_dir`` 的 docstring 同一条，
+    现在由 ``tests/test_restricted_env.py`` 机检守着。
+    """
+
+    def _run_with(self, fe, work_dir: Path, html: str) -> tuple[int, str, str]:
+        index = work_dir / "index.html"
         index.write_text(html, encoding="utf-8", newline="\n")
         original = fe.INDEX
         fe.INDEX = index
@@ -92,19 +100,19 @@ class TestFrontendFailureInjection:
         finally:
             fe.INDEX = original
 
-    def test_unknown_endpoint_is_caught(self, fe, tmp_path, capsys):
+    def test_unknown_endpoint_is_caught(self, fe, work_dir, capsys):
         html = """
         <html><body><div id="x"></div>
         <script>
         async function go() { return api("/api/does-not-exist"); }
         </script></body></html>
         """
-        code, out, _ = self._run_with(fe, tmp_path, html)
+        code, out, _ = self._run_with(fe, work_dir, html)
         capsys.readouterr()
         assert code == 1
         assert "不存在的端点" in out and "/api/does-not-exist" in out
 
-    def test_wrong_method_is_caught(self, fe, tmp_path, capsys):
+    def test_wrong_method_is_caught(self, fe, work_dir, capsys):
         html = """
         <html><body><div id="x"></div>
         <script>
@@ -113,31 +121,31 @@ class TestFrontendFailureInjection:
         }
         </script></body></html>
         """
-        code, out, _ = self._run_with(fe, tmp_path, html)
+        code, out, _ = self._run_with(fe, work_dir, html)
         capsys.readouterr()
         assert code == 1
         assert "DELETE" in out and "只有" in out
 
-    def test_broken_selector_is_caught(self, fe, tmp_path, capsys):
+    def test_broken_selector_is_caught(self, fe, work_dir, capsys):
         html = """
         <html><body><div id="x"></div>
         <script>
         $("#not-here").onclick = () => 1;
         </script></body></html>
         """
-        code, out, _ = self._run_with(fe, tmp_path, html)
+        code, out, _ = self._run_with(fe, work_dir, html)
         capsys.readouterr()
         assert code == 1
         assert "not-here" in out and "不存在" in out
 
-    def test_syntax_error_is_caught(self, fe, tmp_path, capsys):
+    def test_syntax_error_is_caught(self, fe, work_dir, capsys):
         html = """
         <html><body><div id="x"></div>
         <script>
         function broken( { return 1;
         </script></body></html>
         """
-        code, out, _ = self._run_with(fe, tmp_path, html)
+        code, out, _ = self._run_with(fe, work_dir, html)
         capsys.readouterr()
         assert code == 1
         assert "语法检查失败" in out or "node --check" in out

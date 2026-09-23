@@ -39,7 +39,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 API = ROOT / "src" / "ablab" / "platform" / "api.py"
@@ -234,13 +233,24 @@ def node_syntax_check(js: str) -> tuple[bool, str]:
     node = shutil.which("node")
     if node is None:
         return False, "没有找到 node —— 语法检查未执行（装 node ≥ 20，或说明为什么这台机器不该有）"
-    with tempfile.TemporaryDirectory(prefix="frontend-js-") as tmp:
-        path = pathlib.Path(tmp) / "page.js"
-        path.write_text(js, encoding="utf-8", newline="\n")
-        proc = subprocess.run(
-            [node, "--check", str(path)], capture_output=True, text=True,
-            encoding="utf-8", errors="replace",
-        )
+    # 待检的 JS 写在 build/ 下，**不用 tempfile.TemporaryDirectory**。
+    # 它是这一轮抓到的**第三次**同类事故（前两次见 conftest.py 与
+    # run_governance_validation.py 的注释）：那个 API 落在系统 TEMP 下，
+    # 建目录时加 0o700，退出时还要 chmod —— 受限环境（沙箱 / 收紧的容器）里
+    # 这几步都可能被拒。当时的形态最坏：语法检查本身没跑成，却**在清理阶段**
+    # 抛 PermissionError，整条前端检查变成一段 traceback，于是治理报告里少了
+    # "页面与接口的契约一致"这句，下游的 claims 跟着**假红**
+    # （报的是"声明漂移了"，而真正的原因与声明无关）。
+    # build/ 已经是本仓库的临时区，用默认权限建，不清权限也就没有可失败的收尾。
+    scratch = ROOT / "build" / "_frontend_js"
+    shutil.rmtree(scratch, ignore_errors=True)
+    scratch.mkdir(parents=True, exist_ok=True)
+    path = scratch / "page.js"
+    path.write_text(js, encoding="utf-8", newline="\n")
+    proc = subprocess.run(
+        [node, "--check", str(path)], capture_output=True, text=True,
+        encoding="utf-8", errors="replace",
+    )
     if proc.returncode == 0:
         return True, "node --check 通过"
     return False, (proc.stderr or proc.stdout or "").strip().splitlines()[-1] if (

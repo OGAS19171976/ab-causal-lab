@@ -31,15 +31,20 @@ def _load():
 
 
 @pytest.fixture
-def gate(tmp_path: Path, monkeypatch):
-    """把门的三个路径都指到临时目录（绝不动仓库里的 data/real）。"""
+def gate(work_dir: Path, monkeypatch):
+    """把门的三个路径都指到临时目录（绝不动仓库里的 data/real）。
+
+    用 ``work_dir``（项目内）而不是 pytest 的 ``tmp_path``：后者落在系统 TEMP 下，
+    受限（沙箱）环境里建目录/清理会被拒，整组测试变成 error —— 与
+    ``tests/conftest.py::work_dir`` 同一个理由，由 ``tests/test_restricted_env.py`` 机检守着。
+    """
     module = _load()
-    data = tmp_path / "real"
+    data = work_dir / "real"
     data.mkdir()
     monkeypatch.setattr(module, "DATA", data)
     monkeypatch.setattr(module, "PROVENANCE", data / "provenance.json")
-    monkeypatch.setattr(module, "TARGET", tmp_path / "target")
-    monkeypatch.setattr(module, "DB_PATH", tmp_path / "wh.duckdb")
+    monkeypatch.setattr(module, "TARGET", work_dir / "target")
+    monkeypatch.setattr(module, "DB_PATH", work_dir / "wh.duckdb")
     return module, data
 
 
