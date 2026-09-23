@@ -498,3 +498,62 @@ class TestUnimplementedRegistry:
         assert {i.kind for i in ITEMS} <= {"symbol_absent", "text_absent", "file_absent"}
         # 而且不能把人工那条伪装成机检项
         assert not any("真实流量" in i.readme_phrase and i.kind == "symbol_absent" for i in ITEMS)
+
+
+class TestNotDoneCoverage:
+    """**第二层**：正文里那些"没有机器证据"的『没做』也要有人管。
+
+    第一层（``ITEMS``）只管"登记过的"，而这个仓库第四次栽的跟头恰恰是
+    **没登记的那些句子**（路线图里 Sun-Abraham/BJS 早已实现、比值数仓的施工口径
+    早已执行）。所以这一层检查的不是"做没做"，而是**有没有人管**：
+    被标记的句子必须在登记表里，登记的句子也必须在 README 里还在。
+
+    下面既有"真 README 的覆盖面"这条正面断言，也有**两个方向的故障注入** ——
+    没有故障注入，检查器最可能的失效方式是永远绿（决策 54）。
+    """
+
+    @staticmethod
+    def _load():
+        import importlib
+
+        sys.path.insert(0, str(ROOT / "scripts"))
+        return importlib.import_module("check_unimplemented")
+
+    def test_real_readme_is_covered(self):
+        checker = self._load()
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        problems = checker.check_not_done_coverage(readme)
+        assert not problems, problems
+        # 而且要真的扫到了东西：全 0 条时"覆盖得住"是废话
+        assert len(checker.active_not_done_lines(readme)) >= 5
+
+    def test_unregistered_statement_is_caught(self):
+        """方向一：新写一句被标记的"没做"却没挂号 -> 必须报出来。"""
+        checker = self._load()
+        fake = "这里是一句**仍未做**：某个没人管的新边界。\n"
+        problems = checker.check_not_done_coverage(fake)
+        assert any("没有对应条目" in p for p in problems), problems
+
+    def test_registered_statement_that_vanished_is_caught(self):
+        """方向二：挂了号的句子从 README 里消失（做完了/改措辞了）-> 也要报。"""
+        checker = self._load()
+        problems = checker.check_not_done_coverage("README 里什么都没写。\n")
+        assert len(problems) >= 7, problems  # 每一条登记都该被顶出来
+
+    def test_struck_through_statements_are_history(self):
+        """被划掉的一律算历史 —— 否则"后来补上了"的句子会被当成活跃声明。"""
+        checker = self._load()
+        readme = "~~**仍未做**：断点回归~~ —— **后来补上了**。\n"
+        assert checker.active_not_done_lines(readme) == []
+        assert checker.check_not_done_coverage(readme)  # 但登记表本身仍然对不上
+
+    def test_marker_is_a_prefix_so_whole_sentence_bold_is_caught(self):
+        """**回归**：``**仍未做：X**``（整句加粗）也必须被扫到。
+
+        第一版判据是全形 ``**仍未做**``，于是这种写法一条都没被看见 ——
+        而"漏掉"恰恰是最危险的失效方向：没人管的那句悄悄滑过检查。
+        README 里当时真的就有一句是这个写法。
+        """
+        checker = self._load()
+        readme = "- **仍未做：真实效应下的功效/覆盖**。后面跟着说明。\n"
+        assert len(checker.active_not_done_lines(readme)) == 1

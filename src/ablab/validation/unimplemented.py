@@ -25,9 +25,23 @@
 * ``text_absent``：某个字面串**必须不在**指定目录里。用于"没有这条技术路线"。
 * ``file_absent``：某个文件**必须不存在**。用于"没有这张表/这个脚本"。
 
-诚实的边界：**这份清单只覆盖能机检的那些"没做"**。像"没有真实流量"这种
-无法用符号表达的，仍然只能靠人读 —— 清单不会假装覆盖了它们（见
-``check_unimplemented.py`` 的输出里那句"人工核对的条数"）。
+诚实的边界，以及**这份清单自己漂移过**（这一轮补的第二层）
+----------------------------------------------------------
+上面那三类证据只能收"能用符号/文件/串表达的"未做事项。而**大多数"没做"是
+正文里的句子**，它们没有这种证据 —— 于是它们绕过了 `ITEMS`，照样漂：
+这一轮就抓到三处（路线图里"第二种交错处置估计量（Sun-Abraham 或 BJS）"其实
+早已实现、比值数仓的施工口径标题还写着"下一次开工照着做"而它上一段就写着
+"已经接通了"、"README 里还没有比值数仓的数字"也不成立）。
+
+所以补了第二层：``NOT_DONE_STATEMENTS`` —— **正文里每一句被标记的"没做"
+都必须在这里挂号，挂了号的句子也必须在 README 里还在**。它不检查"做没做"
+（那做不到），它检查**有没有人管**：两头对不上就在检查集里红。
+写法约定见 ``NOT_DONE_MARKERS``。
+
+于是三层各管一段，别混：
+* ``ITEMS``：能机检证据的未做事项（现在**空**）；
+* ``NOT_DONE_STATEMENTS``：正文里带标记、逐字登记的"没做"（覆盖性检查）；
+* ``human_reviewed_notes()``：**取舍声明**（有意不做，不是欠账），只能人读。
 """
 
 from __future__ import annotations
@@ -80,6 +94,81 @@ class UnimplementedItem:
 ITEMS: tuple[UnimplementedItem, ...] = ()
 
 
+#: 活跃"没做"的**写法约定**：粗体标记，且粗体**以这三个词开头**。
+#:
+#: 为什么要有这个约定、而不是直接扫"未做"三个字：README 里还有大量**引用与
+#: 回顾**（"当时留了一句『仍未做：……』"、"~~仍未做：断点回归~~ —— 后来补上了"）。
+#: 把叙述当成活跃声明，检查器第一天就会被假阳性淹没，然后被人关掉 ——
+#: 所以用"粗体标记"这个**作者显式作出的声明**当判据，被划掉的（``~~``）一律算历史。
+#:
+#: 判据取**前缀**（``**仍未做``）而不是全形（``**仍未做**``）：后者会漏掉
+#: ``**仍未做：真实效应下的功效/覆盖**`` 这种"整句加粗"的写法 —— 而**漏掉**
+#: 恰恰是最危险的失效方向（没人管的那句悄悄滑过检查）。这一条是写检查器的同一轮
+#: 实测出来的：登记表建好之后，扫描器只认全形，于是那条句子一条都没被看见。
+NOT_DONE_MARKERS: tuple[str, ...] = ("**未做", "**仍未做", "**没有做")
+
+
+@dataclass(frozen=True)
+class NotDoneStatement:
+    """正文里一句**活跃的**"没做"，逐字登记。
+
+    ``phrase`` 必须出现在那条被标记的句子里 —— 比对前会把 markdown 的
+    ``*`` 与反引号去掉（否则 ``**业务损失函数**`` 这种加粗会让逐字比对白白失败）。
+    判据与声明清单同一个套路：**用"逐字能搜到"换掉"语义相似"**，
+    因为后者的判据会随人变。
+    """
+
+    key: str
+    #: 必须出现在那条被标记句子里的**逐字片段**
+    phrase: str
+    #: 为什么它还是"没做"（人读的一句话）
+    why: str
+
+
+#: 活跃的"没做"（本仓库目前的全部）。
+#:
+#: 加一条时问自己两件事：它**真的**还没做吗？以及——它能不能升级成 ``ITEMS``
+#: 里那种有证据的检查（能的话就别放在这里，那里更强）。
+NOT_DONE_STATEMENTS: tuple[NotDoneStatement, ...] = (
+    NotDoneStatement(
+        key="monitor_looks_not_comparable",
+        phrase="各次查看之间不再可比",
+        why="监控曲线跨查看点不可比是另一个（更麻烦的）问题，本仓库不做",
+    ),
+    NotDoneStatement(
+        key="business_loss_function",
+        phrase="按业务损失函数自动选择上线与否",
+        why="要先把收益/损失的效用函数写成声明，平台现在只有统计判据",
+    ),
+    NotDoneStatement(
+        key="donor_pool_common_shocks",
+        phrase="捐赠池本身被共同冲击污染",
+        why="合成控制需要交互固定效应一类的方法，本仓库的 SCM 没做这一档",
+    ),
+    NotDoneStatement(
+        key="second_covariate_in_warehouse",
+        phrase="把第二个协变量接进 DWS/ADS",
+        why="ADS 只落了一个 pre_sum；多协变量目前只能在明细/合成路径上算",
+    ),
+    NotDoneStatement(
+        key="cluster_pairing",
+        phrase="簇级配对/协变量调整",
+        why="整簇随机化下设计层面的补救（配对、协变量调整）没有做",
+    ),
+    NotDoneStatement(
+        key="token_lifecycle_rest",
+        phrase="刷新令牌/撤销列表",
+        why="静态 token 补了有效期/轮换/限速，但刷新令牌、撤销列表、多设备管理、"
+        "自助轮换端点与限速共享存储都没有",
+    ),
+    NotDoneStatement(
+        key="ratio_real_effect_power",
+        phrase="真实效应下的功效/覆盖",
+        why="比值链路的复制实验共享同一份结果序列、真实效应为 0，所以只能校准零效应",
+    ),
+)
+
+
 def human_reviewed_notes() -> tuple[str, ...]:
     """**无法机检**的"没做"（清单不假装覆盖它们，但要列出来提醒人去读）。"""
     return (
@@ -95,4 +184,12 @@ def human_reviewed_notes() -> tuple[str, ...]:
     )
 
 
-__all__ = ["ITEMS", "EvidenceKind", "UnimplementedItem", "human_reviewed_notes"]
+__all__ = [
+    "ITEMS",
+    "NOT_DONE_MARKERS",
+    "NOT_DONE_STATEMENTS",
+    "EvidenceKind",
+    "NotDoneStatement",
+    "UnimplementedItem",
+    "human_reviewed_notes",
+]
